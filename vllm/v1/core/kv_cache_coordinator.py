@@ -297,6 +297,23 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def reconcile_reclaimed_blocks(
+        self,
+        request_id: str,
+        retained_block_ids: list[int],
+        expected_old_num_blocks: int,
+        same_step_new_block_ids: list[int],
+    ) -> list[int]:
+        """Reconcile a single-group request to its dense physical ownership."""
+        if len(self.single_type_managers) != 1:
+            raise ValueError("Physical reclaim supports exactly one KV cache group")
+        return self.single_type_managers[0].reconcile_reclaimed_blocks(
+            request_id,
+            retained_block_ids,
+            expected_old_num_blocks,
+            same_step_new_block_ids,
+        )
+
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
         Pop the request's bookkeeping from all single-type managers and

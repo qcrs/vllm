@@ -426,7 +426,12 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        allocation_base = (
+            request.effective_kv_len
+            if request.effective_kv_len is not None
+            else total_computed_tokens
+        )
+        num_tokens_main_model = allocation_base + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -512,6 +517,28 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+
+    def reconcile_reclaimed_blocks(
+        self,
+        request_id: str,
+        retained_block_ids: list[int],
+        expected_old_num_blocks: int,
+        same_step_new_block_ids: tuple[list[int], ...] | None,
+    ) -> list[int]:
+        """Publish one dense reclaimed ownership row and release removed blocks."""
+        if self.num_kv_cache_groups != 1:
+            raise ValueError("Physical reclaim supports exactly one KV cache group")
+        if same_step_new_block_ids is not None and len(same_step_new_block_ids) != 1:
+            raise ValueError("Physical reclaim supports exactly one KV cache group")
+        new_block_ids = (
+            [] if same_step_new_block_ids is None else same_step_new_block_ids[0]
+        )
+        return self.coordinator.reconcile_reclaimed_blocks(
+            request_id,
+            retained_block_ids,
+            expected_old_num_blocks,
+            new_block_ids,
+        )
 
     def remove_skipped_blocks(
         self,

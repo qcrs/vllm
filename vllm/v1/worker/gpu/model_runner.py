@@ -839,12 +839,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
-        for req_id, num_computed_tokens, req_new_block_ids in zip(
-            reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
+        reclaim_transitions = reqs.reclaim_transitions or [None] * len(reqs.req_ids)
+        for req_id, num_computed_tokens, req_new_block_ids, reclaim_transition in zip(
+            reqs.req_ids,
+            reqs.num_computed_tokens,
+            reqs.new_block_ids,
+            reclaim_transitions,
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
-            if req_new_block_ids is not None:
+            if reclaim_transition is not None:
+                # Reclaim and normal append are mutually exclusive for one row.
+                self._commit_reclaim_transition(
+                    request_id=req_id,
+                    retained_block_ids=reclaim_transition.retained_block_ids,
+                    new_effective_kv_len=reclaim_transition.new_effective_kv_len,
+                    expected_old_num_blocks=(
+                        reclaim_transition.expected_old_num_blocks
+                    ),
+                    same_step_new_block_ids=req_new_block_ids,
+                )
+            elif req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
@@ -869,6 +884,592 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+            )
+
+    def _commit_reclaim_transition(
+        self,
+        request_id: str,
+
+        # reclaim 之后，从“旧 Worker block row”中保留下来的 block IDs。
+        #
+        # 例如旧 row：
+        #   [B0, B1, B2, B3, B4, B5]
+        #
+        # 删除 B2/B3 后：
+        #   retained_block_ids = [B0, B1, B4, B5]
+        #
+        # 注意：
+        # 这里“不应该”包含当前 scheduler step 新申请的 B6。
+        retained_block_ids: list[int],
+
+        # reclaim 后的有效 physical KV token 数。
+        #
+        # 例如：
+        #   old effective = 94
+        #   删除 2 个完整 block
+        #   block_size = 16
+        #
+        #   new effective = 94 - 2*16 = 62
+        #
+        # 注意：
+        # 它描述的是“已经真正有效的 KV token 数”，
+        # 不是 block capacity。
+        new_effective_kv_len: int,
+
+        # 一个 stale-decision validation fence。
+        #
+        # producer 在产生 reclaim decision 时认为：
+        #   “这个 request 当前应该有 6 个 active blocks”
+        #
+        # 所以传：
+        #   expected_old_num_blocks = 6
+        #
+        # Worker 真正执行时也必须看到 6。
+        #
+        # 如果 Worker 已经变成 7，
+        # 说明这个 reclaim decision 已经过期，不能继续执行。
+        expected_old_num_blocks: int,
+
+        # 当前 scheduler step “额外新分配”的 block IDs。
+        #
+        # 例如：
+        #   retained = [B0, B1, B4, B5]
+        #
+        # 当前 query 又跨 block boundary，
+        # scheduler allocate_slots() 新分配：
+        #   B6
+        #
+        # 那么：
+        #   same_step_new_block_ids = ([B6],)
+        #
+        # 为什么是 tuple[list[int], ...]？
+        # 因为 vLLM block table API 原本支持多个 KV cache groups：
+        #
+        #   (
+        #       group0_block_ids,
+        #       group1_block_ids,
+        #       ...
+        #   )
+        #
+        # 但我们 V1 只允许 single KV group。
+        same_step_new_block_ids: tuple[list[int], ...] | None = None,
+    ) -> None:
+
+        """Stage a validated single-group worker physical-view transition."""
+
+        # ============================================================
+        # Phase 1:
+        # 确认这个 request 在 Worker 里还存在。
+        # ============================================================
+
+        # 如果 request 已经 finish / remove / preempt 掉，
+        # 一个旧的 reclaim decision 就不能继续作用在它身上。
+        if request_id not in self.req_states.req_id_to_index:
+            raise ValueError(f"Unknown worker request: {request_id}")
+
+
+        # ============================================================
+        # Phase 2:
+        # V1 scope guard：只支持一个 KV cache group。
+        # ============================================================
+
+        # 当前 reclaim contract 只审计过：
+        #   num_kv_cache_groups = 1
+        #
+        # multi-group / hybrid KV 的 block row layout 更复杂，
+        # 所以不能让这个 helper 悄悄泛化过去。
+        if self.block_tables.num_kv_cache_groups != 1:
+            raise ValueError(
+                "Worker reclaim commit requires one KV cache group"
+            )
+
+
+        # ============================================================
+        # Phase 3:
+        # 读取当前 Worker 的“旧状态”。
+        #
+        # 后面的 validation 全部针对这份 old state。
+        # ============================================================
+
+        # request_id 是逻辑 ID，
+        # Worker 内部真正的 GPU/CPU state 都按 row index 保存。
+        #
+        # 例如：
+        #   "req-A" -> req_index = 0
+        req_index = self.req_states.req_id_to_index[request_id]
+
+
+        # 当前 Worker active block-table prefix 长度。
+        #
+        # 例如：
+        #   [B0 B1 B2 B3 B4 B5]
+        #
+        # active count:
+        #   old_num_blocks = 6
+        #
+        # 这里读的是 CPU-side num_blocks.np，
+        # 不需要 GPU readback。
+        old_num_blocks = int(
+            self.block_tables.num_blocks.np[0, req_index]
+        )
+
+
+        # 当前 reclaim 发生之前的 physical KV valid length。
+        #
+        # canonical:
+        #   old_effective_kv_len = 94
+        #
+        # 它现在是 GPU persistent state，
+        # 所以这里 .item() 会有 GPU -> CPU scalar read。
+        #
+        # correctness 没问题；
+        # 只是未来可以优化掉这个同步。
+        old_effective_kv_len = int(
+            self.req_states.effective_kv_len.gpu[req_index].item()
+        )
+
+
+        # 当前 logical progress。
+        #
+        # canonical:
+        #   logical_num_computed_tokens = 94
+        #
+        # 和 physical 不同：
+        #
+        # reclaim 后：
+        #   logical 仍然 94
+        #   physical 变成 62
+        #
+        # 这里已经有 CPU mirror，所以直接读 np。
+        logical_num_computed_tokens = int(
+            self.req_states.num_computed_tokens_np[req_index]
+        )
+
+
+        # reclaim 后保留下来的“旧 blocks”数量。
+        #
+        # canonical:
+        #   retained = [B0 B1 B4 B5]
+        #   retained_num_blocks = 4
+        retained_num_blocks = len(retained_block_ids)
+
+
+        # 当前 KV block token capacity。
+        #
+        # canonical:
+        #   block_size = 16
+        block_size = self.block_tables.block_sizes[0]
+
+
+        # ============================================================
+        # Phase 4:
+        # 把 current-step new block IDs 规范化成普通 list。
+        # ============================================================
+
+        if same_step_new_block_ids is None:
+
+            # 当前 step 没有跨新 block boundary，
+            # 没有新增 capacity。
+            #
+            # 例如：
+            # E=62，只计算 physical position 62，
+            # 仍然落在已有 B5 中。
+            new_block_ids: list[int] = []
+
+        elif len(same_step_new_block_ids) != 1:
+
+            # API shape 本来允许：
+            #
+            #   (
+            #       group0_ids,
+            #       group1_ids,
+            #   )
+            #
+            # 但 P1 V1 只支持 single group，
+            # 所以如果 tuple 里不是恰好一个 group，
+            # 直接拒绝。
+            raise ValueError(
+                "same-step new block IDs require one KV cache group"
+            )
+
+        else:
+
+            # single group：
+            #
+            #   ([B6],)
+            #
+            # 展开成：
+            #
+            #   [B6]
+            new_block_ids = same_step_new_block_ids[0]
+
+
+        # ============================================================
+        # Phase 5:
+        # Validation 1 —— decision 有没有过期？
+        # ============================================================
+
+        # producer 产生 decision 时认为 old row 有 6 blocks。
+        #
+        # Worker 真正执行时也必须还是 6。
+        #
+        # 如果变成：
+        #   expected = 6
+        #   actual   = 7
+        #
+        # 说明两边 state version 不一致。
+        #
+        # 此时不能继续用旧 retained row。
+        if expected_old_num_blocks != old_num_blocks:
+            raise ValueError(
+                f"expected {expected_old_num_blocks} blocks, "
+                f"found {old_num_blocks}"
+            )
+
+
+        # ============================================================
+        # Phase 6:
+        # Validation 2 —— retained row 本身有没有明显问题？
+        # ============================================================
+
+        # V1 不允许把整个 physical KV row reclaim 成空。
+        if retained_num_blocks == 0:
+            raise ValueError(
+                "retained block list must be non-empty"
+            )
+
+
+        # 不可能：
+        #
+        # old row 只有 6 个 blocks，
+        # reclaim 后反而说 retained 有 7 个“旧 blocks”。
+        if retained_num_blocks > old_num_blocks:
+            raise ValueError(
+                "retained block count exceeds current active count"
+            )
+
+
+        # retained 里面不能同一个 physical block 出现两次。
+        #
+        # 错误例子：
+        #   [B0 B1 B4 B4]
+        #
+        # 否则一个 physical block 被多个 logical physical columns 引用，
+        # 当前 V1 contract 不允许。
+        if len(set(retained_block_ids)) != retained_num_blocks:
+            raise ValueError(
+                "retained block IDs must be unique"
+            )
+
+
+        # ============================================================
+        # Phase 7:
+        # 构造真正 forward 前 Worker 应该看到的 final row。
+        # ============================================================
+
+        # canonical:
+        #
+        # retained:
+        #   [B0 B1 B4 B5]
+        #
+        # same-step new:
+        #   [B6]
+        #
+        # final:
+        #   [B0 B1 B4 B5 B6]
+        #
+        # 注意：
+        # 这里仅仅拼“block ID metadata list”。
+        #
+        # 没有 copy K/V payload。
+        final_physical_row = [
+            *retained_block_ids,
+            *new_block_ids,
+        ]
+
+
+        # final row 同样不允许 duplicate。
+        #
+        # 这一条尤其能抓出：
+        #
+        # retained 本身已经错误包含 B6，
+        # 然后 same_step_new 又带一次 B6。
+        #
+        # 例如：
+        #
+        # retained:
+        #   [B0 B1 B4 B5 B6]
+        #
+        # new:
+        #   [B6]
+        #
+        # final:
+        #   [B0 B1 B4 B5 B6 B6]
+        #
+        # 必须拒绝。
+        if len(set(final_physical_row)) != len(final_physical_row):
+            raise ValueError(
+                "final physical block IDs must be unique"
+            )
+
+
+        # ============================================================
+        # Phase 8:
+        # Validation 3 —— new effective KV length 合不合法？
+        # ============================================================
+
+        # 当前 scope 不支持 effective=0。
+        #
+        # 即不能把 request 的全部 physical KV 都删空。
+        if new_effective_kv_len <= 0:
+            raise ValueError(
+                "new effective KV length must be positive"
+            )
+
+
+        # reclaim 的语义是 shrink。
+        #
+        # 不能：
+        #   old_E = 94
+        #   new_E = 110
+        #
+        # 那不是 reclaim。
+        if old_effective_kv_len < new_effective_kv_len:
+            raise ValueError(
+                "reclaim cannot increase effective KV length"
+            )
+
+
+        # ============================================================
+        # Phase 9:
+        # 算“physical token 实际减少多少”。
+        # ============================================================
+
+        # canonical:
+        #
+        # old_E = 94
+        # new_E = 62
+        #
+        # physical_shrink = 32
+        physical_shrink = (
+            old_effective_kv_len - new_effective_kv_len
+        )
+
+
+        # 再从“删掉多少整个 blocks”计算理论上应该 shrink 多少 token。
+        #
+        # old_num_blocks = 6
+        # retained_num_blocks = 4
+        #
+        # 说明从 old row 中去掉了：
+        #   6 - 4 = 2 blocks
+        #
+        # block_size = 16
+        #
+        # expected_shrink = 2 * 16 = 32
+        #
+        # 注意：
+        # current-step 的 B6 不算在这里。
+        #
+        # 因为 B6 是新 capacity，
+        # 不是“旧 row 中被保留的 block”。
+        expected_shrink = (
+            old_num_blocks - retained_num_blocks
+        ) * block_size
+
+
+        # ============================================================
+        # Phase 10:
+        # 核心 whole-block reclaim correctness check。
+        # ============================================================
+
+        # canonical：
+        #
+        # physical_shrink = 94 - 62 = 32
+        #
+        # expected_shrink = (6 - 4) * 16 = 32
+        #
+        # PASS。
+        #
+        # 错误例子：
+        #
+        # new_E = 63
+        #
+        # physical_shrink = 31
+        # expected_shrink = 32
+        #
+        # 说明你不是删了完整两个 blocks，
+        # 而是出现 token-level / inconsistent transition。
+        if physical_shrink != expected_shrink:
+            raise ValueError(
+                "effective KV shrink does not match "
+                "reclaimed whole blocks"
+            )
+
+
+        # 这一条从 token 维度再次 enforce：
+        #
+        # physical shrink 必须是 block_size 的整数倍。
+        #
+        # 例如：
+        #   32 % 16 == 0
+        #
+        # 虽然在前一个 equality check 下某种程度上是冗余防御，
+        # 但它直接表达了 V1 contract：
+        #
+        #   whole-block reclaim only
+        if physical_shrink % block_size != 0:
+            raise ValueError(
+                "effective KV shrink must be block aligned"
+            )
+
+
+        # ============================================================
+        # Phase 11:
+        # physical progress 不能超过 logical progress。
+        # ============================================================
+
+        # reclaim 后正确关系：
+        #
+        #   E <= L
+        #
+        # canonical：
+        #   62 <= 94
+        #
+        # 如果：
+        #   E = 100
+        #   L = 94
+        #
+        # 意味着 physical KV 居然比模型 logical progress 更多，
+        # 不符合当前 contract。
+        if new_effective_kv_len > logical_num_computed_tokens:
+            raise ValueError(
+                "effective KV length cannot exceed logical progress"
+            )
+
+
+        # ============================================================
+        # Phase 12:
+        # 保证 logical / physical divergence 是 whole-block 对齐。
+        # ============================================================
+
+        # whole-block reclaim 要求：
+        #
+        #   L - E = R * block_size
+        #
+        # canonical：
+        #
+        #   94 - 62 = 32
+        #   32 % 16 = 0
+        #
+        # 所以：
+        #
+        #   L % S == E % S
+        #
+        # 这条 invariant 非常重要，
+        # 因为它保证未来 logical 和 physical
+        # 跨 block boundary 的 cadence 保持一致。
+        if (
+            logical_num_computed_tokens - new_effective_kv_len
+        ) % block_size != 0:
+            raise ValueError(
+                "logical/physical divergence must be block aligned"
+            )
+
+
+        # ============================================================
+        # Phase 13:
+        # strict no-op。
+        # ============================================================
+
+        # 如果：
+        #
+        # retained block 数没减少
+        # E 也没减少
+        # 当前 step 也没有新增 block
+        #
+        # 那么实际上什么都没发生。
+        #
+        # 不应该为了 no-op 制造 staged descriptor。
+        if (
+            retained_num_blocks == old_num_blocks
+            and new_effective_kv_len == old_effective_kv_len
+            and not new_block_ids
+        ):
+            return
+
+
+        # ============================================================
+        # Phase 14:
+        # 真正开始 mutation。
+        #
+        # 重点：
+        # 到这里之前没有改任何 persistent/staged state。
+        # 所以上面任何 validation 失败，都属于 fail-before-mutation。
+        # ============================================================
+
+
+        # ------------------------------------------------------------
+        # Mutation A：
+        # 把 reclaim + current-step allocation
+        # 合成“一个最终 block row descriptor”。
+        # ------------------------------------------------------------
+
+        # canonical：
+        #
+        # old:
+        #   [B0 B1 B2 B3 B4 B5]
+        #
+        # final:
+        #   [B0 B1 B4 B5 B6]
+        #
+        # overwrite=True：
+        # 从 column 0 重建整个 active prefix。
+        #
+        # 最重要的是：
+        #
+        # 这里只有“一次 append_block_ids()”
+        #
+        # 因此 BlockTables 只产生：
+        #
+        #   ONE staged descriptor
+        #
+        # 这就是 R1 用来解决原 01A
+        # two-descriptor capacity conflict 的核心。
+        self.block_tables.append_block_ids(
+            req_index,
+            (final_physical_row,),
+            overwrite=True,
+        )
+
+
+        # ------------------------------------------------------------
+        # Mutation B：
+        # 如果 physical valid length 真的 shrink，
+        # 再 stage effective_kv_len 的 absolute replacement。
+        # ------------------------------------------------------------
+
+        # canonical：
+        #
+        # old_E = 94
+        # new_E = 62
+        #
+        # 注意：
+        #
+        # final block row 有 5 blocks：
+        #   [B0 B1 B4 B5 B6]
+        #
+        # 但是 E 仍然是 62，
+        # 不能写成：
+        #
+        #   5 * 16 = 80
+        #
+        # 因为 B6 只是当前 step 新分配出来的 capacity，
+        # 当前 forward 尚未真正完成写入这些 future tokens。
+        if new_effective_kv_len != old_effective_kv_len:
+            self.req_states.effective_kv_len.stage_write_elem(
+                req_index,
+                new_effective_kv_len,
             )
 
     def prepare_inputs(
@@ -967,8 +1568,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
+            cache_pos=self.input_buffers.cache_positions,
+            effective_kv_seq_lens=self.input_buffers.effective_kv_seq_lens,
+            effective_kv_len=self.req_states.effective_kv_len.gpu,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        effective_kv_seq_lens = self.input_buffers.effective_kv_seq_lens[
+            :num_reqs_padded
+        ]
 
         dcp_local_seq_lens = None
         if self.use_dcp:
@@ -1043,7 +1650,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
+            cache_positions=self.input_buffers.cache_positions[
+                :num_tokens_after_padding
+            ],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
+            effective_kv_seq_lens=effective_kv_seq_lens,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -1065,10 +1676,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+        # Logical positions remain model/RoPE coordinates; cache_positions track
+        # effective KV append coordinates.
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
-            input_batch.positions,
+            input_batch.cache_positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
         return block_tables, slot_mappings
@@ -1133,6 +1746,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
+            self.req_states.effective_kv_len.gpu,
             self.req_states.last_sampled_tokens,
             output_bin_counts,
             sampled_tokens,
@@ -1163,6 +1777,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self.req_states.effective_kv_len.apply_write()
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.

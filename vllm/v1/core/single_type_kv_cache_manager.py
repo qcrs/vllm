@@ -502,6 +502,73 @@ class SingleTypeKVCacheManager(ABC):
         # Free blocks in reverse order so that the tail blocks are freed first.
         self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
 
+    def reconcile_reclaimed_blocks(
+        self,
+        request_id: str,
+        retained_block_ids: list[int],
+        expected_old_num_blocks: int,
+        same_step_new_block_ids: list[int],
+    ) -> list[int]:
+        """
+        Replace canonical ownership with one validated dense physical row.
+        拿当前 canonical ownership，验证这次 reclaim transaction 没有错，然后把
+        req_to_blocks[request_id] 从旧 row 改成新的 dense row，最后把被移除的 blocks 退回 BlockPool。
+        """
+        '''
+        SingleTypeKVCacheManager 维护的 canonical Request → blocks ownership
+        KVCacheBlock(block_id=0, ref_cnt=1, ...)
+        '''
+        current_blocks = self.req_to_blocks.get(request_id)
+        if current_blocks is None:
+            raise ValueError(f"Request {request_id!r} has no KV block ownership")
+        if len(current_blocks) != expected_old_num_blocks + len(
+            same_step_new_block_ids
+        ):
+            raise ValueError("Canonical block count does not match reclaim transition")
+
+        old_blocks = current_blocks[:expected_old_num_blocks]
+        new_blocks = current_blocks[expected_old_num_blocks:]
+        old_ids = [block.block_id for block in old_blocks]
+        if len(set(old_ids)) != len(old_ids):
+            raise ValueError("Old canonical block IDs must be unique")
+        if [block.block_id for block in new_blocks] != same_step_new_block_ids:
+            raise ValueError("Same-step blocks do not match canonical ownership tail")
+        if len(set(retained_block_ids)) != len(retained_block_ids):
+            raise ValueError("Retained block IDs must be unique")
+        if not retained_block_ids or len(retained_block_ids) >= expected_old_num_blocks:
+            raise ValueError("Reclaim must retain a non-empty strict subset")
+
+        old_positions = {block_id: i for i, block_id in enumerate(old_ids)}
+        try:
+            retained_positions = [
+                old_positions[block_id] for block_id in retained_block_ids
+            ]
+        except KeyError as exc:
+            raise ValueError("Retained block does not belong to old ownership") from exc
+        if retained_positions != sorted(retained_positions):
+            raise ValueError("Retained blocks must preserve old ownership order")
+
+        final_ids = [*retained_block_ids, *same_step_new_block_ids]
+        if len(set(final_ids)) != len(final_ids):
+            raise ValueError("Final canonical block IDs must be unique")
+
+        retained_set = set(retained_block_ids)
+        removed_blocks = [
+            block for block in old_blocks if block.block_id not in retained_set
+        ]
+        if any(block.ref_cnt <= 0 or block.is_null for block in removed_blocks):
+            raise ValueError("Removed blocks must be live, non-null ownership")
+        final_blocks = [old_blocks[i] for i in retained_positions] + list(new_blocks)
+
+        # Ownership must stop naming a block before the pool can make it reusable.
+        self.req_to_blocks[request_id] = final_blocks
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id], len(final_blocks)
+            )
+        self.block_pool.free_blocks(reversed(removed_blocks))
+        return [block.block_id for block in removed_blocks]
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

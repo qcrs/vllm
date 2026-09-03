@@ -22,11 +22,17 @@ class InputBuffers:
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+        self.cache_positions = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.effective_kv_seq_lens = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
         # DCP: per-request local seq_lens buffer
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
@@ -84,8 +90,12 @@ class InputBatch:
     input_ids: torch.Tensor
     # [num_tokens_after_padding]
     positions: torch.Tensor
+    # [num_tokens_after_padding] physical KV sequence coordinates
+    cache_positions: torch.Tensor
     # [num_tokens_after_padding]
     is_padding: torch.Tensor
+    # [num_reqs_after_padding] physical KV length including current query
+    effective_kv_seq_lens: torch.Tensor
 
     # [total_num_logits]
     logits_indices: torch.Tensor
@@ -122,6 +132,10 @@ class InputBatch:
         # seq_len equals to query_len
         input_buffers.seq_lens[:num_reqs] = num_tokens // num_reqs
         input_buffers.seq_lens[num_reqs - 1] += num_tokens % num_reqs
+        input_buffers.effective_kv_seq_lens[:num_reqs].copy_(
+            input_buffers.seq_lens[:num_reqs]
+        )
+        input_buffers.effective_kv_seq_lens[num_reqs:].zero_()
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
         seq_lens = input_buffers.seq_lens[:num_reqs]
@@ -139,6 +153,7 @@ class InputBatch:
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
+        cache_positions = input_buffers.cache_positions[:num_tokens].zero_()
 
         input_buffers.is_padding[:num_tokens].fill_(True)
         is_padding = input_buffers.is_padding[:num_tokens]
@@ -173,7 +188,9 @@ class InputBatch:
             max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,
+            cache_positions=cache_positions,
             is_padding=is_padding,
+            effective_kv_seq_lens=input_buffers.effective_kv_seq_lens[:num_reqs],
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -245,10 +262,13 @@ def prepare_prefill_inputs(
 @triton.jit
 def _prepare_pos_seq_lens_kernel(
     pos_ptr,
+    cache_pos_ptr,
     seq_lens_ptr,
+    effective_kv_seq_lens_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
+    effective_kv_len_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -260,10 +280,12 @@ def _prepare_pos_seq_lens_kernel(
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < max_num_reqs
             tl.store(seq_lens_ptr + block, 0, mask=mask)
+            tl.store(effective_kv_seq_lens_ptr + block, 0, mask=mask)
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
+    effective_kv_len = tl.load(effective_kv_len_ptr + req_state_idx)
 
     start = tl.load(query_start_loc_ptr + req_id)
     end = tl.load(query_start_loc_ptr + req_id + 1)
@@ -271,12 +293,15 @@ def _prepare_pos_seq_lens_kernel(
 
     seq_len = num_computed_tokens + query_len
     tl.store(seq_lens_ptr + req_id, seq_len)
+    tl.store(effective_kv_seq_lens_ptr + req_id, effective_kv_len + query_len)
 
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         pos = num_computed_tokens + block
         tl.store(pos_ptr + start + block, pos, mask=mask)
+        cache_pos = effective_kv_len + block
+        tl.store(cache_pos_ptr + start + block, cache_pos, mask=mask)
 
 
 def prepare_pos_seq_lens(
@@ -285,16 +310,28 @@ def prepare_pos_seq_lens(
     num_computed_tokens: torch.Tensor,
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    cache_pos: torch.Tensor | None = None,
+    effective_kv_seq_lens: torch.Tensor | None = None,
+    effective_kv_len: torch.Tensor | None = None,
 ) -> None:
+    if cache_pos is None:
+        cache_pos = pos
+    if effective_kv_seq_lens is None:
+        effective_kv_seq_lens = seq_lens
+    if effective_kv_len is None:
+        effective_kv_len = num_computed_tokens
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
+        cache_pos,
         seq_lens,
+        effective_kv_seq_lens,
         idx_mapping,
         query_start_loc,
         num_computed_tokens,
+        effective_kv_len,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )
@@ -459,6 +496,7 @@ def get_num_sampled_and_rejected(
 def _post_update_kernel(
     idx_mapping_ptr,
     num_computed_tokens_ptr,
+    effective_kv_len_ptr,
     last_sampled_tokens_ptr,
     output_bin_counts_ptr,
     output_bin_counts_stride,
@@ -514,6 +552,8 @@ def _post_update_kernel(
     if computed_delta != 0:
         num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+        effective_len = tl.load(effective_kv_len_ptr + req_state_idx)
+        tl.store(effective_kv_len_ptr + req_state_idx, effective_len + computed_delta)
 
 
 def post_update(
@@ -521,6 +561,8 @@ def post_update(
     idx_mapping: torch.Tensor,
     # [max_num_reqs]
     num_computed_tokens: torch.Tensor,
+    # [max_num_reqs]
+    effective_kv_len: torch.Tensor,
     # [max_num_reqs]
     last_sampled_tokens: torch.Tensor,
     # [max_num_reqs, vocab_size]
@@ -542,6 +584,7 @@ def post_update(
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
+        effective_kv_len,
         last_sampled_tokens,
         output_bin_counts,
         output_bin_counts.stride(0) if output_bin_counts is not None else 0,

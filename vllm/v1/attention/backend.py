@@ -439,6 +439,9 @@ class CommonAttentionMetadata:
 
     causal: bool | torch.Tensor = True
 
+    effective_kv_seq_lens: torch.Tensor | None = None
+    """Physical KV length including the current query; seq_lens stays logical."""
+
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
@@ -568,6 +571,7 @@ class CommonAttentionMetadata:
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
+            effective_kv_seq_lens=maybe_slice_reqs(self.effective_kv_seq_lens),
             _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
             if self._seq_lens_cpu is not None
             else None,

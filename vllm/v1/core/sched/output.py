@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -111,6 +111,13 @@ class NewRequestData:
 
 
 @dataclass
+class ReclaimTransitionData:
+    retained_block_ids: list[int]
+    new_effective_kv_len: int
+    expected_old_num_blocks: int
+
+
+@dataclass
 class CachedRequestData:
     req_ids: list[str]
     # For request ids not in resumed_req_ids, new_block_ids will be appended to
@@ -126,8 +133,15 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Aligned with req_ids; None preserves the normal cached-request path.
+    # 如果为空 创建一个 list 字段
+    reclaim_transitions: list[ReclaimTransitionData | None] = field(
+        default_factory=list
+    )
 
     # Version of dataclass repr with token IDs obfuscated.
+    # 核心运行逻辑 日志
+    # 给 CachedRequestData 生成一个适合日志/debug 的字符串表示，同时避免把 token IDs 全打印出来。
     def anon_repr(self) -> str:
         new_token_ids_lens = [len(toks) for toks in self.new_token_ids]
         all_token_ids_lens = {
@@ -142,6 +156,8 @@ class CachedRequestData:
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"num_output_tokens={self.num_output_tokens}"
+            f",reclaim_transition_counts="
+            f"{[len(t.retained_block_ids) if t is not None else None for t in self.reclaim_transitions]}"
             f")"
         )
 
@@ -176,6 +192,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            reclaim_transitions=[],
         )
 
 

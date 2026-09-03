@@ -68,6 +68,17 @@ from vllm.v1.worker.cp_utils import (
 logger = init_logger(__name__)
 
 
+def _select_kv_seq_lens(
+    common_attn_metadata: CommonAttentionMetadata,
+    *,
+    use_effective: bool = True,
+) -> torch.Tensor:
+    """Use physical KV visibility when provided, else preserve upstream behavior."""
+    if use_effective and common_attn_metadata.effective_kv_seq_lens is not None:
+        return common_attn_metadata.effective_kv_seq_lens
+    return common_attn_metadata.seq_lens
+
+
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -460,6 +471,17 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+        use_cascade = common_prefix_len > 0
+        use_effective_kv_seq_lens = (
+            common_attn_metadata.effective_kv_seq_lens is not None
+            and self.dcp_world_size == 1
+            and not use_cascade
+        )
+        kv_seq_lens = _select_kv_seq_lens(
+            common_attn_metadata, use_effective=use_effective_kv_seq_lens
+        )
+        # Only the pinned normal FA2 path uses physical visibility. DCP and
+        # cascade retain their upstream logical-length semantics.
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
@@ -529,7 +551,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 )
             return None
 
-        use_cascade = common_prefix_len > 0
         max_dcp_context_kv_len = 0
         dcp_context_kv_lens = None
         num_decode_reqs = 0
@@ -633,7 +654,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 batch_size=num_reqs,
                 cu_query_lens=query_start_loc,
                 max_query_len=max_query_len,
-                seqlens=seq_lens,
+                seqlens=kv_seq_lens,
                 max_seq_len=max_seq_len,
                 causal=causal,
             )
@@ -663,7 +684,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
-            seq_lens=seq_lens,
+            seq_lens=kv_seq_lens,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,

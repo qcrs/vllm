@@ -575,6 +575,7 @@ def build_attn_metadata(
     block_tables: Sequence[torch.Tensor],
     slot_mappings: torch.Tensor,
     kv_cache_config: KVCacheConfig,
+    effective_kv_seq_lens: torch.Tensor | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -590,6 +591,8 @@ def build_attn_metadata(
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
     if seq_lens_cpu_upper_bound is not None:
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+    if effective_kv_seq_lens is not None:
+        effective_kv_seq_lens = effective_kv_seq_lens[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -615,6 +618,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
+            effective_kv_seq_lens=effective_kv_seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             max_seq_len=max_seq_len,
             num_reqs=num_reqs,

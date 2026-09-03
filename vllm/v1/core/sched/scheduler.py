@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -44,6 +44,7 @@ from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
+    ReclaimTransitionData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
@@ -65,6 +66,16 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# 创建后 不可以修改
+@dataclass(frozen=True)
+class _PreparedReclaimPlan:
+    '''
+    这个 request 如果这一步执行 reclaim，我准备保留旧 block row 中哪些位置，
+    以及 reclaim 后 E 应该是多少。
+    '''
+    retained_block_indices: tuple[int, ...]
+    new_effective_kv_len: int
 
 
 class Scheduler(SchedulerInterface):
@@ -184,6 +195,8 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        # Private ingress for an already prepared decision; no policy runs here.
+        self._prepared_reclaim_plans: dict[str, _PreparedReclaimPlan] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -441,6 +454,7 @@ class Scheduler(SchedulerInterface):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        req_to_reclaim_transition: dict[str, ReclaimTransitionData] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -558,6 +572,10 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            tentative_reclaim_transition = self._materialize_reclaim_transition(
+                request.request_id
+            )
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -584,6 +602,7 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
+                            req_to_reclaim_transition.pop(preempted_req_id, None)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
@@ -603,6 +622,7 @@ class Scheduler(SchedulerInterface):
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
+                        self._prepared_reclaim_plans.pop(request.request_id, None)
                         # No more request to preempt. Cannot schedule this request.
                         break
 
@@ -615,6 +635,9 @@ class Scheduler(SchedulerInterface):
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
+            if tentative_reclaim_transition is not None:
+                req_to_reclaim_transition[request_id] = tentative_reclaim_transition
+                self._prepared_reclaim_plans.pop(request_id, None)
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -1111,6 +1134,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
+                req_to_reclaim_transition,
             )
 
         # Record the request ids that were scheduled in this step (MRV1-only).
@@ -1223,6 +1247,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.effective_kv_len = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1333,6 +1358,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_blocks: dict[str, KVCacheBlocks],
+        req_to_reclaim_transition: dict[str, ReclaimTransitionData] | None = None,
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -1340,6 +1366,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        reclaim_transitions: list[ReclaimTransitionData | None] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1374,6 +1401,11 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            reclaim_transitions.append(
+                None
+                if req_to_reclaim_transition is None
+                else req_to_reclaim_transition.get(req_id)
+            )
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1383,6 +1415,46 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            reclaim_transitions=reclaim_transitions,
+        )
+
+    def _set_prepared_reclaim_plan(
+        self,
+        request_id: str,
+        retained_block_indices: tuple[int, ...],
+        new_effective_kv_len: int,
+    ) -> None:
+        """Register an already prepared whole-block decision for one request."""
+        '''
+        _prepared_reclaim_plans 还没进入某一个具体 SchedulerOutput 的 prepared decision
+        req_to_reclaim_transition: dict[str, ReclaimTransitionData] = {} 当前这一轮 schedule() 的局部变量。
+
+        '''
+        self._prepared_reclaim_plans[request_id] = _PreparedReclaimPlan(
+            retained_block_indices, new_effective_kv_len
+        )
+
+    def _materialize_reclaim_transition(
+        self, request_id: str
+    ) -> ReclaimTransitionData | None:
+        plan = self._prepared_reclaim_plans.get(request_id)
+        if plan is None:
+            return None
+        block_ids = self.kv_cache_manager.get_block_ids(request_id)
+        if len(block_ids) != 1:
+            raise ValueError("Prepared reclaim requires one KV cache group")
+        old_row = block_ids[0]
+        indices = plan.retained_block_indices
+        if not indices or len(set(indices)) != len(indices):
+            raise ValueError("Retained block indices must be non-empty and unique")
+        if tuple(sorted(indices)) != indices:
+            raise ValueError("Retained block indices must preserve row order")
+        if indices[0] < 0 or indices[-1] >= len(old_row):
+            raise ValueError("Retained block index is outside the canonical row")
+        return ReclaimTransitionData(
+            retained_block_ids=[old_row[index] for index in indices],
+            new_effective_kv_len=plan.new_effective_kv_len,
+            expected_old_num_blocks=len(old_row),
         )
 
     def _try_schedule_encoder_inputs(
@@ -1623,6 +1695,16 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
+        reclaim_transitions = {
+            req_id: (transition, new_block_ids)
+            for req_id, transition, new_block_ids in zip(
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                scheduler_output.scheduled_cached_reqs.reclaim_transitions,
+                scheduler_output.scheduled_cached_reqs.new_block_ids,
+            )
+            if transition is not None
+        }
+
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
         # MUST precede the per-request routing reads below: stopped
@@ -1671,6 +1753,21 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+
+            reclaim_state = reclaim_transitions.get(req_id)
+            if reclaim_state is not None:
+                transition, same_step_new_block_ids = reclaim_state
+                self.kv_cache_manager.reconcile_reclaimed_blocks(
+                    req_id,
+                    transition.retained_block_ids,
+                    transition.expected_old_num_blocks,
+                    same_step_new_block_ids,
+                )
+                request.effective_kv_len = (
+                    transition.new_effective_kv_len + num_tokens_scheduled
+                )
+            elif request.effective_kv_len is not None:
+                request.effective_kv_len += num_tokens_scheduled
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)

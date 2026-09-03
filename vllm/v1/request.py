@@ -166,6 +166,9 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Completed physical KV frontier after logical/physical state diverges.
+        # None keeps the request on the upstream logical allocation path.
+        self.effective_kv_len: int | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
