@@ -66,6 +66,7 @@ class BlockTables:
 
         # Block tables used for model's forward pass.
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
+        # 本次需要的
         self.input_block_tables: list[torch.Tensor] = [
             torch.zeros_like(b.gpu) for b in self.block_tables
         ]
@@ -208,12 +209,14 @@ class BlockTables:
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def _gather_block_tables_kernel(
-    batch_idx_to_req_idx,  # [batch_size]
-    src_block_table_ptrs,  # [num_kv_cache_groups]
-    dst_block_table_ptrs,  # [num_kv_cache_groups]
-    block_table_strides,  # [num_kv_cache_groups]
-    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
-    num_blocks_stride,
+    batch_idx_to_req_idx,  # [batch_size] 【num_reqs】 idx_mapping 【11，7】 要从 presistent中拿走的
+    src_block_table_ptrs,  # [num_kv_cache_groups] 源地址
+    dst_block_table_ptrs,  # [num_kv_cache_groups] input_block_tables 当前 forward batch 要用的 destination table
+    # Group 每个请求的 大小
+    block_table_strides,  # [num_kv_cache_groups] persistent BlockTable shape 
+    # group之间 横跨的是最大请求数 是 一个group里 每个请求的block的数量
+    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs] persistent BlockTable shape stride(0)=max_num_blocks [num_kv_cache_groups, max_num_reqs]
+    num_blocks_stride, # num_blocks[group] 两个 group 之间的 stride
     num_reqs,  # actual number of requests (for padding)
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -263,6 +266,8 @@ def _compute_slot_mappings_kernel(
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
+    # 一个 Triton program 负责“某个 KV Group 中一个 Request 本轮所有 scheduled tokens 的 slot calculation”。
+    # 最后额外一个 program 负责把剩余 slot 全填 PAD。
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -273,12 +278,13 @@ def _compute_slot_mappings_kernel(
         # Start from actual token count (not padded) to cover the gap
         # between actual tokens and padded tokens that can contain stale
         # valid slot IDs from previous chunks during chunked prefill.
+        # 最后一个
         actual_num_tokens = tl.load(query_start_loc + batch_idx)
         for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
             offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
             tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
         return
-
+    # 融合在了一起 先 load 然后 cast 转化为指针类型
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)

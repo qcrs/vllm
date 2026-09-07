@@ -57,21 +57,26 @@ def reshape_and_cache_kernel_flash(
     # tune parameters
     TILE_SIZE: tl.constexpr,
 ):
+    # 负责吧KV 写到 K V cache里  是二维的 第 0 维 是 token  第 一个维 是 dim
     token_idx = tl.program_id(axis=0)
+    # 先找到 要写进块的位置 物理位置
     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
     if slot_idx < 0:
         # Padding token that should be ignored.
         return
-
+    # 块的 idx 和 offset
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
-
+    # 并行写入
     tile_i = tl.program_id(axis=1)
+    # 一个 program 负责 TILE_SIZE
     tile_offs = tl.arange(0, TILE_SIZE)
+    # 确定 pos
     tile_pos = tile_i * TILE_SIZE + tile_offs
+    # 确定 src的 位置 
     src_key_idx = token_idx * key_stride
     src_value_idx = token_idx * value_stride
-
+    # contexxptr 编译的时候确定好了 所以 额米有if的问题
     if USE_HEAD_MAJOR_LAYOUT:
         # Decompose the tile index back into head and dim coordinates.
         cur_head = tile_pos // head_size
@@ -92,6 +97,7 @@ def reshape_and_cache_kernel_flash(
             + (cur_dim % x)
         )
     else:
+        # pos 是一个 范围 所以 得到 每个维度的 写入哪个头的具体位置
         cur_head = tile_pos // head_size
         cur_dim = tile_pos % head_size
         tgt_idx_k = (

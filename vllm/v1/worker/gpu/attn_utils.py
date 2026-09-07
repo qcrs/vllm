@@ -169,7 +169,7 @@ def init_attn_backend(
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
-def _allocate_kv_cache(
+def  _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}

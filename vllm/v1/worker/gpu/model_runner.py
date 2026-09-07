@@ -409,6 +409,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return get_kv_cache_spec(self.vllm_config)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        # 深拉票呢哦 建立 本地得runtime
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -502,6 +503,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
+            #  runner 持有最终 tensor references
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
@@ -1551,6 +1553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get prefill tokens if any.
         if np.any(is_prefilling_np):
+            # 去准备把对应的片段拿出来
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
@@ -1561,7 +1564,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        # Prepare positions and seq_lens.
+        # Prepare positions and seq_lens. 计算position的位置 
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
@@ -1592,6 +1595,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        # decode 在这里处理
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -1681,6 +1685,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
+            # 函数内 这是计算地图 所以 不许哟啊原本的 positon
+            
+            # block table 只告诉你“第 N 个逻辑 block 对应哪个物理 block”。
+            # 传入 postion block_index = 18 // 16 = 1 block_offset = 18 % 16 = 2
             input_batch.cache_positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )

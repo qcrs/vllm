@@ -563,6 +563,7 @@ class SingleTypeKVCacheManager(ABC):
         # Ownership must stop naming a block before the pool can make it reusable.
         self.req_to_blocks[request_id] = final_blocks
         if request_id in self.num_cached_block:
+            # 如果是 再计算中中 id
             self.num_cached_block[request_id] = min(
                 self.num_cached_block[request_id], len(final_blocks)
             )
