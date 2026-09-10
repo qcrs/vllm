@@ -2,11 +2,100 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    CompactionPlanData,
+    CompactionResultData,
+    SchedulerOutput,
+)
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.core.sched.output import CachedRequestData
-
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 LOCAL_MODEL = "/data/models/Qwen3-0.6B"
+
+
+def test_v2_compaction_contract_fields_and_source_semantics() -> None:
+    plan = CompactionPlanData("request-a", [0, 2, 5], 48, 3, step_seq=7)
+    assert plan.request_id == "request-a"
+    assert plan.keep_member_indices == [0, 2, 5]
+    assert plan.expected_source_effective_kv_len == 48
+    assert plan.expected_source_num_blocks == 3
+    assert plan.step_seq == 7
+
+    result = CompactionResultData("request-a", 48, 3, 3, 1, step_seq=7)
+    assert result.request_id == "request-a"
+    assert result.expected_source_effective_kv_len == 48
+    assert result.expected_source_num_blocks == 3
+    assert (result.new_effective_kv_len, result.new_num_blocks) == (3, 1)
+    assert result.step_seq == 7
+
+
+def test_v2_plan_scheduler_output_to_worker_preserves_request_mapping() -> None:
+    plan_a = CompactionPlanData("request-a", [0, 2], 32, 2)
+    plan_c = CompactionPlanData("request-c", [1, 3], 64, 4)
+    output = SchedulerOutput.make_empty()
+    output.compaction_plans = {"request-a": plan_a, "request-c": plan_c}
+
+    received = GPUModelRunner.extract_compaction_plans(output)
+    assert list(received) == ["request-a", "request-c"]
+    assert received["request-a"].keep_member_indices == [0, 2]
+    assert received["request-c"].keep_member_indices == [1, 3]
+
+
+def test_v2_result_model_runner_output_to_scheduler_carrier() -> None:
+    result_a = CompactionResultData("request-a", 48, 3, 3, 1, step_seq=11)
+    result_c = CompactionResultData("request-c", 80, 5, 17, 2, step_seq=11)
+    output = ModelRunnerOutput(
+        req_ids=["request-a", "request-c"],
+        req_id_to_index={"request-a": 0, "request-c": 1},
+        compaction_results=[result_a, result_c],
+    )
+
+    Scheduler._validate_compaction_results(output.compaction_results)
+    assert [r.request_id for r in output.compaction_results] == [
+        "request-a",
+        "request-c",
+    ]
+    assert output.compaction_results[1].new_num_blocks == 2
+
+
+def test_v2_prepared_plan_is_materialized_only_for_scheduled_request() -> None:
+    scheduler = create_scheduler(
+        model=LOCAL_MODEL,
+        skip_tokenizer_init=True,
+        max_num_seqs=1,
+        max_num_batched_tokens=16,
+        max_model_len=64,
+        num_blocks=8,
+        block_size=16,
+        use_v2_model_runner=True,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=20,
+        req_ids=["request-a"],
+        block_size=16,
+    )
+    scheduler.add_request(request)
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[0]],
+        ),
+    )
+    scheduler._set_prepared_compaction_plan(
+        request.request_id, [0, 1], 32, 2, step_seq=2
+    )
+    second_output = scheduler.schedule()
+    assert second_output.compaction_plans == {
+        request.request_id: CompactionPlanData(
+            request.request_id, [0, 1], 32, 2, step_seq=2
+        )
+    }
 
 
 def test_cached_request_reclaim_transport_is_aligned_after_allocation() -> None:

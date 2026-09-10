@@ -117,6 +117,47 @@ class ReclaimTransitionData:
     expected_old_num_blocks: int
 
 
+@dataclass(frozen=True)
+class CompactionPlanData:
+    """Scheduler-owned V2 post-forward compaction plan.
+
+    ``expected_source_effective_kv_len`` describes the physical source extent
+    *after the current forward* (for example, 32 + 16 = 48), not the
+    forward-entry extent. ``keep_member_indices`` indexes that current
+    physical member sequence and preserves the producer's order.
+    Scheduler 告诉 Worker：“这个 request 在本轮 forward 做完以后，
+        请基于这个 source state，保留这些 members。”
+    """
+
+    request_id: str
+    keep_member_indices: list[int]
+    # 没有裁剪之前的KV_len
+    expected_source_effective_kv_len: int
+    expected_source_num_blocks: int
+    # 给哪一个 step的
+    step_seq: int | None = None
+
+# 简化了类的实现 比如  不需要初始化之类的 也可以直接访问 更像是结构体
+# frozen 被创建后 不应该被重新赋值
+@dataclass(frozen=True)
+class CompactionResultData:
+    """Worker-reported V2 post-forward physical compaction result.
+
+    The result reports the completed physical shape; it does not report
+    allocator-authoritative freed IDs. The Scheduler will later reconcile its
+    canonical row from ``new_num_blocks``.
+    “我已经做完，并且现在 physical state 是这样”
+    Worker->Scheduler
+    """
+
+    request_id: str
+    expected_source_effective_kv_len: int
+    expected_source_num_blocks: int
+    new_effective_kv_len: int
+    new_num_blocks: int
+    step_seq: int | None = None
+
+
 @dataclass
 class CachedRequestData:
     req_ids: list[str]
@@ -275,6 +316,12 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Request-indexed V2 plans. Plans describe the post-forward source state;
+    # an empty mapping preserves the normal path.
+    # str request
+    # field 描述如何初始化 {} 可能会被多实例共享
+    compaction_plans: dict[str, CompactionPlanData] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

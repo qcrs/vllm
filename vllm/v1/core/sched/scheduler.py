@@ -42,6 +42,8 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    CompactionPlanData,
+    CompactionResultData,
     GrammarOutput,
     NewRequestData,
     ReclaimTransitionData,
@@ -197,6 +199,7 @@ class Scheduler(SchedulerInterface):
         self.running: list[Request] = []
         # Private ingress for an already prepared decision; no policy runs here.
         self._prepared_reclaim_plans: dict[str, _PreparedReclaimPlan] = {}
+        self._prepared_compaction_plans: dict[str, CompactionPlanData] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -455,6 +458,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         req_to_reclaim_transition: dict[str, ReclaimTransitionData] = {}
+        compaction_plans: dict[str, CompactionPlanData] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -623,6 +627,7 @@ class Scheduler(SchedulerInterface):
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         self._prepared_reclaim_plans.pop(request.request_id, None)
+                        self._prepared_compaction_plans.pop(request.request_id, None)
                         # No more request to preempt. Cannot schedule this request.
                         break
 
@@ -638,6 +643,13 @@ class Scheduler(SchedulerInterface):
             if tentative_reclaim_transition is not None:
                 req_to_reclaim_transition[request_id] = tentative_reclaim_transition
                 self._prepared_reclaim_plans.pop(request_id, None)
+            compaction_plan = self._prepared_compaction_plans.pop(request_id, None)
+            if compaction_plan is not None:
+                if compaction_plan.request_id != request_id:
+                    raise ValueError("Compaction plan request identity mismatch")
+                # The explicit plan is transport-only in this Slice; its
+                # post-forward source fence is not checked until M5-T2.
+                compaction_plans[request_id] = compaction_plan
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -1188,6 +1200,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            compaction_plans=compaction_plans,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1434,6 +1447,23 @@ class Scheduler(SchedulerInterface):
             retained_block_indices, new_effective_kv_len
         )
 
+    def _set_prepared_compaction_plan(
+        self,
+        request_id: str,
+        keep_member_indices: list[int],
+        expected_source_effective_kv_len: int,
+        expected_source_num_blocks: int,
+        step_seq: int | None = None,
+    ) -> None:
+        """Register an explicit V2 plan for schedule-time transport only."""
+        self._prepared_compaction_plans[request_id] = CompactionPlanData(
+            request_id=request_id,
+            keep_member_indices=keep_member_indices,
+            expected_source_effective_kv_len=expected_source_effective_kv_len,
+            expected_source_num_blocks=expected_source_num_blocks,
+            step_seq=step_seq,
+        )
+
     def _materialize_reclaim_transition(
         self, request_id: str
     ) -> ReclaimTransitionData | None:
@@ -1658,11 +1688,23 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    @staticmethod
+    def _validate_compaction_results(
+        results: list[CompactionResultData],
+    ) -> None:
+        """Validate V2 result carrier shape without applying physical state."""
+        request_ids: set[str] = set()
+        for result in results:
+            if result.request_id in request_ids:
+                raise ValueError("Duplicate compaction result request ID")
+            request_ids.add(result.request_id)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._validate_compaction_results(model_runner_output.compaction_results)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

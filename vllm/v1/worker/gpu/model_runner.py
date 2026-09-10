@@ -21,6 +21,7 @@ import functools
 import gc
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -48,7 +49,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CompactionPlanData,
+    GrammarOutput,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -116,6 +121,20 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _PreparedCompaction:
+    request_id: str
+    req_state_idx: int
+    batch_idx: int
+    source_effective_kv_len: int
+    source_num_blocks: int
+    block_ids: tuple[int, ...]
+    block_size: int
+    keep_member_indices: tuple[int, ...]
+    new_effective_kv_len: int
+    new_num_blocks: int
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1769,6 +1788,151 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    @staticmethod
+    def extract_compaction_plans(
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, CompactionPlanData]:
+        """Read the Scheduler→Worker V2 plan carrier without executing it."""
+        plans = scheduler_output.compaction_plans
+        if not isinstance(plans, dict):
+            raise TypeError("compaction_plans must be a request-indexed dict")
+        for request_id, plan in plans.items():
+            if not isinstance(plan, CompactionPlanData):
+                raise TypeError("compaction_plans values must be CompactionPlanData")
+            if request_id != plan.request_id:
+                raise ValueError("Compaction plan request identity mismatch")
+        return plans
+
+    def _prepare_v2_compactions(
+        self,
+        compaction_plans: dict[str, CompactionPlanData],
+        input_batch: InputBatch,
+    ) -> dict[str, _PreparedCompaction]:
+        """Validate post-forward V2 sources without mutating runtime state."""
+        if not compaction_plans:
+            return {}
+        if self.block_tables.num_kv_cache_groups != 1:
+            raise ValueError("V2 compaction requires exactly one KV cache group")
+
+        block_size = self.block_tables.block_sizes[0]
+        if not isinstance(block_size, int) or block_size <= 0:
+            raise ValueError("V2 compaction block_size must be positive")
+        if not self.kv_caches:
+            raise ValueError("V2 compaction requires initialized layer KV caches")
+
+        batch_indices = {
+            request_id: batch_idx
+            for batch_idx, request_id in enumerate(input_batch.req_ids)
+        }
+        prepared: dict[str, _PreparedCompaction] = {}
+        for request_id, plan in compaction_plans.items():
+            if request_id != plan.request_id:
+                raise ValueError("Compaction plan request identity mismatch")
+            req_state_idx = self.req_states.req_id_to_index.get(request_id)
+            if req_state_idx is None:
+                raise ValueError(f"V2 compaction request is missing: {request_id}")
+            batch_idx = batch_indices.get(request_id)
+            if batch_idx is None:
+                raise ValueError(
+                    f"V2 compaction request is not in the current batch: {request_id}"
+                )
+            if int(input_batch.idx_mapping_np[batch_idx]) != req_state_idx:
+                raise ValueError(
+                    f"V2 compaction request index mapping is stale: {request_id}"
+                )
+
+            source_effective_kv_len = int(
+                input_batch.effective_kv_seq_lens[batch_idx].item()
+            )
+            if source_effective_kv_len <= 0:
+                raise ValueError(
+                    "V2 compaction source effective KV length must be positive"
+                )
+            if source_effective_kv_len != plan.expected_source_effective_kv_len:
+                raise ValueError(
+                    f"V2 compaction source effective KV length mismatch: {request_id}"
+                )
+
+            source_num_blocks = int(
+                self.block_tables.num_blocks.np[0, req_state_idx]
+            )
+            if source_num_blocks <= 0:
+                raise ValueError("V2 compaction source block count must be positive")
+            if source_num_blocks != plan.expected_source_num_blocks:
+                raise ValueError(
+                    f"V2 compaction source block count mismatch: {request_id}"
+                )
+            if source_num_blocks * block_size < source_effective_kv_len:
+                raise ValueError(
+                    "V2 compaction source blocks do not cover source extent"
+                )
+
+            keep_member_indices = plan.keep_member_indices
+            if not isinstance(keep_member_indices, list) or not keep_member_indices:
+                raise ValueError("keep_member_indices must be a non-empty list")
+            if any(
+                not isinstance(index, int) or isinstance(index, bool)
+                for index in keep_member_indices
+            ):
+                raise TypeError("keep_member_indices values must be integers")
+            if keep_member_indices[0] < 0:
+                raise ValueError("keep_member_indices must be non-negative")
+            if any(
+                current <= previous
+                for previous, current in zip(
+                    keep_member_indices, keep_member_indices[1:]
+                )
+            ):
+                raise ValueError("keep_member_indices must be strictly increasing")
+            if keep_member_indices[-1] >= source_effective_kv_len:
+                raise ValueError("keep_member_indices exceed the source extent")
+
+            new_effective_kv_len = len(keep_member_indices)
+            new_num_blocks = cdiv(new_effective_kv_len, block_size)
+            if not 0 < new_num_blocks <= source_num_blocks:
+                raise ValueError("V2 compaction destination block count is invalid")
+
+            block_ids_tensor = self.block_tables.block_tables[0].gpu[
+                req_state_idx, :source_num_blocks
+            ]
+            block_ids = tuple(int(block_id) for block_id in block_ids_tensor.tolist())
+            if len(set(block_ids)) != source_num_blocks or any(
+                block_id < 0 for block_id in block_ids
+            ):
+                raise ValueError("V2 compaction active block IDs are invalid")
+            max_block_id = max(block_ids)
+            for layer_idx, kv_cache in enumerate(self.kv_caches):
+                if kv_cache.ndim != 4:
+                    raise ValueError(
+                        f"V2 compaction layer {layer_idx} KV cache must be 4D"
+                    )
+                if kv_cache.shape[2] != block_size:
+                    raise ValueError(
+                        f"V2 compaction layer {layer_idx} block size mismatch"
+                    )
+                if max_block_id >= kv_cache.shape[0]:
+                    raise ValueError(
+                        f"V2 compaction layer {layer_idx} lacks a source block"
+                    )
+                if kv_cache.device != block_ids_tensor.device:
+                    raise ValueError(
+                        f"V2 compaction layer {layer_idx} device mismatch"
+                    )
+
+            prepared[request_id] = _PreparedCompaction(
+                request_id=request_id,
+                req_state_idx=req_state_idx,
+                batch_idx=batch_idx,
+                source_effective_kv_len=source_effective_kv_len,
+                source_num_blocks=source_num_blocks,
+                block_ids=block_ids,
+                block_size=block_size,
+                keep_member_indices=tuple(keep_member_indices),
+                new_effective_kv_len=new_effective_kv_len,
+                new_num_blocks=new_num_blocks,
+            )
+        return prepared
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1778,6 +1942,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        compaction_plans = self.extract_compaction_plans(scheduler_output)
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1998,6 +2163,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        prepared_compactions = self._prepare_v2_compactions(
+            compaction_plans, input_batch
+        )
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -2006,6 +2174,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            prepared_compactions=prepared_compactions,
         )
 
         if not self.is_last_pp_rank:
@@ -2270,6 +2439,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    prepared_compactions: dict[str, _PreparedCompaction]
 
 
 def sort_batch_req_ids(
