@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.v1.core.sched.output import CompactionPlanData
+from vllm.v1.worker.gpu import model_runner as model_runner_module
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
@@ -48,6 +49,7 @@ def _plan(
     request_id: str = "request-a",
     source_effective_kv_len: int = 10,
     source_num_blocks: int = 3,
+    step_seq: int | None = None,
 ):
     return CompactionPlanData(
         request_id=request_id,
@@ -58,6 +60,7 @@ def _plan(
         ),
         expected_source_effective_kv_len=source_effective_kv_len,
         expected_source_num_blocks=source_num_blocks,
+        step_seq=step_seq,
     )
 
 
@@ -153,7 +156,7 @@ def test_prepare_v2_compaction_rejects_stale_index_mapping():
 
 
 def test_prepare_v2_compaction_rejects_insufficient_source_capacity():
-    with pytest.raises(ValueError, match="do not cover source extent"):
+    with pytest.raises(ValueError, match="exact page count"):
         _runner(source_blocks=2)._prepare_v2_compactions(
             {"request-a": _plan(source_num_blocks=2)}, _batch()
         )
@@ -176,3 +179,218 @@ def test_prepare_v2_compaction_prevalidates_every_layer():
 
     with pytest.raises(ValueError, match="layer 1 block size mismatch"):
         runner._prepare_v2_compactions({"request-a": _plan()}, _batch())
+
+
+def test_execute_v2_compaction_compacts_all_layers_and_stages_next_state(
+    monkeypatch,
+):
+    runner = _runner()
+    runner.device = torch.device("cpu")
+    batch = _batch()
+    batch.num_reqs = len(batch.req_ids)
+    staged = []
+
+    def append_block_ids(req_state_idx, new_block_ids, overwrite):
+        staged.append((req_state_idx, new_block_ids, overwrite))
+
+    runner.block_tables.append_block_ids = append_block_ids
+    calls = []
+
+    def fake_compact(kv_cache, block_ids, source_effective_kv_len, keep):
+        calls.append(
+            (kv_cache, block_ids.clone(), source_effective_kv_len, keep.clone())
+        )
+        kv_cache[5, :, 0, :] = 9
+        return int(keep.numel()), 2
+
+    monkeypatch.setattr(
+        model_runner_module, "compact_paged_kv_triton_2d", fake_compact
+    )
+
+    prepared = runner._prepare_v2_compactions(
+        {"request-a": _plan(step_seq=17)}, batch
+    )
+    override_valid, override_value, results = runner._execute_v2_compactions(
+        prepared, batch
+    )
+
+    assert len(calls) == 2
+    assert all(call[1].tolist() == [5, 1, 3] for call in calls)
+    assert all(call[2] == 10 for call in calls)
+    assert all(call[3].tolist() == [0, 2, 5, 8, 9] for call in calls)
+    assert staged == [(2, ([5, 1],), True)]
+    assert override_valid.tolist() == [True, False]
+    assert override_value.tolist() == [5, 0]
+    assert results[0].request_id == "request-a"
+    assert results[0].new_effective_kv_len == 5
+    assert results[0].new_num_blocks == 2
+    assert results[0].step_seq == 17
+    assert all(torch.all(cache[5, :, 0, :] == 9) for cache in runner.kv_caches)
+
+
+def test_execute_v2_compaction_does_not_publish_success_after_layer_failure(
+    monkeypatch,
+):
+    runner = _runner()
+    runner.device = torch.device("cpu")
+    batch = _batch()
+    batch.num_reqs = len(batch.req_ids)
+    staged = []
+    runner.block_tables.append_block_ids = lambda *args, **kwargs: staged.append(
+        (args, kwargs)
+    )
+    calls = 0
+
+    def failing_compact(kv_cache, block_ids, source_effective_kv_len, keep):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected M4 failure")
+        kv_cache[5, :, 0, :] = 9
+        return int(keep.numel()), 2
+
+    monkeypatch.setattr(
+        model_runner_module, "compact_paged_kv_triton_2d", failing_compact
+    )
+
+    prepared = runner._prepare_v2_compactions({"request-a": _plan()}, batch)
+    with pytest.raises(RuntimeError, match="injected M4 failure"):
+        runner._execute_v2_compactions(prepared, batch)
+
+    assert calls == 2
+    assert staged == []
+    assert torch.all(runner.kv_caches[0][5, :, 0, :] == 9)
+    assert torch.all(runner.kv_caches[1][5, :, 0, :] == 1)
+
+
+def test_execute_v2_compaction_payload_failure_does_not_stage_prior_request(
+    monkeypatch,
+):
+    runner = _runner()
+    runner.device = torch.device("cpu")
+    runner.block_tables.block_tables[0].gpu[0, 0] = 7
+    runner.block_tables.num_blocks.np[0, 0] = 1
+    batch = _batch()
+    batch.num_reqs = len(batch.req_ids)
+    batch.effective_kv_seq_lens = torch.tensor([10, 4], dtype=torch.int32)
+    before_num_blocks = runner.block_tables.num_blocks.np.copy()
+    staged = []
+    runner.block_tables.append_block_ids = lambda *args, **kwargs: staged.append(
+        (args, kwargs)
+    )
+    calls = 0
+
+    def failing_second_request(kv_cache, block_ids, source_effective_kv_len, keep):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("injected request-B failure")
+        return int(keep.numel()), (int(keep.numel()) + 3) // 4
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "compact_paged_kv_triton_2d",
+        failing_second_request,
+    )
+
+    plans = {
+        "request-a": _plan(step_seq=1),
+        "request-b": _plan(
+            request_id="request-b",
+            keep_member_indices=[0, 2, 3],
+            source_effective_kv_len=4,
+            source_num_blocks=1,
+            step_seq=1,
+        ),
+    }
+    prepared = runner._prepare_v2_compactions(plans, batch)
+    with pytest.raises(RuntimeError, match="request-B failure"):
+        runner._execute_v2_compactions(prepared, batch)
+
+    assert calls == 3
+    assert staged == []
+    np.testing.assert_array_equal(runner.block_tables.num_blocks.np, before_num_blocks)
+
+
+def test_execute_v2_compaction_preserves_result_identity_for_multiple_requests(
+    monkeypatch,
+):
+    runner = _runner()
+    runner.device = torch.device("cpu")
+
+    # request-b:
+    # req_state_idx=0, source_E=4, source_num_blocks=1, physical block=[7]
+    runner.block_tables.block_tables[0].gpu[0, 0] = 7
+    runner.block_tables.num_blocks.np[0, 0] = 1
+
+    batch = _batch()
+    batch.num_reqs = len(batch.req_ids)
+
+    staged = []
+
+    def append_block_ids(req_state_idx, new_block_ids, overwrite):
+        staged.append((req_state_idx, new_block_ids, overwrite))
+
+    runner.block_tables.append_block_ids = append_block_ids
+
+    calls = []
+
+    def fake_compact(kv_cache, block_ids, source_effective_kv_len, keep):
+        calls.append(
+            (
+                block_ids.clone(),
+                source_effective_kv_len,
+                keep.clone(),
+            )
+        )
+        new_effective_kv_len = int(keep.numel())
+        new_num_blocks = (new_effective_kv_len + 3) // 4
+        return new_effective_kv_len, new_num_blocks
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "compact_paged_kv_triton_2d",
+        fake_compact,
+    )
+
+    plans = {
+        "request-a": _plan(step_seq=17),
+        "request-b": _plan(
+            request_id="request-b",
+            keep_member_indices=[0, 2, 3],
+            source_effective_kv_len=4,
+            source_num_blocks=1,
+            step_seq=18,
+        ),
+    }
+
+    prepared = runner._prepare_v2_compactions(plans, batch)
+
+    override_valid, override_value, results = runner._execute_v2_compactions(
+        prepared,
+        batch,
+    )
+
+    # Two requests × two KV layers.
+    assert len(calls) == 4
+
+    # request-a keeps 5 members => 2 pages.
+    # request-b keeps 3 members => 1 page.
+    assert staged == [
+        (2, ([5, 1],), True),
+        (0, ([7],), True),
+    ]
+
+    assert override_valid.tolist() == [True, True]
+    assert override_value.tolist() == [5, 3]
+
+    # Regression: Phase 2 must use prepared.request_id rather than the stale
+    # request_id left behind by the Phase 1 loop.
+    assert [result.request_id for result in results] == [
+        "request-a",
+        "request-b",
+    ]
+
+    assert [result.new_effective_kv_len for result in results] == [5, 3]
+    assert [result.new_num_blocks for result in results] == [2, 1]
+    assert [result.step_seq for result in results] == [17, 18]

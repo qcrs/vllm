@@ -12,8 +12,8 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
     _select_kv_seq_lens,
 )
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.input_batch import post_update, prepare_pos_seq_lens
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -85,6 +85,58 @@ class TestEffectiveKVState(unittest.TestCase):
 
         self.assertEqual(state.num_computed_tokens.gpu[req_idx].item(), 129)
         self.assertEqual(state.effective_kv_len.gpu[req_idx].item(), 65)
+
+    def test_v2_override_is_absolute_when_computed_delta_is_zero(self) -> None:
+        state = make_request_state()
+        req_idx = add_request(state, "request-a", 128)
+        override_valid = torch.tensor([True], dtype=torch.bool, device="cuda")
+        override_value = torch.tensor([5], dtype=torch.int32, device="cuda")
+
+        post_update(
+            idx_mapping=torch.tensor([req_idx], dtype=torch.int32, device="cuda"),
+            num_computed_tokens=state.num_computed_tokens.gpu,
+            effective_kv_len=state.effective_kv_len.gpu,
+            last_sampled_tokens=state.last_sampled_tokens,
+            output_bin_counts=None,
+            sampled_tokens=torch.tensor([[7]], dtype=torch.int64, device="cuda"),
+            num_sampled=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            num_rejected=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            all_token_ids=state.all_token_ids.gpu,
+            total_len=state.total_len.gpu,
+            effective_kv_len_override_valid=override_valid,
+            effective_kv_len_override=override_value,
+        )
+        torch.accelerator.synchronize()
+
+        self.assertEqual(state.num_computed_tokens.gpu[req_idx].item(), 128)
+        self.assertEqual(state.effective_kv_len.gpu[req_idx].item(), 5)
+
+    def test_v2_override_does_not_add_computed_delta(self) -> None:
+        state = make_request_state()
+        req_idx = add_request(state, "request-a", 128)
+        override_valid = torch.tensor([True], dtype=torch.bool, device="cuda")
+        override_value = torch.tensor([5], dtype=torch.int32, device="cuda")
+
+        post_update(
+            idx_mapping=torch.tensor([req_idx], dtype=torch.int32, device="cuda"),
+            num_computed_tokens=state.num_computed_tokens.gpu,
+            effective_kv_len=state.effective_kv_len.gpu,
+            last_sampled_tokens=state.last_sampled_tokens,
+            output_bin_counts=None,
+            sampled_tokens=torch.tensor([[7]], dtype=torch.int64, device="cuda"),
+            num_sampled=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            num_rejected=torch.tensor([0], dtype=torch.int32, device="cuda"),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            all_token_ids=state.all_token_ids.gpu,
+            total_len=state.total_len.gpu,
+            effective_kv_len_override_valid=override_valid,
+            effective_kv_len_override=override_value,
+        )
+        torch.accelerator.synchronize()
+
+        self.assertEqual(state.num_computed_tokens.gpu[req_idx].item(), 129)
+        self.assertEqual(state.effective_kv_len.gpu[req_idx].item(), 5)
 
     def test_request_slot_reuse_overwrites_state(self) -> None:
         state = make_request_state()

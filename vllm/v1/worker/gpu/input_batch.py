@@ -508,6 +508,8 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    effective_kv_len_override_valid_ptr,
+    effective_kv_len_override_ptr,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -552,6 +554,11 @@ def _post_update_kernel(
     if computed_delta != 0:
         num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+    override_valid = tl.load(effective_kv_len_override_valid_ptr + req_id)
+    if override_valid:
+        override_value = tl.load(effective_kv_len_override_ptr + req_id)
+        tl.store(effective_kv_len_ptr + req_state_idx, override_value)
+    elif computed_delta != 0:
         effective_len = tl.load(effective_kv_len_ptr + req_state_idx)
         tl.store(effective_kv_len_ptr + req_state_idx, effective_len + computed_delta)
 
@@ -579,8 +586,25 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    # [num_reqs] batch-indexed absolute V2 effective length override validity.
+    effective_kv_len_override_valid: torch.Tensor | None = None,
+    # [num_reqs] batch-indexed absolute V2 effective length override value.
+    effective_kv_len_override: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if (effective_kv_len_override_valid is None) != (
+        effective_kv_len_override is None
+    ):
+        raise ValueError(
+            "effective KV length override tensors must be provided together"
+        )
+    if effective_kv_len_override_valid is None:
+        effective_kv_len_override_valid = torch.zeros(
+            num_reqs, dtype=torch.bool, device=idx_mapping.device
+        )
+        effective_kv_len_override = torch.zeros(
+            num_reqs, dtype=effective_kv_len.dtype, device=idx_mapping.device
+        )
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
@@ -596,6 +620,8 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        effective_kv_len_override_valid,
+        effective_kv_len_override,
         num_warps=1,
     )
 

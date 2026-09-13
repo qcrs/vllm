@@ -524,8 +524,8 @@ class KVCacheManager:
         retained_block_ids: list[int],
         expected_old_num_blocks: int,
         same_step_new_block_ids: tuple[list[int], ...] | None,
-    ) -> list[int]:
-        """Publish one dense reclaimed ownership row and release removed blocks."""
+    ) -> list[KVCacheBlock]:
+        """Publish one dense reclaimed ownership row for Scheduler release."""
         if self.num_kv_cache_groups != 1:
             raise ValueError("Physical reclaim supports exactly one KV cache group")
         if same_step_new_block_ids is not None and len(same_step_new_block_ids) != 1:
@@ -538,6 +538,17 @@ class KVCacheManager:
             retained_block_ids,
             expected_old_num_blocks,
             new_block_ids,
+        )
+
+    def reconcile_compacted_blocks(
+        self,
+        request_id: str,
+        expected_source_num_blocks: int,
+        new_num_blocks: int,
+    ) -> list[KVCacheBlock]:
+        """Detach the compacted suffix for Scheduler-owned release."""
+        return self.coordinator.reconcile_compacted_blocks(
+            request_id, expected_source_num_blocks, new_num_blocks
         )
 
     def remove_skipped_blocks(

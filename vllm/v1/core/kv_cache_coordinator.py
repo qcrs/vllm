@@ -303,7 +303,7 @@ class KVCacheCoordinator(ABC):
         retained_block_ids: list[int],
         expected_old_num_blocks: int,
         same_step_new_block_ids: list[int],
-    ) -> list[int]:
+    ) -> list[KVCacheBlock]:
         """Reconcile a single-group request to its dense physical ownership."""
         if len(self.single_type_managers) != 1:
             raise ValueError("Physical reclaim supports exactly one KV cache group")
@@ -312,6 +312,19 @@ class KVCacheCoordinator(ABC):
             retained_block_ids,
             expected_old_num_blocks,
             same_step_new_block_ids,
+        )
+
+    def reconcile_compacted_blocks(
+        self,
+        request_id: str,
+        expected_source_num_blocks: int,
+        new_num_blocks: int,
+    ) -> list[KVCacheBlock]:
+        """Detach a V2 compacted suffix from the canonical row."""
+        if len(self.single_type_managers) != 1:
+            raise ValueError("Physical compaction supports exactly one KV cache group")
+        return self.single_type_managers[0].reconcile_compacted_blocks(
+            request_id, expected_source_num_blocks, new_num_blocks
         )
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:

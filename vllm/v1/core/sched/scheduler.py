@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -78,6 +79,15 @@ class _PreparedReclaimPlan:
     '''
     retained_block_indices: tuple[int, ...]
     new_effective_kv_len: int
+
+
+@dataclass(frozen=True)
+class _PreparedCompactionReconciliation:
+    request_id: str
+    expected_source_num_blocks: int
+    new_effective_kv_len: int
+    new_num_blocks: int
+    step_seq: int | None
 
 
 class Scheduler(SchedulerInterface):
@@ -450,7 +460,13 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-
+        '''
+        两种  compaction_plans 本次准备schedule的
+        self._prepared_compaction_plans: dict[str, CompactionPlanData] = {} 持续持有的 大概关系 是从 _pre 中选择赋值到compacting中 然后传到out
+        所以preemet两种情况 一种 是 加入schduler 需要 premet 只需要 清理 compaction
+        一种是需要清理当前request 则需要 释放整体
+        注意 状态为 compact的时候说明 pre的内容已经被清理
+        '''
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -607,6 +623,7 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             req_to_reclaim_transition.pop(preempted_req_id, None)
+                            compaction_plans.pop(preempted_req_id, None)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
@@ -645,6 +662,10 @@ class Scheduler(SchedulerInterface):
                 self._prepared_reclaim_plans.pop(request_id, None)
             compaction_plan = self._prepared_compaction_plans.pop(request_id, None)
             if compaction_plan is not None:
+                if tentative_reclaim_transition is not None:
+                    raise ValueError(
+                        "V1 reclaim and V2 compaction cannot coexist in one step"
+                    )
                 if compaction_plan.request_id != request_id:
                     raise ValueError("Compaction plan request identity mismatch")
                 # The explicit plan is transport-only in this Slice; its
@@ -1699,12 +1720,179 @@ class Scheduler(SchedulerInterface):
                 raise ValueError("Duplicate compaction result request ID")
             request_ids.add(result.request_id)
 
+    def _prepare_compaction_reconciliations(
+    self,
+    scheduler_output: SchedulerOutput,
+    results: list[CompactionResultData],
+    ) -> tuple[dict[str, _PreparedCompactionReconciliation], set[str]]:
+        """Validate all active V2 receipts before changing canonical state."""
+        '''
+        CompactionResultData],  _PreparedCompactionReconciliation 两者的内容没什么差异 返回的 不一定正确 且有些不需要 所以 要再用一个保存
+        '''
+        prepared: dict[str, _PreparedCompactionReconciliation] = {}
+        stale: set[str] = set()
+
+        plans = scheduler_output.compaction_plans
+
+        # Current-step requests that were actually issued a V2 compaction plan.
+        plan_ids = set(plans)
+
+        # Requests for which the Worker returned a compaction result.
+        result_ids = {result.request_id for result in results}
+
+        # HARDEN-01:
+        # An active request that received a plan must return a result.
+        # Finished / removed requests are allowed to become lifecycle-stale.
+        # 找到 还没结束的requeste
+        for plan_id in plan_ids - result_ids:
+            request = self.requests.get(plan_id)
+            if request is not None and not request.is_finished():
+                raise ValueError("Active compaction plan is missing result")
+
+        block_size = self.block_size
+
+        for result in results:
+            # ------------------------------------------------------------
+            # 1. Result must correspond to a current-step Plan.
+            # ------------------------------------------------------------
+            plan = plans.get(result.request_id)
+            if plan is None:
+                raise ValueError("Compaction result has no matching plan")
+
+            if result.request_id != plan.request_id:
+                raise ValueError("Compaction result request identity mismatch")
+
+            if result.step_seq != plan.step_seq:
+                raise ValueError("Compaction result step sequence mismatch")
+
+            # Worker must report the same source fence that Scheduler put
+            # into the Plan.
+            if (
+                result.expected_source_effective_kv_len
+                != plan.expected_source_effective_kv_len
+                or result.expected_source_num_blocks
+                != plan.expected_source_num_blocks
+            ):
+                raise ValueError("Compaction result source fence mismatch")
+
+            # ------------------------------------------------------------
+            # 2. Lifecycle check.
+            # ------------------------------------------------------------
+            request = self.requests.get(result.request_id)
+
+            # The result itself may be valid, but the request can have been
+            # aborted / finished while the Worker was executing.
+            if request is None or request.is_finished():
+                stale.add(result.request_id)
+                continue
+
+            # ------------------------------------------------------------
+            # 3. Reconstruct the physical source extent for this step.
+            # ------------------------------------------------------------
+            q = scheduler_output.num_scheduled_tokens.get(result.request_id)
+
+            if q is None or q <= 0:
+                raise ValueError("Compaction result request was not scheduled")
+
+            # effective_kv_len, when present, is the committed physical base
+            # before the current step.
+            #
+            # If E is None, physical progress is still implicit in the logical
+            # counter. num_computed_tokens has already been advanced by q in
+            # _update_after_schedule(), so subtract q to recover the step-start
+            # physical base.
+            source_base = (
+                request.effective_kv_len
+                if request.effective_kv_len is not None
+                else request.num_computed_tokens - q
+            )
+
+            # V2 compaction happens post-forward, so its source includes
+            # this step's q tokens.
+            source_e = source_base + q
+
+            if source_e != result.expected_source_effective_kv_len:
+                raise ValueError("Scheduler source effective length mismatch")
+
+            # ------------------------------------------------------------
+            # 4. Validate the compacted effective length.
+            # ------------------------------------------------------------
+            if (
+                result.new_effective_kv_len <= 0
+                or result.new_effective_kv_len > source_e
+            ):
+                raise ValueError("Invalid compacted effective length")
+
+            # ------------------------------------------------------------
+            # 5. Validate source / destination page geometry.
+            # ------------------------------------------------------------
+            if result.expected_source_num_blocks != cdiv(source_e, block_size):
+                raise ValueError("Source block count violates MVP page invariant")
+
+            if result.new_num_blocks != cdiv(
+                result.new_effective_kv_len,
+                block_size,
+            ):
+                raise ValueError("Compacted block count violates MVP page invariant")
+
+            if not 0 < result.new_num_blocks <= result.expected_source_num_blocks:
+                raise ValueError("Invalid compacted block count")
+
+            # ------------------------------------------------------------
+            # 6. Scheduler canonical ownership must still match the source.
+            # ------------------------------------------------------------
+            current = self.kv_cache_manager.get_block_ids(result.request_id)
+
+            if (
+                len(current) != 1
+                or len(current[0]) != result.expected_source_num_blocks
+            ):
+                raise ValueError("Canonical row does not match compaction source")
+
+            # ------------------------------------------------------------
+            # 7. Validation passed. Prepare commit descriptor only.
+            #    No canonical mutation happens in this function.
+            # ------------------------------------------------------------
+            prepared[result.request_id] = _PreparedCompactionReconciliation(
+                result.request_id,
+                result.expected_source_num_blocks,
+                result.new_effective_kv_len,
+                result.new_num_blocks,
+                result.step_seq,
+            )
+
+        return prepared, stale
+
+    def _commit_compaction_reconciliations(
+        self, prepared: dict[str, _PreparedCompactionReconciliation]
+    ) -> None:
+        #遍历所有的value
+        for item in prepared.values():
+            removed = self.kv_cache_manager.reconcile_compacted_blocks(
+                item.request_id,
+                item.expected_source_num_blocks,
+                item.new_num_blocks,
+            )
+            request = self.requests.get(item.request_id)
+            if request is None or request.is_finished():
+                continue
+            # 正式提交物理长度
+            request.effective_kv_len = item.new_effective_kv_len
+            if removed:
+                self._release_reconciled_blocks(removed)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         self._validate_compaction_results(model_runner_output.compaction_results)
+        prepared_compactions, _stale_compactions = (
+            self._prepare_compaction_reconciliations(
+                scheduler_output, model_runner_output.compaction_results
+            )
+        )
+        self._commit_compaction_reconciliations(prepared_compactions)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1796,20 +1984,25 @@ class Scheduler(SchedulerInterface):
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
-            reclaim_state = reclaim_transitions.get(req_id)
-            if reclaim_state is not None:
-                transition, same_step_new_block_ids = reclaim_state
-                self.kv_cache_manager.reconcile_reclaimed_blocks(
-                    req_id,
-                    transition.retained_block_ids,
-                    transition.expected_old_num_blocks,
-                    same_step_new_block_ids,
-                )
-                request.effective_kv_len = (
-                    transition.new_effective_kv_len + num_tokens_scheduled
-                )
-            elif request.effective_kv_len is not None:
-                request.effective_kv_len += num_tokens_scheduled
+            if req_id in prepared_compactions:
+                # V2 reconciliation committed an absolute physical E=K above.
+                pass
+            else:
+                reclaim_state = reclaim_transitions.get(req_id)
+                if reclaim_state is not None:
+                    transition, same_step_new_block_ids = reclaim_state
+                    removed = self.kv_cache_manager.reconcile_reclaimed_blocks(
+                        req_id,
+                        transition.retained_block_ids,
+                        transition.expected_old_num_blocks,
+                        same_step_new_block_ids,
+                    )
+                    request.effective_kv_len = (
+                        transition.new_effective_kv_len + num_tokens_scheduled
+                    )
+                    self._release_reconciled_blocks(removed)
+                elif request.effective_kv_len is not None:
+                    request.effective_kv_len += num_tokens_scheduled
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -2409,6 +2602,17 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.block_pool.free_blocks(blocks)
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
+
+    def _release_reconciled_blocks(self, removed: list[KVCacheBlock]) -> None:
+        """Release blocks detached by a result-time partial transition.
+
+        V1/V2 reconciliation has already committed canonical ownership before
+        this helper returns blocks to the allocator. This path is intentionally
+        synchronous-MVP specific; overlap/connector frees continue using the
+        upstream deferred-free protocol below.
+        """
+        if removed:
+            self.kv_cache_manager.block_pool.free_blocks(reversed(removed))
 
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.

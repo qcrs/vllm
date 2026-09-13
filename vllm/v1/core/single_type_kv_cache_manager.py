@@ -508,11 +508,12 @@ class SingleTypeKVCacheManager(ABC):
         retained_block_ids: list[int],
         expected_old_num_blocks: int,
         same_step_new_block_ids: list[int],
-    ) -> list[int]:
+    ) -> list[KVCacheBlock]:
         """
         Replace canonical ownership with one validated dense physical row.
         拿当前 canonical ownership，验证这次 reclaim transaction 没有错，然后把
-        req_to_blocks[request_id] 从旧 row 改成新的 dense row，最后把被移除的 blocks 退回 BlockPool。
+        req_to_blocks[request_id] 从旧 row 改成新的 dense row，并返回被移除的
+        blocks；释放由 Scheduler 在 result-time 完成。
         """
         '''
         SingleTypeKVCacheManager 维护的 canonical Request → blocks ownership
@@ -567,8 +568,31 @@ class SingleTypeKVCacheManager(ABC):
             self.num_cached_block[request_id] = min(
                 self.num_cached_block[request_id], len(final_blocks)
             )
-        self.block_pool.free_blocks(reversed(removed_blocks))
-        return [block.block_id for block in removed_blocks]
+        return removed_blocks
+
+    def reconcile_compacted_blocks(
+        self,
+        request_id: str,
+        expected_source_num_blocks: int,
+        new_num_blocks: int,
+    ) -> list[KVCacheBlock]:
+        """Detach a V2 compacted suffix without returning it to the pool."""
+        current_blocks = self.req_to_blocks.get(request_id)
+        if current_blocks is None:
+            raise ValueError(f"Request {request_id!r} has no KV block ownership")
+        if not 0 < new_num_blocks <= expected_source_num_blocks:
+            raise ValueError("Invalid compacted block count")
+        if len(current_blocks) != expected_source_num_blocks:
+            raise ValueError("Canonical block count does not match compaction")
+        retained = current_blocks[:new_num_blocks]
+        removed = current_blocks[new_num_blocks:]
+        self.req_to_blocks[request_id] = retained
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id], len(retained)
+            )
+        # 返回 KVCacheBlock；该函数只负责保留剩余 block，不负责释放。
+        return removed
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

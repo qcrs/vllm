@@ -51,6 +51,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import (
     CompactionPlanData,
+    CompactionResultData,
     GrammarOutput,
     SchedulerOutput,
 )
@@ -88,6 +89,7 @@ from vllm.v1.worker.gpu.input_batch import (
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
 )
+from vllm.v1.worker.gpu.kv_compaction import compact_paged_kv_triton_2d
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     KVConnector,
@@ -135,6 +137,7 @@ class _PreparedCompaction:
     keep_member_indices: tuple[int, ...]
     new_effective_kv_len: int
     new_num_blocks: int
+    step_seq: int | None
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1583,7 +1586,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        # Prepare positions and seq_lens. 计算position的位置 
+        # Prepare positions and seq_lens. 计算position的位置
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
@@ -1705,7 +1708,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             input_batch.query_start_loc,
             # 函数内 这是计算地图 所以 不许哟啊原本的 positon
-            
+
             # block table 只告诉你“第 N 个逻辑 block 对应哪个物理 block”。
             # 传入 postion block_index = 18 // 16 = 1 block_offset = 18 % 16 = 2
             input_batch.cache_positions,
@@ -1763,6 +1766,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        effective_kv_len_override_valid: torch.Tensor | None = None,
+        effective_kv_len_override: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
@@ -1782,6 +1787,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            effective_kv_len_override_valid,
+            effective_kv_len_override,
         )
 
         self.model_state.postprocess_state(
@@ -1808,6 +1815,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         compaction_plans: dict[str, CompactionPlanData],
         input_batch: InputBatch,
     ) -> dict[str, _PreparedCompaction]:
+        '''
+        它就是逐项核验 Plan 里面声称的东西，转换成 Worker 真正能执行的 descriptor。
+        Scheduler
+        │
+        └─ compaction_plans
+            │
+            ├─ request_id
+            ├─ expected_source_E
+            ├─ expected_source_num_blocks
+            └─ keep_member_indices
+
+
+        Current Batch
+        │
+        └─ input_batch
+            │
+            ├─ req_ids
+            ├─ idx_mapping_np（req_state--> batch）
+            └─ effective_kv_seq_lens
+
+
+        Persistent Worker State
+        │
+        ├─ self.req_states
+        │     └─ req_id_to_index
+        │
+        ├─ self.block_tables
+        │     ├─ num_blocks.np
+        │     └─ block_tables[0].gpu
+        │
+        └─ self.kv_caches
+            └─ 每一层真实 KV cache tensor
+        '''
         """Validate post-forward V2 sources without mutating runtime state."""
         if not compaction_plans:
             return {}
@@ -1819,7 +1859,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise ValueError("V2 compaction block_size must be positive")
         if not self.kv_caches:
             raise ValueError("V2 compaction requires initialized layer KV caches")
-
+        '''
+        enumerate 迭代器 返回 一个 元组 带索引
+        req_ids 存放本轮需要forward的 id
+        得到一个字典 是因为我们可能需要ids 去找batch_idx
+        items 返回 (键，值) 元组
+        '''
         batch_indices = {
             request_id: batch_idx
             for batch_idx, request_id in enumerate(input_batch.req_ids)
@@ -1828,6 +1873,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for request_id, plan in compaction_plans.items():
             if request_id != plan.request_id:
                 raise ValueError("Compaction plan request identity mismatch")
+            # 基于 id 得到 index
             req_state_idx = self.req_states.req_id_to_index.get(request_id)
             if req_state_idx is None:
                 raise ValueError(f"V2 compaction request is missing: {request_id}")
@@ -1840,7 +1886,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 raise ValueError(
                     f"V2 compaction request index mapping is stale: {request_id}"
                 )
-
+            # item 把单元素tensor转化为Python scalar 可能存在隐含的GPU->CPU sync
             source_effective_kv_len = int(
                 input_batch.effective_kv_seq_lens[batch_idx].item()
             )
@@ -1852,7 +1898,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 raise ValueError(
                     f"V2 compaction source effective KV length mismatch: {request_id}"
                 )
-
+            # block_tables req_state 的 变 需要 idx 来检索
             source_num_blocks = int(
                 self.block_tables.num_blocks.np[0, req_state_idx]
             )
@@ -1862,11 +1908,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 raise ValueError(
                     f"V2 compaction source block count mismatch: {request_id}"
                 )
-            if source_num_blocks * block_size < source_effective_kv_len:
+            expected_source_num_blocks = cdiv(source_effective_kv_len, block_size)
+            if source_num_blocks != expected_source_num_blocks:
                 raise ValueError(
-                    "V2 compaction source blocks do not cover source extent"
+                    "V2 compaction source block count is not the exact page count"
                 )
-
             keep_member_indices = plan.keep_member_indices
             if not isinstance(keep_member_indices, list) or not keep_member_indices:
                 raise ValueError("keep_member_indices must be a non-empty list")
@@ -1891,10 +1937,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             new_num_blocks = cdiv(new_effective_kv_len, block_size)
             if not 0 < new_num_blocks <= source_num_blocks:
                 raise ValueError("V2 compaction destination block count is invalid")
-
+            '''
+            二维矩阵
+            [max_num_reqs, max_num_blocks_per_req] 所以存放的 physical_block_id
+            变成不可变、可哈希的元组
+            '''
             block_ids_tensor = self.block_tables.block_tables[0].gpu[
                 req_state_idx, :source_num_blocks
             ]
+
             block_ids = tuple(int(block_id) for block_id in block_ids_tensor.tolist())
             if len(set(block_ids)) != source_num_blocks or any(
                 block_id < 0 for block_id in block_ids
@@ -1930,8 +1981,86 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 keep_member_indices=tuple(keep_member_indices),
                 new_effective_kv_len=new_effective_kv_len,
                 new_num_blocks=new_num_blocks,
+                step_seq=plan.step_seq,
             )
         return prepared
+    # 推理 不训练 不构建 autograd graph
+    @torch.inference_mode()
+    def _execute_v2_compactions(
+        self,
+        prepared_compactions: dict[str, _PreparedCompaction],
+        input_batch: InputBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[CompactionResultData]]:
+        """Execute validated V2 compactions and stage the worker next state."""
+        '''
+        override_valid
+        = 当前 batch 哪些 request 的 effective_kv_len
+        需要被 V2 强制覆盖（区分是0 还是 没有修改）
+
+        override_value
+        = 要覆盖成多少，也就是 K
+
+        results
+        = Worker → Scheduler 的 CompactionResultData 回执
+        '''
+        override_valid = torch.zeros(
+            input_batch.num_reqs, dtype=torch.bool, device=self.device
+        )
+        override_value = torch.zeros(
+            input_batch.num_reqs, dtype=torch.int32, device=self.device
+        )
+        results: list[CompactionResultData] = []
+        prepared_tensors: list[
+            tuple[_PreparedCompaction, torch.Tensor, torch.Tensor]
+        ] = []
+
+        # Phase 1: execute every request × every layer before touching any
+        # Worker BlockTable metadata or constructing a success result.
+        for request_id, prepared in prepared_compactions.items():
+            keep = torch.tensor(
+                prepared.keep_member_indices, dtype=torch.int64, device=self.device
+            )
+            block_ids = torch.tensor(
+                prepared.block_ids, dtype=torch.int32, device=self.device
+            )
+            for kv_cache in self.kv_caches:
+                new_effective_kv_len, new_num_blocks = compact_paged_kv_triton_2d(
+                    kv_cache,
+                    block_ids,
+                    prepared.source_effective_kv_len,
+                    keep,
+                )
+                if (
+                    new_effective_kv_len != prepared.new_effective_kv_len
+                    or new_num_blocks != prepared.new_num_blocks
+                ):
+                    raise RuntimeError(
+                        "V2 compaction primitive returned an unexpected shape"
+                    )
+            prepared_tensors.append((prepared, keep, block_ids))
+
+        # Phase 2: all payload calls succeeded; now stage metadata and publish
+        # the per-batch absolute override/result state.
+        for prepared, _, _ in prepared_tensors:
+            retained_block_ids = list(prepared.block_ids[: prepared.new_num_blocks])
+            self.block_tables.append_block_ids(
+                prepared.req_state_idx,
+                (retained_block_ids,),
+                overwrite=True,
+            )
+            override_valid[prepared.batch_idx] = True
+            override_value[prepared.batch_idx] = prepared.new_effective_kv_len
+            results.append(
+                CompactionResultData(
+                    request_id=prepared.request_id,
+                    expected_source_effective_kv_len=prepared.source_effective_kv_len,
+                    expected_source_num_blocks=prepared.source_num_blocks,
+                    new_effective_kv_len=prepared.new_effective_kv_len,
+                    new_num_blocks=prepared.new_num_blocks,
+                    step_seq=prepared.step_seq,
+                )
+            )
+        return override_valid, override_value, results
 
     @torch.inference_mode()
     def execute_model(
@@ -2166,6 +2295,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         prepared_compactions = self._prepare_v2_compactions(
             compaction_plans, input_batch
         )
+        (
+            effective_kv_len_override_valid,
+            effective_kv_len_override,
+            compaction_results,
+        ) = self._execute_v2_compactions(prepared_compactions, input_batch)
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -2174,7 +2308,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            prepared_compactions=prepared_compactions,
+            effective_kv_len_override_valid=effective_kv_len_override_valid,
+            effective_kv_len_override=effective_kv_len_override,
+            compaction_results=compaction_results,
         )
 
         if not self.is_last_pp_rank:
@@ -2197,6 +2333,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        effective_kv_len_override_valid = (
+            self.execute_model_state.effective_kv_len_override_valid
+        )
+        effective_kv_len_override = self.execute_model_state.effective_kv_len_override
+        compaction_results = self.execute_model_state.compaction_results
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2253,6 +2394,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            compaction_results=compaction_results,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -2284,6 +2426,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
+            effective_kv_len_override_valid,
+            effective_kv_len_override,
         )
 
         if self.speculator is not None:
@@ -2439,7 +2583,9 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
-    prepared_compactions: dict[str, _PreparedCompaction]
+    effective_kv_len_override_valid: torch.Tensor
+    effective_kv_len_override: torch.Tensor
+    compaction_results: list[CompactionResultData]
 
 
 def sort_batch_req_ids(
