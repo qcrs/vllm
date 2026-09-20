@@ -158,6 +158,87 @@ class CompactionResultData:
     step_seq: int | None = None
 
 
+@dataclass(frozen=True)
+class RaggedRequestStateSnapshotData:
+    """Complete Scheduler-owned Ragged physical state for one request."""
+    '''
+    request_id
+
+    effective_lens =
+    [32,56,20,48]
+
+    page_counts =
+    [2,4,2,3]
+
+    flat_page_ids =
+    [10,11,
+    20,21,22,23,
+    30,31,
+    40,41,42]`
+    第一次把 request 建到 Worker
+    resume
+    re-add
+    Worker state 丢失
+    resync
+    future migration
+    '''
+    request_id: str
+    effective_lens: tuple[int, ...]
+    page_counts: tuple[int, ...]
+    flat_page_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RaggedPageAllocationDeltaData:
+    """Cluster-major physical-page capacity appended by the Scheduler."""
+    '''
+    source E =
+    [32,56,20,48]
+
+    source counts =
+    [2,4,2,3]
+
+    append =
+    [1,0,0,1]
+
+    new page IDs =
+    [101,102]`
+    Worker 必须已经持有和 Scheduler 一致的 source state。
+    '''
+
+    request_id: str
+    expected_source_effective_lens: tuple[int, ...]
+    expected_source_page_counts: tuple[int, ...]
+    appended_page_counts: tuple[int, ...]
+    flat_new_page_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RaggedCompactionResultData:
+    """Worker-reported shape transition without allocator-authoritative IDs."""
+    '''
+    Worker → Scheduler
+    压缩完成之后报告
+    Worker → Scheduler
+    '''
+
+    request_id: str
+    expected_source_effective_lens: tuple[int, ...]
+    expected_source_page_counts: tuple[int, ...]
+    new_effective_lens: tuple[int, ...]
+    new_page_counts: tuple[int, ...]
+    state_version: int | None = None
+    step_seq: int | None = None
+
+
+@dataclass(frozen=True)
+class RaggedKVUpdateData:
+    """Ragged state transport kept separate from Dense KVCacheGroup fields."""
+
+    snapshots: dict[str, RaggedRequestStateSnapshotData]
+    allocations: dict[str, RaggedPageAllocationDeltaData]
+
+
 @dataclass
 class CachedRequestData:
     req_ids: list[str]
@@ -182,7 +263,8 @@ class CachedRequestData:
 
     # Version of dataclass repr with token IDs obfuscated.
     # 核心运行逻辑 日志
-    # 给 CachedRequestData 生成一个适合日志/debug 的字符串表示，同时避免把 token IDs 全打印出来。
+    # 给 CachedRequestData 生成适合日志/debug 的字符串表示，
+    # 同时避免把 token IDs 全打印出来。
     def anon_repr(self) -> str:
         new_token_ids_lens = [len(toks) for toks in self.new_token_ids]
         all_token_ids_lens = {
@@ -198,7 +280,7 @@ class CachedRequestData:
             f"num_computed_tokens={self.num_computed_tokens},"
             f"num_output_tokens={self.num_output_tokens}"
             f",reclaim_transition_counts="
-            f"{[len(t.retained_block_ids) if t is not None else None for t in self.reclaim_transitions]}"
+            f"{[len(t.retained_block_ids) if t is not None else None for t in self.reclaim_transitions]}"  # noqa: E501
             f")"
         )
 
@@ -322,6 +404,9 @@ class SchedulerOutput:
     # str request
     # field 描述如何初始化 {} 可能会被多实例共享
     compaction_plans: dict[str, CompactionPlanData] = field(default_factory=dict)
+
+    # Explicit physical-cluster transport. None preserves the Dense path.
+    ragged_kv_updates: RaggedKVUpdateData | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
