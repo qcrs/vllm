@@ -49,22 +49,60 @@ class AttentionCGSupportInfo:
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     kv_cache_spec: dict[str, KVCacheSpec] = {}
+    # 不不要把AttentionLayerBase 当作一个类看 作为一个产选 按照什么类型来检查
     layer_type = cast(type[Any], AttentionLayerBase)
+    # 得到的是具体的键值对
+    '''
+    {
+    "model.layers.0.self_attn.attn": <Attention object>,
+    "model.layers.1.self_attn.attn": <Attention object>,
+    ...
+    }
+    '''
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+    # 迭代器 转化为元组输出
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             # This layer will use KV cache of the sharing target layer.
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
+        '''
+        assignment expression / walrus operator
+        spec = attn_module.get_kv_cache_spec(vllm_config)
+
+        if spec:
+            ...
+        '''
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
                 backend = attn_module.get_attn_backend()
                 # indexes_kv_by_block_stride() -> get_kv_cache_stride_order() ->
                 # get_kv_cache_layout() needs the current vLLM config.
+                '''
+                进入：
+                    临时把当前全局/context 中的 vLLM config
+                    设置成这个 vllm_config
+
+                执行：
+                    stride
+                    backend.indexes_kv_by_block_stride()
+
+                退出：
+                    恢复之前的 config
+                最底层 get_kv_cache_layout() 需要 config，但这条调用链没有把 config 当普通参数层层传下去，所以这里先把它设置成 current context。
+                '''
                 with set_current_vllm_config(vllm_config):
                     indexes = backend.indexes_kv_by_block_stride()
                 spec = replace(spec, indexes_kv_by_block_stride=indexes)
             kv_cache_spec[layer_name] = spec
+            '''
+            kv_cache_spec = {
+            "layer0": FullAttentionSpec(...),
+            "layer1": FullAttentionSpec(...),
+            "layer2": FullAttentionSpec(...),
+            "layer3": FullAttentionSpec(...),
+        }
+            '''
     return kv_cache_spec
 
 

@@ -53,6 +53,11 @@ class CacheConfig:
     """Whether block_size was explicitly provided. Derived automatically."""
     user_specified_mamba_block_size: bool = field(default=False, init=False)
     """Whether mamba_block_size was explicitly provided. Derived automatically."""
+    page_group_size: int | None = Field(default=None, gt=0)
+    """Future Ragged KV physical page width in KV-head columns.
+
+    ``None`` preserves Dense KV cache geometry; runtime activation is deferred.
+    """
     prefix_match_unit: int | None = Field(default=None, gt=0)
     """The finest token boundary (in tokens) a prefix-cache hit can land on.
 

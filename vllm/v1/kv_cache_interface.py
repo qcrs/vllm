@@ -100,6 +100,15 @@ class KVCacheSpecKind(str, Enum):
 class KVCacheSpec:
     """
     A base class for specifying the KV cache format of one layer.
+    这个 layer：
+
+    一个 page 放多少 bytes？
+
+    一个 request 最多需要多少 KV memory？
+
+    一个 request 的 block table 最长多少？
+
+    这个 spec 能不能和别的 layer 合并/group？
     """
 
     # number of tokens in a block
@@ -224,6 +233,78 @@ class AttentionSpec(KVCacheSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RaggedAttentionSpec(AttentionSpec):
+    """Geometry contract for a future Ragged KV physical page layout.
+
+    ``num_kv_heads`` remains the semantic local KV-head count (Hkv), while
+    ``page_group_size`` is the physical page width (Hp).  This class does not
+    own placement, page IDs, allocation, or runtime dispatch.
+    """
+
+    page_group_size: int
+    head_size_v: int | None = None
+    # 初始化完成后自动调用
+    def __post_init__(self) -> None:
+        if self.page_group_size <= 0:
+            raise ValueError("page_group_size must be positive")
+        if self.num_kv_heads % self.page_group_size != 0:
+            raise ValueError("num_kv_heads must be divisible by page_group_size")
+        if self.head_size_v is None:
+            # 这个 Spec 不允许随便修改。如果为空 就要重新设置
+            object.__setattr__(self, "head_size_v", self.head_size)
+
+    @property
+    def num_head_groups_per_layer(self) -> int:
+        return self.num_kv_heads // self.page_group_size
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.page_group_size
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_world_size > 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size)
+        num_depths = cdiv(max_model_len, self.block_size)
+        # 得到每层的块数
+        return num_depths * self.num_head_groups_per_layer * self.page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert specs and all(isinstance(spec, cls) for spec in specs), (
+            "All attention layers in the same KV cache group must be RaggedAttentionSpec."
+        )
+        merged_spec = cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            head_size_v=specs[0].head_size_v,
+            dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
+            page_size_padded=specs[0].page_size_padded,
+            indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            page_group_size=specs[0].page_group_size,
+        )
+        for spec in specs:
+            # 检查 attenion相关的字段
+            for f in fields(AttentionSpec):
+                assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
+                    "All attention layers in the same KV cache group must have "
+                    "the same attention spec."
+                )
+            # 检查新加的字段
+            assert spec.head_size_v == merged_spec.head_size_v
+            assert spec.page_group_size == merged_spec.page_group_size
+        return merged_spec
+
+
+@dataclass(frozen=True, kw_only=True)
 class FullAttentionSpec(AttentionSpec):
     """
     When hybrid allocator is disabled and the model contains both full
@@ -254,7 +335,7 @@ class FullAttentionSpec(AttentionSpec):
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
-
+    # 所以这里说的是一层
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -337,6 +418,7 @@ class FullAttentionSpec(AttentionSpec):
             last_dim = self.head_size // 2 + self.head_size_v // 2
         else:
             last_dim = self.head_size + self.head_size_v
+        # 所以 这里说的page_size 是 一个 块 的 数量
         return (
             self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
         )
@@ -940,7 +1022,17 @@ class KVCacheGroupSpec:
     Represents a group of model layers that share the same KV cache block table.
     These layers are regarded as one layer in the KV cache manager.
     """
-
+    '''
+    KVCacheGroupSpec(
+    layer_names=[
+        "layer0",
+        "layer1",
+        "layer2",
+        "layer3",
+    ],
+    kv_cache_spec=FullAttentionSpec(...),
+    )
+    '''
     # The names of model layers in this group
     layer_names: list[str]
     # The KV cache spec of this manager layer

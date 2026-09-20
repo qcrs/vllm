@@ -185,7 +185,7 @@ class KVCacheManager:
 
     @property
     def usage(self) -> float:
-        """Get the KV cache usage.
+        """Get the KV cache usage
 
         Returns:
             The KV cache usage (between 0.0 and 1.0).

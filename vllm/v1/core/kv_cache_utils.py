@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    RaggedAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -940,18 +941,44 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    #每Group的Layer数量可能不同，取最大的Layer数量作为每个请求的Layer数量
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
+    ragged_groups = [
+        group
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, RaggedAttentionSpec)
+    ]
+    if ragged_groups:
+        if len(ragged_groups) != 1 or len(ragged_groups) != len(
+            kv_cache_config.kv_cache_groups
+        ):
+            raise ValueError(
+                "Ragged KV cache concurrency requires exactly one Ragged KV cache group"
+            )
+        group = ragged_groups[0]
+        per_request_bytes = (
+            len(group.layer_names)
+            * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        )
+        physical_pages_per_request = cdiv(
+            per_request_bytes, group.kv_cache_spec.page_size_bytes
+        )
+        return kv_cache_config.num_blocks / physical_pages_per_request
+    # 基于最大请求长度 得到 最大请求长度占用的byte
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
         vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
     )
+    #得到每一个block 整体占用的 byte 
     memory_per_block = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
         * num_layer_per_group
     )
+    # 得到 最多可以需要多少块
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    # 最大并发数
     return max_concurrency
 
 
@@ -1363,6 +1390,38 @@ def get_kv_cache_config_from_groups(
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    # 从所有的组里找到Ragged这个
+    ragged_groups = [
+        group
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, RaggedAttentionSpec)
+    ]
+    if ragged_groups:
+        # ragged粒度可能有多个 所以是不同的组 但是这里要求只有一个 且ragged和full不能并存
+        if len(ragged_groups) != 1 or len(ragged_groups) != len(kv_cache_groups):
+            raise ValueError(
+                "Ragged KV cache planning requires exactly one Ragged KV cache group"
+            )
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError(
+                "num_gpu_blocks_override is unsupported for Ragged KV cache planning"
+            )
+        ragged_group = ragged_groups[0]
+        page_size = ragged_group.kv_cache_spec.page_size_bytes
+        num_blocks = max(available_memory // page_size, 0)
+        # ragged group的kv cache tensor是共享的 所以只需要一个tensor 粒度更小 池子 更小
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=num_blocks * page_size,
+                shared_by=ragged_group.layer_names,
+            )
+        ]
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
         )
 
