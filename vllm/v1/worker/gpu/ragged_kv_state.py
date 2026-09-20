@@ -11,13 +11,14 @@ from vllm.v1.core.sched.output import (
     RaggedPageAllocationDeltaData,
     RaggedRequestStateSnapshotData,
 )
+from vllm.v1.ragged_kv_layout import MemberPlacementMap
 
 
 @dataclass(frozen=True)
 class RaggedClusterStepView:
     '''
     它不是 request 的持久化状态，
-    而是从 RaggedWorkerPhysicalState 里，按本轮 active requests gather 出来的“本轮输入视图”。
+    它按本轮 active requests 从 RaggedWorkerPhysicalState gather 出输入视图。
     request0:
     c0 [10,11,0,0]
     c1 [20,21,22,23]
@@ -30,6 +31,7 @@ class RaggedClusterStepView:
     cluster_rows: npt.NDArray[np.int32]
     page_counts: npt.NDArray[np.int32]
     effective_lens: npt.NDArray[np.int32]
+    state_versions: npt.NDArray[np.int64]
 
 
 class RaggedWorkerPhysicalState:
@@ -54,24 +56,26 @@ class RaggedWorkerPhysicalState:
     def __init__(
         self,
         max_num_reqs: int,
-        num_clusters: int,
+        placement: MemberPlacementMap,
         max_pages_per_cluster: int,
         block_size: int,
     ) -> None:
-        if min(max_num_reqs, num_clusters, max_pages_per_cluster, block_size) <= 0:
+        if min(max_num_reqs, max_pages_per_cluster, block_size) <= 0:
             raise ValueError("Ragged Worker dimensions must be positive")
         self.max_num_reqs = max_num_reqs
-        self.num_clusters = num_clusters
+        self.placement = placement
+        self.num_clusters = placement.num_clusters
         self.max_pages_per_cluster = max_pages_per_cluster
         self.block_size = block_size
         # 【R C N】
         self.rows = np.zeros(
-            (max_num_reqs, num_clusters, max_pages_per_cluster), dtype=np.int32
+            (max_num_reqs, self.num_clusters, max_pages_per_cluster), dtype=np.int32
         )
-        self.counts = np.zeros((max_num_reqs, num_clusters), dtype=np.int32)
+        self.counts = np.zeros((max_num_reqs, self.num_clusters), dtype=np.int32)
         self.effective_lens = np.zeros(
-            (max_num_reqs, num_clusters), dtype=np.int32
+            (max_num_reqs, self.num_clusters), dtype=np.int32
         )
+        self.state_versions = np.full(max_num_reqs, -1, dtype=np.int64)
 
     def _validate_req_index(self, req_index: int) -> None:
         if not 0 <= req_index < self.max_num_reqs:
@@ -95,7 +99,7 @@ class RaggedWorkerPhysicalState:
             raise ValueError("Ragged page IDs must be unique")
         return result
     '''
-    把 Scheduler 传来的 Ragged physical state，同步到 Worker 本地的 RaggedWorkerPhysicalState
+    把 Scheduler Ragged physical state 同步到 Worker mirror。
     apply_snapshot()
     = 全量覆盖
 
@@ -106,6 +110,8 @@ class RaggedWorkerPhysicalState:
         self, req_index: int, snapshot: RaggedRequestStateSnapshotData
     ) -> None:
         self._validate_req_index(req_index)
+        if snapshot.state_version < 0:
+            raise ValueError("Snapshot state_version must be non-negative")
         effective_lens = self._validate_vector(
             snapshot.effective_lens, "effective_lens"
         )
@@ -131,11 +137,15 @@ class RaggedWorkerPhysicalState:
         self.rows[req_index] = candidate_rows
         self.counts[req_index] = counts
         self.effective_lens[req_index] = effective_lens
+        self.state_versions[req_index] = snapshot.state_version
 
     def apply_allocation_delta(
         self, req_index: int, delta: RaggedPageAllocationDeltaData
     ) -> None:
         self._validate_req_index(req_index)
+        current_version = int(self.state_versions[req_index])
+        if current_version != delta.expected_source_state_version:
+            raise ValueError("Ragged allocation delta source version is stale")
         expected_e = self._validate_vector(
             delta.expected_source_effective_lens,
             "expected_source_effective_lens",
@@ -154,6 +164,9 @@ class RaggedWorkerPhysicalState:
         new_page_ids = self._validate_page_ids(delta.flat_new_page_ids)
         if sum(appended_counts) != len(new_page_ids):
             raise ValueError("Delta flat page length does not match appended counts")
+        expected_new_version = delta.expected_source_state_version + bool(new_page_ids)
+        if delta.new_state_version != expected_new_version:
+            raise ValueError("Ragged allocation delta version transition is invalid")
         active_ids = {
             int(page_id)
             # 遍历一个序列时，同时拿到“下标”和“元素值”。
@@ -182,19 +195,23 @@ class RaggedWorkerPhysicalState:
             offset += count
         self.rows[req_index] = candidate_rows
         self.counts[req_index] = new_counts
+        self.state_versions[req_index] = delta.new_state_version
 
     def commit_effective_lens(
         self,
         req_index: int,
+        expected_state_version: int,
         expected_source_effective_lens: Sequence[int],
         new_effective_lens: Sequence[int],
     ) -> None:
-        # forward / KV write 成功后，把 Worker 本地这个 request 的 effective_lens 从旧值推进到新值。
+        # KV write 成功后推进 Worker mirror 的 effective_lens。
         self._validate_req_index(req_index)
         expected = self._validate_vector(
             expected_source_effective_lens, "expected_source_effective_lens"
         )
         new = self._validate_vector(new_effective_lens, "new_effective_lens")
+        if int(self.state_versions[req_index]) != expected_state_version:
+            raise ValueError("Ragged physical state version is stale")
         current = tuple(int(value) for value in self.effective_lens[req_index])
         if current != expected:
             raise ValueError("Ragged effective frontier is stale")
@@ -213,6 +230,7 @@ class RaggedWorkerPhysicalState:
         self.rows[req_index].fill(0)
         self.counts[req_index].fill(0)
         self.effective_lens[req_index].fill(0)
+        self.state_versions[req_index] = -1
 
     def gather(self, req_indices: Sequence[int]) -> RaggedClusterStepView:
         # 把任意 Sequence[int] 统一转换成 NumPy ndarray。
@@ -225,4 +243,5 @@ class RaggedWorkerPhysicalState:
             cluster_rows=self.rows[indices].copy(),
             page_counts=self.counts[indices].copy(),
             effective_lens=self.effective_lens[indices].copy(),
+            state_versions=self.state_versions[indices].copy(),
         )

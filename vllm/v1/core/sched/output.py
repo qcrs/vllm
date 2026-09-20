@@ -183,6 +183,7 @@ class RaggedRequestStateSnapshotData:
     future migration
     '''
     request_id: str
+    state_version: int
     effective_lens: tuple[int, ...]
     page_counts: tuple[int, ...]
     flat_page_ids: tuple[int, ...]
@@ -207,6 +208,8 @@ class RaggedPageAllocationDeltaData:
     '''
 
     request_id: str
+    expected_source_state_version: int
+    new_state_version: int
     expected_source_effective_lens: tuple[int, ...]
     expected_source_page_counts: tuple[int, ...]
     appended_page_counts: tuple[int, ...]
@@ -223,11 +226,11 @@ class RaggedCompactionResultData:
     '''
 
     request_id: str
+    expected_source_state_version: int
     expected_source_effective_lens: tuple[int, ...]
     expected_source_page_counts: tuple[int, ...]
     new_effective_lens: tuple[int, ...]
     new_page_counts: tuple[int, ...]
-    state_version: int | None = None
     step_seq: int | None = None
 
 
@@ -237,6 +240,13 @@ class RaggedKVUpdateData:
 
     snapshots: dict[str, RaggedRequestStateSnapshotData]
     allocations: dict[str, RaggedPageAllocationDeltaData]
+
+    def __post_init__(self) -> None:
+        overlap = self.snapshots.keys() & self.allocations.keys()
+        if overlap:
+            raise ValueError(
+                "A request cannot have both a Ragged snapshot and allocation delta"
+            )
 
 
 @dataclass

@@ -13,6 +13,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import KVCacheSpec, RaggedAttentionSpec
+from vllm.v1.ragged_kv_layout import MemberPlacementMap
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class RaggedRequestPhysicalState:
     Ragged C条row 每条深度不同
     list 是可以改变的 重新赋值的 要求不能改变
     '''
+    state_version: int
     effective_lens: tuple[int, ...]
     page_rows: tuple[tuple[KVCacheBlock, ...], ...]
 
@@ -62,6 +64,7 @@ class RaggedCapacityPlan:
     从当前状态走到目标状态时，计划要扩多少 page。
     '''
     request_id: str
+    source_state_version: int
     source_effective_lens: tuple[int, ...]
     source_page_counts: tuple[int, ...]
     target_effective_lens: tuple[int, ...]
@@ -85,12 +88,14 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         enable_caching: bool,
         kv_cache_group_id: int,
         scheduler_block_size: int,
-        num_clusters: int,
+        placement: MemberPlacementMap,
     ) -> None:
         if enable_caching:
             raise ValueError("RaggedAttentionManager does not support prefix caching")
-        if num_clusters <= 0:
-            raise ValueError("num_clusters must be positive")
+        if placement.num_kv_heads != kv_cache_spec.num_kv_heads:
+            raise ValueError("Placement KV-head count does not match the cache spec")
+        if placement.page_group_size != kv_cache_spec.page_group_size:
+            raise ValueError("Placement page width does not match the cache spec")
         super().__init__(
             kv_cache_spec=kv_cache_spec,
             block_pool=block_pool,
@@ -105,14 +110,17 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
             ├─ effective_lens[C]
             └─ page_rows[C][variable depth]
         '''
-        self.num_clusters = num_clusters
+        self.placement = placement
+        self.num_clusters = placement.num_clusters
         self.req_to_ragged_state: dict[str, RaggedRequestPhysicalState] = {}
+        self._last_state_versions: dict[str, int] = {}
 
-    def _empty_state(self) -> RaggedRequestPhysicalState:
+    def _empty_state(self, request_id: str) -> RaggedRequestPhysicalState:
         '''
         构造一个全空的合法初始状态
         '''
         return RaggedRequestPhysicalState(
+            state_version=self._last_state_versions.get(request_id, -1) + 1,
             #(0,)*4 = (0,0,0,0)
             effective_lens=(0,) * self.num_clusters,
             #() for _ in range(4) 依次生成()
@@ -129,6 +137,8 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         return result
 
     def _validate_state(self, state: RaggedRequestPhysicalState) -> None:
+        if state.state_version < 0:
+            raise ValueError("state_version must be non-negative")
         # vector 合法
         effective_lens = self._validate_vector(
             state.effective_lens, "effective_lens"
@@ -198,7 +208,9 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         '''
         target = self._validate_vector(target_effective_lens, "target_effective_lens")
         # 存在返回 不存在初始化
-        state = self.req_to_ragged_state.get(request_id, self._empty_state())
+        state = self.req_to_ragged_state.get(request_id)
+        if state is None:
+            state = self._empty_state(request_id)
         source_counts = state.page_counts
         required_counts = tuple(cdiv(value, self.block_size) for value in target)
         appended_counts = tuple(
@@ -207,6 +219,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         )
         return RaggedCapacityPlan(
             request_id=request_id,
+            source_state_version=state.state_version,
             source_effective_lens=state.effective_lens,
             source_page_counts=source_counts,
             target_effective_lens=target,
@@ -218,9 +231,12 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
     def apply_capacity_plan(
         self, plan: RaggedCapacityPlan
     ) -> RaggedPageAllocationDeltaData:
-        current = self.req_to_ragged_state.get(plan.request_id, self._empty_state())
+        current = self.req_to_ragged_state.get(plan.request_id)
+        if current is None:
+            current = self._empty_state(plan.request_id)
         if (
-            current.effective_lens != plan.source_effective_lens
+            current.state_version != plan.source_state_version
+            or current.effective_lens != plan.source_effective_lens
             or current.page_counts != plan.source_page_counts
         ):
             raise ValueError("Ragged capacity plan is stale")
@@ -276,14 +292,18 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
             offset += count
         assert offset == len(new_blocks)
         candidate = RaggedRequestPhysicalState(
+            state_version=current.state_version + bool(new_blocks),
             # 先不加
             effective_lens=current.effective_lens,
             page_rows=tuple(candidate_rows),
         )
         self._validate_state(candidate)
         self.req_to_ragged_state[plan.request_id] = candidate
+        self._last_state_versions[plan.request_id] = candidate.state_version
         return RaggedPageAllocationDeltaData(
             request_id=plan.request_id,
+            expected_source_state_version=current.state_version,
+            new_state_version=candidate.state_version,
             expected_source_effective_lens=plan.source_effective_lens,
             expected_source_page_counts=plan.source_page_counts,
             appended_page_counts=appended,
@@ -294,6 +314,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
     def commit_effective_lens(
         self,
         request_id: str,
+        expected_state_version: int,
         expected_source_effective_lens: Sequence[int],
         new_effective_lens: Sequence[int],
     ) -> None:
@@ -302,11 +323,17 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
             expected_source_effective_lens, "expected_source_effective_lens"
         )
         new = self._validate_vector(new_effective_lens, "new_effective_lens")
+        if state.state_version != expected_state_version:
+            raise ValueError("Ragged physical state version is stale")
         if state.effective_lens != expected:
             raise ValueError("Ragged effective frontier is stale")
         if any(new_value < old_value for old_value, new_value in zip(expected, new)):
             raise ValueError("Normal effective frontier commit cannot shrink")
-        candidate = RaggedRequestPhysicalState(new, state.page_rows)
+        candidate = RaggedRequestPhysicalState(
+            state_version=state.state_version,
+            effective_lens=new,
+            page_rows=state.page_rows,
+        )
         self._validate_state(candidate)
         self.req_to_ragged_state[request_id] = candidate
 
@@ -339,6 +366,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         state = self.get_state(request_id)
         return RaggedRequestStateSnapshotData(
             request_id=request_id,
+            state_version=state.state_version,
             effective_lens=state.effective_lens,
             page_counts=state.page_counts,
             flat_page_ids=tuple(
@@ -349,6 +377,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
     def reconcile_compaction(
         self,
         request_id: str,
+        expected_source_state_version: int,
         expected_source_effective_lens: Sequence[int],
         expected_source_page_counts: Sequence[int],
         new_effective_lens: Sequence[int],
@@ -369,6 +398,8 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         )
         new_e = self._validate_vector(new_effective_lens, "new_effective_lens")
         new_counts = self._validate_vector(new_page_counts, "new_page_counts")
+        if state.state_version != expected_source_state_version:
+            raise ValueError("Ragged compaction source version is stale")
         if state.effective_lens != expected_e or state.page_counts != expected_counts:
             raise ValueError("Ragged compaction source state is stale")
         if any(value > source for value, source in zip(new_e, expected_e)):
@@ -379,7 +410,11 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         candidate_rows = tuple(
             row[:count] for row, count in zip(state.page_rows, new_counts)
         )
-        candidate = RaggedRequestPhysicalState(new_e, candidate_rows)
+        candidate = RaggedRequestPhysicalState(
+            state_version=state.state_version + 1,
+            effective_lens=new_e,
+            page_rows=candidate_rows,
+        )
         self._validate_state(candidate)
         # 找到删去的 白遍历所有的sate 然后 匹配新的 梳理 然后写入新的
         detached = [
@@ -388,6 +423,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
             for block in row[count:]
         ]
         self.req_to_ragged_state[request_id] = candidate
+        self._last_state_versions[request_id] = candidate.state_version
         self.block_pool.free_blocks(reversed(detached))
         return tuple(block.block_id for block in detached)
 
@@ -395,6 +431,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         state = self.req_to_ragged_state.pop(request_id, None)
         if state is None:
             return ()
+        self._last_state_versions[request_id] = state.state_version
         blocks = [block for row in state.page_rows for block in row]
         self.block_pool.free_blocks(reversed(blocks))
         return tuple(block.block_id for block in blocks)

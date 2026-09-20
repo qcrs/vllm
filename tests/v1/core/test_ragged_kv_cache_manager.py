@@ -9,13 +9,12 @@ import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.ragged_kv_cache_manager import RaggedAttentionManager
 from vllm.v1.kv_cache_interface import RaggedAttentionSpec
+from vllm.v1.ragged_kv_layout import MemberPlacementMap
 
 pytestmark = pytest.mark.cpu_test
 
 
-def make_manager(
-    *, num_blocks: int = 64, num_clusters: int = 4
-) -> tuple[RaggedAttentionManager, BlockPool]:
+def make_manager(*, num_blocks: int = 64) -> tuple[RaggedAttentionManager, BlockPool]:
     block_size = 16
     pool = BlockPool(
         num_gpu_blocks=num_blocks,
@@ -35,7 +34,11 @@ def make_manager(
         enable_caching=False,
         kv_cache_group_id=0,
         scheduler_block_size=block_size,
-        num_clusters=num_clusters,
+        placement=MemberPlacementMap.identity(
+            num_layers=2,
+            num_kv_heads=4,
+            page_group_size=2,
+        ),
     )
     return manager, pool
 
@@ -44,9 +47,12 @@ def reserve_and_commit(
     manager: RaggedAttentionManager, request_id: str, effective_lens: list[int]
 ) -> None:
     plan = manager.plan_capacity(request_id, effective_lens)
-    manager.apply_capacity_plan(plan)
+    delta = manager.apply_capacity_plan(plan)
     manager.commit_effective_lens(
-        request_id, plan.source_effective_lens, effective_lens
+        request_id,
+        delta.new_state_version,
+        plan.source_effective_lens,
+        effective_lens,
     )
 
 
@@ -57,6 +63,7 @@ def test_non_uniform_plan_is_pure_and_reserve_does_not_advance_frontier():
     plan = manager.plan_capacity("req", [32, 56, 20, 48])
 
     assert plan.source_effective_lens == (0, 0, 0, 0)
+    assert plan.source_state_version == 0
     assert plan.source_page_counts == (0, 0, 0, 0)
     assert plan.required_page_counts == (2, 4, 2, 3)
     assert plan.appended_page_counts == (2, 4, 2, 3)
@@ -69,6 +76,8 @@ def test_non_uniform_plan_is_pure_and_reserve_does_not_advance_frontier():
     assert state.page_counts == (2, 4, 2, 3)
     assert state.effective_lens == (0, 0, 0, 0)
     assert delta.expected_source_effective_lens == (0, 0, 0, 0)
+    assert delta.expected_source_state_version == 0
+    assert delta.new_state_version == 1
     assert delta.appended_page_counts == (2, 4, 2, 3)
     assert len(delta.flat_new_page_ids) == 11
 
@@ -89,9 +98,11 @@ def test_non_uniform_incremental_scatter_and_frontier_commit():
     assert reserved.page_rows[3][-1].block_id == delta.flat_new_page_ids[1]
 
     manager.commit_effective_lens(
-        "req", source.effective_lens, [33, 57, 21, 49]
+        "req", reserved.state_version, source.effective_lens, [33, 57, 21, 49]
     )
-    assert manager.get_state("req").effective_lens == (33, 57, 21, 49)
+    committed = manager.get_state("req")
+    assert committed.effective_lens == (33, 57, 21, 49)
+    assert committed.state_version == reserved.state_version
 
 
 def test_stale_or_malformed_plan_has_zero_pool_and_state_mutation():
@@ -134,13 +145,20 @@ def test_compaction_detaches_scheduler_owned_pages_and_reuses_them():
 
     detached_ids = manager.reconcile_compaction(
         "req-a",
+        expected_source_state_version=old_state.state_version,
         expected_source_effective_lens=[64, 64, 64, 64],
         expected_source_page_counts=[4, 4, 4, 4],
         new_effective_lens=[32, 48, 16, 64],
         new_page_counts=[2, 3, 1, 4],
     )
 
-    assert manager.get_state("req-a").page_counts == (2, 3, 1, 4)
+    compacted = manager.get_state("req-a")
+    assert compacted.page_counts == (2, 3, 1, 4)
+    assert compacted.state_version == old_state.state_version + 1
+    for old_row, new_row, count in zip(
+        old_state.page_rows, compacted.page_rows, (2, 3, 1, 4)
+    ):
+        assert new_row == old_row[:count]
     assert set(detached_ids) == {
         block.block_id
         for row, count in zip(old_state.page_rows, (2, 3, 1, 4))
@@ -164,6 +182,7 @@ def test_stale_compaction_has_zero_pool_and_state_mutation():
     with pytest.raises(ValueError, match="stale"):
         manager.reconcile_compaction(
             "req",
+            expected_source_state_version=state_before.state_version,
             expected_source_effective_lens=[32, 32, 16, 64],
             expected_source_page_counts=[2, 3, 1, 4],
             new_effective_lens=[16, 32, 16, 48],
@@ -224,5 +243,58 @@ def test_prefix_caching_and_dense_scalar_apis_fail_closed():
             enable_caching=True,
             kv_cache_group_id=0,
             scheduler_block_size=16,
-            num_clusters=4,
+            placement=MemberPlacementMap.identity(
+                num_layers=2,
+                num_kv_heads=4,
+                page_group_size=2,
+            ),
+        )
+
+
+def test_request_recreation_does_not_reuse_physical_generation():
+    manager, _ = make_manager()
+    reserve_and_commit(manager, "req", [16, 0, 0, 0])
+    old_version = manager.get_state("req").state_version
+    manager.free_request("req")
+
+    plan = manager.plan_capacity("req", [16, 0, 0, 0])
+    assert plan.source_state_version > old_version
+    delta = manager.apply_capacity_plan(plan)
+    assert delta.new_state_version > old_version
+
+
+def test_compaction_rejects_equal_shape_with_stale_version_atomically():
+    manager, pool = make_manager()
+    reserve_and_commit(manager, "req", [32, 32, 32, 32])
+    state_before = manager.get_state("req")
+    free_before = pool.get_num_free_blocks()
+
+    with pytest.raises(ValueError, match="version is stale"):
+        manager.reconcile_compaction(
+            "req",
+            expected_source_state_version=state_before.state_version - 1,
+            expected_source_effective_lens=state_before.effective_lens,
+            expected_source_page_counts=state_before.page_counts,
+            new_effective_lens=state_before.effective_lens,
+            new_page_counts=state_before.page_counts,
+        )
+
+    assert manager.get_state("req") == state_before
+    assert pool.get_num_free_blocks() == free_before
+
+
+def test_manager_rejects_placement_that_disagrees_with_spec():
+    manager, pool = make_manager()
+    with pytest.raises(ValueError, match="KV-head count"):
+        RaggedAttentionManager(
+            kv_cache_spec=manager.kv_cache_spec,
+            block_pool=pool,
+            enable_caching=False,
+            kv_cache_group_id=0,
+            scheduler_block_size=16,
+            placement=MemberPlacementMap.identity(
+                num_layers=1,
+                num_kv_heads=2,
+                page_group_size=2,
+            ),
         )
