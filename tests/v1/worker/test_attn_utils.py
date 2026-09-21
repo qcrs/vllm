@@ -3,8 +3,16 @@
 
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
-from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
+from vllm.v1.attention.backends.ragged_layout import as_virtual_block_view
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    KVQuantMode,
+    RaggedAttentionSpec,
+)
+from vllm.v1.worker.gpu.attn_utils import _allocate_kv_cache, _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -240,3 +248,61 @@ def test_reshape_padded_quantized_kv_cache_preserves_scale_stride():
     assert kv_cache.stride(0) == spec.page_size_bytes
     assert kv_cache.stride(1) == 16 * 1 * 8
     assert kv_cache[1, 1].storage_offset() == spec.page_size_bytes + 16 * 1 * 8
+
+
+class RaggedBackendMustNotProvideDenseShape:
+    @staticmethod
+    def get_kv_cache_shape(*args, **kwargs):
+        raise AssertionError("Ragged path must not query the Dense backend shape")
+
+
+def test_reshape_ragged_cache_materializes_shared_hp_wide_backing():
+    spec = RaggedAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        page_group_size=2,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    num_pages = 3
+    config = KVCacheConfig(
+        num_blocks=num_pages,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_pages * spec.page_size_bytes,
+                shared_by=["layer0", "layer1"],
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0", "layer1"], spec)],
+    )
+    raw_tensors = _allocate_kv_cache(config, {}, torch.device("cpu"))
+    assert raw_tensors["layer0"].data_ptr() == raw_tensors["layer1"].data_ptr()
+
+    attn_groups = [
+        AttentionGroup(
+            backend=RaggedBackendMustNotProvideDenseShape,
+            layer_names=["layer0", "layer1"],
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+        )
+    ]
+    kv_caches = _reshape_kv_cache(
+        attn_groups,
+        raw_tensors,
+        "auto",
+        [spec.block_size],
+        {},
+        kv_cache_config=config,
+    )
+
+    expected_shape = (
+        num_pages,
+        spec.page_group_size,
+        spec.block_size,
+        2 * spec.head_size,
+    )
+    assert kv_caches["layer0"].shape == expected_shape
+    assert kv_caches["layer1"].shape == expected_shape
+    assert kv_caches["layer0"].data_ptr() == kv_caches["layer1"].data_ptr()
+    virtual = as_virtual_block_view(kv_caches["layer0"], spec.page_group_size)
+    assert virtual.data_ptr() == kv_caches["layer0"].data_ptr()

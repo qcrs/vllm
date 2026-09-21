@@ -242,6 +242,7 @@ class RaggedKVUpdateData:
     allocations: dict[str, RaggedPageAllocationDeltaData]
 
     def __post_init__(self) -> None:
+        #同一个 request 在同一次 update 里，不能同时既有 Snapshot，又有 Allocation Delta。
         overlap = self.snapshots.keys() & self.allocations.keys()
         if overlap:
             raise ValueError(

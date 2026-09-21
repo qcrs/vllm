@@ -252,6 +252,14 @@ class RaggedAttentionSpec(AttentionSpec):
         if self.head_size_v is None:
             # 这个 Spec 不允许随便修改。如果为空 就要重新设置
             object.__setattr__(self, "head_size_v", self.head_size)
+        if self.head_size_v != self.head_size:
+            raise ValueError(
+                "Ragged Core requires head_size_v to equal head_size"
+            )
+        if self.kv_quant_mode != KVQuantMode.NONE:
+            raise ValueError("Ragged Core supports only KVQuantMode.NONE")
+        if self.page_size_padded is not None:
+            raise ValueError("Ragged Core does not support padded KV pages")
 
     @property
     def num_head_groups_per_layer(self) -> int:

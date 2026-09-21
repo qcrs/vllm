@@ -21,12 +21,14 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.ragged_layout import ragged_physical_cache_shape
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
+    RaggedAttentionSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -328,7 +330,21 @@ def _reshape_kv_cache(
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             packing = layer_packing.get(layer_name)
-            if packing is not None:
+            if isinstance(kv_cache_spec, RaggedAttentionSpec):
+                if packing is not None:
+                    raise NotImplementedError(
+                        "Packed KV cache tensors are unsupported for Ragged"
+                    )
+                if kernel_block_size != kv_cache_spec.block_size:
+                    raise ValueError(
+                        "Ragged kernel block size must match the spec block size"
+                    )
+                if kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes != 0:
+                    raise ValueError("Ragged KV backing is not page aligned")
+                num_blocks = (
+                    kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                )
+            elif packing is not None:
                 _, blk_stride = packing
                 num_blocks = kv_raw_tensor.numel() // blk_stride
             else:
@@ -337,6 +353,17 @@ def _reshape_kv_cache(
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
+                if isinstance(kv_cache_spec, RaggedAttentionSpec):
+                    kv_cache_shape = ragged_physical_cache_shape(
+                        num_blocks,
+                        kv_cache_spec.page_group_size,
+                        kv_cache_spec.block_size,
+                        kv_cache_spec.head_size,
+                    )
+                    kv_caches[layer_name] = kv_raw_tensor.view(
+                        kv_cache_spec.dtype
+                    ).view(kv_cache_shape)
+                    continue
                 # Use storage_block_size: it equals block_size for uncompressed
                 # specs but is smaller for compressed ones (DeepSeek V4), which
                 # store block_size tokens in block_size // compress_ratio slots.
@@ -444,6 +471,8 @@ def _align_mixed_attention_kv_cache_views(
     for group in attn_groups:
         kv_cache_spec = group.kv_cache_spec
         if not isinstance(kv_cache_spec, AttentionSpec):
+            continue
+        if isinstance(kv_cache_spec, RaggedAttentionSpec):
             continue
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue

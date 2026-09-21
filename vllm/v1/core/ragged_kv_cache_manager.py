@@ -49,6 +49,30 @@ class RaggedRequestPhysicalState:
     Ragged C条row 每条深度不同
     list 是可以改变的 重新赋值的 要求不能改变
     '''
+    '''
+    state_version: int
+    Scheduler 眼里某个 request 当前真实的 physical ownership。
+    request A
+
+    state_version = 4
+
+    effective_lens =
+    [32, 48]
+
+    page_rows =
+    [
+    [B10, B11],
+    [B20, B21, B22]
+    ]
+    state_version
+    = 这是第几代 ownership
+
+    effective_lens
+    = 每个 cluster 当前有多少有效 KV token
+
+    page_rows
+    = 每个 cluster 实际拥有哪些 physical pages
+    '''
     state_version: int
     effective_lens: tuple[int, ...]
     page_rows: tuple[tuple[KVCacheBlock, ...], ...]
@@ -118,6 +142,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
     def _empty_state(self, request_id: str) -> RaggedRequestPhysicalState:
         '''
         构造一个全空的合法初始状态
+        初始状态
         '''
         return RaggedRequestPhysicalState(
             state_version=self._last_state_versions.get(request_id, -1) + 1,
