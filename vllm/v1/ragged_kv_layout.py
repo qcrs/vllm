@@ -166,7 +166,11 @@ class MemberPlacementMap:
             member_to_column=tuple(columns),
         )
 
-
+'''
+给定 (layer, kv_head, physical_position)，
+C1 要回答这个 KV token 最终对应哪个 physical page、哪个 page column，
+以及在 Dense-compatible virtual view 里对应哪个 block / slot。
+'''
 @dataclass(frozen=True)
 class ResolvedKVAddress:
     """Reference address for one semantic KV member and token position."""
@@ -189,14 +193,28 @@ def resolve_kv_address(
     active_row: Sequence[Sequence[int]],
     placement: MemberPlacementMap,
 ) -> ResolvedKVAddress:
+    '''
+    三类输入(谁得KV)
+    layer_idx
+    kv_head_idx
+    physical_position: int
+    这是这个 member 的第几个 retained/physical token position
+    active_row 每个 cluster 当前实际占有哪些 physical page。
+    '''
     """Resolve a physical token position through the canonical placement map."""
+    '''
+    两个维度的梳理 一个 是 按照 layer head 的维度的编码 二维映射为1维
+    还有一个是 token位于哪个block 哪个 offset
+    '''
     member_index = placement.flat_member_index(layer_idx, kv_head_idx)
     if physical_position < 0:
         raise ValueError("physical_position must be non-negative")
-
+    # 逻辑地址
     cluster_index = placement.member_to_cluster[member_index]
     column_index = placement.member_to_column[member_index]
+    # 基于物理地址 知道 他位于 哪个 block 哪个 offset 这里的都是 physical 地址
     page_depth, block_offset = divmod(physical_position, block_size)
+    # 该clster 对应得占有得block activate 存的是实际的block 需要这一层的映射
     cluster_row = active_row[cluster_index]
     if page_depth >= len(cluster_row):
         raise IndexError("physical_position is outside the supplied active row")
@@ -204,7 +222,7 @@ def resolve_kv_address(
     physical_page_id = cluster_row[page_depth]
     if physical_page_id == 0:
         raise ValueError("resolved physical page cannot be the NULL page")
-
+    # 就是要基于逻辑地址找到物理地址然后我们的做法就是 重新定义个block 一个token的单个head来代表一个地址
     virtual_block_id = physical_page_id * placement.page_group_size + column_index
     virtual_slot = virtual_block_id * block_size + block_offset
     return ResolvedKVAddress(

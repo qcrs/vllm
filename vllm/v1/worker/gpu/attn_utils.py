@@ -360,6 +360,7 @@ def _reshape_kv_cache(
                         kv_cache_spec.block_size,
                         kv_cache_spec.head_size,
                     )
+                    # 看作什么样的格式 然后 view 成什么样的shape
                     kv_caches[layer_name] = kv_raw_tensor.view(
                         kv_cache_spec.dtype
                     ).view(kv_cache_shape)
