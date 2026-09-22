@@ -362,3 +362,288 @@ def test_real_cuda_ragged_attention_matches_independent_reference(
         f"ATTENTION_REFERENCE_PASS mode={mode} query_lens={query_lens} "
         f"source_e={source_e} max_error={max_error:.6f}"
     )
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA")
+def test_real_cuda_multilayer_layer1_write_and_decode():
+    """
+    D closure smoke:
+    prove non-zero layer_idx uses the correct global member slice.
+
+    L=2, Hkv=4, Hp=2:
+      layer0 -> members 0..3 -> clusters 0..1
+      layer1 -> members 4..7 -> clusters 2..3
+
+    This test exercises layer_idx=1 through:
+      1. RaggedStepViews global member metadata
+      2. exact-cell CUDA KV write
+      3. FA2 decode read
+      4. independent PyTorch reference
+    """
+    ragged_attention_forward, ragged_kv_cache_update = _forward_ops()
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(17)
+
+    num_layers = 2
+    layer_idx = 1
+
+    placement = MemberPlacementMap.identity(
+        num_layers=num_layers,
+        num_kv_heads=NUM_KV_HEADS,
+        page_group_size=PAGE_GROUP_SIZE,
+    )
+
+    member_to_cluster, member_to_column = placement_to_tensors(
+        placement,
+        device=device,
+    )
+
+    # Two decode requests.
+    query_lens = [1, 1]
+    query_start_loc = _query_start_loc(query_lens, device)
+
+    # [R, C], where C=4 for L=2,Hkv=4,Hp=2.
+    #
+    # layer0 owns clusters 0,1
+    # layer1 owns clusters 2,3
+    #
+    # Make layer1 frontiers deliberately non-uniform and near block boundaries.
+    source_e = torch.tensor(
+        [
+            [3, 7, 15, 31],
+            [5, 9, 17, 5],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    assert placement.num_clusters == 4
+
+    num_actual_tokens = sum(query_lens)
+    max_kv_len = int(source_e.max().item()) + 1
+
+    cluster_rows, num_pages = _cluster_rows(
+        num_requests=2,
+        num_clusters=placement.num_clusters,
+        max_kv_len=max_kv_len,
+        device=device,
+    )
+
+    views = build_ragged_step_views(
+        cluster_rows,
+        source_e,
+        query_start_loc,
+        member_to_cluster,
+        member_to_column,
+        PAGE_GROUP_SIZE,
+        BLOCK_SIZE,
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=1,
+        max_kv_len=max_kv_len,
+    )
+
+    physical_cache = torch.zeros(
+        (
+            num_pages,
+            PAGE_GROUP_SIZE,
+            BLOCK_SIZE,
+            2 * HEAD_SIZE,
+        ),
+        dtype=DTYPE,
+        device=device,
+    )
+
+    # ------------------------------------------------------------------
+    # Populate layer1 history through the independent scalar C1 oracle.
+    # ------------------------------------------------------------------
+    histories: dict[
+        tuple[int, int],
+        tuple[torch.Tensor, torch.Tensor],
+    ] = {}
+
+    for request_idx in range(2):
+        for kv_head_idx in range(NUM_KV_HEADS):
+            member_idx = layer_idx * NUM_KV_HEADS + kv_head_idx
+            cluster_idx = placement.member_to_cluster[member_idx]
+            history_len = int(source_e[request_idx, cluster_idx].item())
+
+            history_key = (
+                torch.randn(history_len, HEAD_SIZE, device=device) * 0.2
+            ).to(DTYPE)
+            history_value = (
+                torch.randn(history_len, HEAD_SIZE, device=device) * 0.2
+            ).to(DTYPE)
+
+            histories[(request_idx, kv_head_idx)] = (
+                history_key,
+                history_value,
+            )
+
+            write_history_to_physical_cache(
+                physical_cache,
+                cluster_rows[request_idx],
+                placement,
+                layer_idx=layer_idx,
+                kv_head_idx=kv_head_idx,
+                block_size=BLOCK_SIZE,
+                keys=history_key,
+                values=history_value,
+            )
+
+    # ------------------------------------------------------------------
+    # Current-step layer1 K/V and query.
+    # ------------------------------------------------------------------
+    key = (
+        torch.randn(
+            num_actual_tokens,
+            NUM_KV_HEADS,
+            HEAD_SIZE,
+            device=device,
+        )
+        * 0.2
+    ).to(DTYPE)
+
+    value = (
+        torch.randn(
+            num_actual_tokens,
+            NUM_KV_HEADS,
+            HEAD_SIZE,
+            device=device,
+        )
+        * 0.2
+    ).to(DTYPE)
+
+    query = (
+        torch.randn(
+            num_actual_tokens,
+            NUM_QUERY_HEADS,
+            HEAD_SIZE,
+            device=device,
+        )
+        * 0.2
+    ).to(DTYPE)
+
+    scale_tensor = torch.tensor(
+        1.0,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    # ------------------------------------------------------------------
+    # Real CUDA KV write for layer_idx=1.
+    # ------------------------------------------------------------------
+    ragged_kv_cache_update(
+        key,
+        value,
+        physical_cache,
+        views,
+        layer_idx=layer_idx,
+        num_kv_heads=NUM_KV_HEADS,
+        kv_cache_dtype="auto",
+        k_scale=scale_tensor,
+        v_scale=scale_tensor,
+    )
+
+    torch.cuda.synchronize()
+
+    # Verify current-step K/V landed in layer1's physical clusters,
+    # not layer0's member slice.
+    rows = cluster_rows.cpu().tolist()
+    starts = query_start_loc.cpu().tolist()
+
+    for request_idx, (start, end) in enumerate(
+        zip(starts[:-1], starts[1:])
+    ):
+        for token_idx in range(start, end):
+            local_offset = token_idx - start
+
+            for kv_head_idx in range(NUM_KV_HEADS):
+                member_idx = layer_idx * NUM_KV_HEADS + kv_head_idx
+                cluster_idx = placement.member_to_cluster[member_idx]
+
+                physical_position = (
+                    int(source_e[request_idx, cluster_idx].item())
+                    + local_offset
+                )
+
+                address = resolve_kv_address(
+                    layer_idx=layer_idx,
+                    kv_head_idx=kv_head_idx,
+                    physical_position=physical_position,
+                    block_size=BLOCK_SIZE,
+                    active_row=tuple(
+                        tuple(row) for row in rows[request_idx]
+                    ),
+                    placement=placement,
+                )
+
+                torch.testing.assert_close(
+                    physical_cache[
+                        address.physical_page_id,
+                        address.column_index,
+                        address.block_offset,
+                        :HEAD_SIZE,
+                    ],
+                    key[token_idx, kv_head_idx],
+                    rtol=0,
+                    atol=0,
+                )
+
+                torch.testing.assert_close(
+                    physical_cache[
+                        address.physical_page_id,
+                        address.column_index,
+                        address.block_offset,
+                        HEAD_SIZE:,
+                    ],
+                    value[token_idx, kv_head_idx],
+                    rtol=0,
+                    atol=0,
+                )
+
+    # ------------------------------------------------------------------
+    # Real FA2 decode for layer_idx=1.
+    # ------------------------------------------------------------------
+    output = torch.empty_like(query)
+    softmax_scale = HEAD_SIZE**-0.5
+
+    ragged_attention_forward(
+        query,
+        physical_cache,
+        output,
+        views,
+        layer_idx=layer_idx,
+        num_kv_heads=NUM_KV_HEADS,
+        softmax_scale=softmax_scale,
+        fa_version=2,
+    )
+
+    torch.cuda.synchronize()
+
+    expected = torch_ragged_attention_reference(
+        query,
+        key,
+        value,
+        histories,
+        query_start_loc,
+        num_kv_heads=NUM_KV_HEADS,
+        softmax_scale=softmax_scale,
+    )
+
+    max_error = (
+        output.float() - expected.float()
+    ).abs().max().item()
+
+    torch.testing.assert_close(
+        output,
+        expected,
+        rtol=0.03,
+        atol=0.03,
+    )
+
+    print(
+        "MULTILAYER_LAYER1_PASS "
+        f"layer_idx={layer_idx} "
+        f"num_clusters={placement.num_clusters} "
+        f"max_error={max_error:.6f}"
+    )
