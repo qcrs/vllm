@@ -9,6 +9,7 @@ from vllm.v1.attention.backends.ragged_layout import (
     member_seq_lens,
     member_virtual_block_table,
     member_virtual_slots,
+    placement_to_tensors,
 )
 from vllm.v1.ragged_kv_layout import (
     MemberPlacementMap,
@@ -279,7 +280,13 @@ def test_member_metadata_transforms_match_scalar_addressing():
         [[[7, 8, 0], [11, 0, 0]], [[13, 0, 0], [17, 19, 0]]],
         dtype=torch.int32,
     )
-    member_table = member_virtual_block_table(physical_table, placement)
+    member_to_cluster, member_to_column = placement_to_tensors(placement)
+    member_table = member_virtual_block_table(
+        physical_table,
+        member_to_cluster,
+        member_to_column,
+        placement.page_group_size,
+    )
     torch.testing.assert_close(
         member_table,
         _scalar_member_virtual_block_table(physical_table, placement),
@@ -287,7 +294,13 @@ def test_member_metadata_transforms_match_scalar_addressing():
 
     physical_slots = torch.tensor([[7 * 16 + 5, 11 * 16 + 15], [-1, 19 * 16]],
                                   dtype=torch.int32)
-    member_slots = member_virtual_slots(physical_slots, placement, 16)
+    member_slots = member_virtual_slots(
+        physical_slots,
+        member_to_cluster,
+        member_to_column,
+        placement.page_group_size,
+        16,
+    )
     torch.testing.assert_close(
         member_slots,
         _scalar_member_virtual_slots(physical_slots, placement, 16),
@@ -306,7 +319,9 @@ def test_member_metadata_transforms_match_scalar_addressing():
         ],
         dtype=physical_lens.dtype,
     )
-    torch.testing.assert_close(member_seq_lens(physical_lens, placement), expected_lens)
+    torch.testing.assert_close(
+        member_seq_lens(physical_lens, member_to_cluster), expected_lens
+    )
 
 
 def test_member_metadata_transforms_follow_custom_placement():
@@ -318,7 +333,13 @@ def test_member_metadata_transforms_follow_custom_placement():
         member_to_column=(1, 0, 0, 1),
     )
     physical_table = torch.tensor([[[7, 0], [11, 13]]], dtype=torch.int32)
+    member_to_cluster, member_to_column = placement_to_tensors(placement)
     torch.testing.assert_close(
-        member_virtual_block_table(physical_table, placement),
+        member_virtual_block_table(
+            physical_table,
+            member_to_cluster,
+            member_to_column,
+            placement.page_group_size,
+        ),
         _scalar_member_virtual_block_table(physical_table, placement),
     )

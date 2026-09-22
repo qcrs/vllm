@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from vllm.v1.ragged_kv_layout import MemberPlacementMap
@@ -69,7 +71,9 @@ def placement_to_tensors(
 
 def member_virtual_block_table(
     physical_cluster_table: torch.Tensor,
-    placement: MemberPlacementMap,
+    member_to_cluster: torch.Tensor,
+    member_to_column: torch.Tensor,
+    page_group_size: int,
 ) -> torch.Tensor:
     '''
      physical_cluster_table 这个是在说我们的token有多个需要多少个页来存储
@@ -92,12 +96,10 @@ def member_virtual_block_table(
     ]
     '''
     """Expand ``[R, C, MaxPages]`` physical rows to ``[R, M, MaxPages]``."""
-    member_to_cluster, member_to_column = placement_to_tensors(
-        placement, device=physical_cluster_table.device
-    )
     '''
     它根据 member_to_cluster 提供的索引，
-    从 physical_cluster_table 的第 1 维（通常是“列”）中把对应的数据抽取出来，拼成一张全新的表。
+    从 physical_cluster_table 的第 1 维（通常是“列”）中把对应的数据抽取出来，
+    拼成一张全新的表。
     member_to_cluster = [0, 0, 1, 1]
     member_to_column  = [0, 1, 0, 1]
     R = 1 request
@@ -148,7 +150,7 @@ def member_virtual_block_table(
     '''
     column = member_to_column.to(dtype=physical_cluster_table.dtype).view(1, -1, 1)
     # 得到虚拟的table 维持 一个 head 一个 block 所以 要拆分 转化成 member这样
-    virtual_table = cluster_table * placement.page_group_size + column
+    virtual_table = cluster_table * page_group_size + column
     # 问题在于
     '''
     [21,25,1] 这里的 1 是错的 所以 要转换
@@ -172,7 +174,9 @@ member_to_column  = [0, 1, 0, 1]
 '''
 def member_virtual_slots(
     physical_slots: torch.Tensor,
-    placement: MemberPlacementMap,
+    member_to_cluster: torch.Tensor,
+    member_to_column: torch.Tensor,
+    page_group_size: int,
     block_size: int,
 ) -> torch.Tensor:
     """Expand ``[Q, C]`` physical slots to member-major virtual slots."""
@@ -190,20 +194,17 @@ def member_virtual_slots(
     physical_page_id * B + offset
     B = 16 这里的 
     '''
-    member_to_cluster, member_to_column = placement_to_tensors(
-        placement, device=physical_slots.device
-    )
     member_slots = physical_slots.index_select(1, member_to_cluster)
     page = torch.div(member_slots, block_size, rounding_mode="floor")
     offset = torch.remainder(member_slots, block_size)
     column = member_to_column.to(dtype=physical_slots.dtype).view(1, -1)
-    virtual_slots = (page * placement.page_group_size + column) * block_size + offset
+    virtual_slots = (page * page_group_size + column) * block_size + offset
     return torch.where(member_slots == -1, -1, virtual_slots)
 
 
 def member_seq_lens(
     physical_seq_lens: torch.Tensor,
-    placement: MemberPlacementMap,
+    member_to_cluster: torch.Tensor,
 ) -> torch.Tensor:
     '''
     输入：[R,C]
@@ -216,7 +217,109 @@ def member_seq_lens(
     cluster1 effective KV len = 20
     '''
     """Gather cluster sequence lengths into member-major order."""
-    member_to_cluster, _ = placement_to_tensors(
-        placement, device=physical_seq_lens.device
-    )
     return physical_seq_lens.index_select(1, member_to_cluster)
+
+
+@dataclass(frozen=True)
+class RaggedStepViews:
+    """Derived Ragged execution metadata for one scheduler step."""
+
+    cluster_block_table: torch.Tensor
+    member_block_table: torch.Tensor
+    member_slot_mapping: torch.Tensor
+    member_seq_lens: torch.Tensor
+    query_start_loc: torch.Tensor
+    num_actual_tokens: int
+    page_group_size: int
+    block_size: int
+    max_query_len: int
+    max_kv_len: int
+
+
+def group_physical_slots(
+    cluster_rows: torch.Tensor,
+    source_effective_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    block_size: int,
+    num_actual_tokens: int,
+) -> torch.Tensor:
+    """Build ``[Q, C]`` physical slots from source effective frontiers."""
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    request_indices = torch.repeat_interleave(
+        torch.arange(
+            query_lens.shape[0],
+            device=query_start_loc.device,
+            dtype=torch.long,
+        ),
+        query_lens.to(dtype=torch.long),
+        output_size=num_actual_tokens,
+    )
+    token_indices = torch.arange(
+        num_actual_tokens,
+        device=query_start_loc.device,
+        dtype=query_start_loc.dtype,
+    )
+    local_offsets = token_indices - query_start_loc[:-1].index_select(
+        0, request_indices
+    )
+    physical_positions = source_effective_lens.index_select(
+        0, request_indices
+    ) + local_offsets.unsqueeze(1)
+    page_depths = torch.div(physical_positions, block_size, rounding_mode="floor")
+    block_offsets = torch.remainder(physical_positions, block_size)
+    token_rows = cluster_rows.index_select(0, request_indices)
+    physical_pages = token_rows.gather(
+        2, page_depths.to(dtype=torch.long).unsqueeze(2)
+    ).squeeze(2)
+    return physical_pages * block_size + block_offsets
+
+
+def build_ragged_step_views(
+    cluster_rows: torch.Tensor,
+    source_effective_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    member_to_cluster: torch.Tensor,
+    member_to_column: torch.Tensor,
+    page_group_size: int,
+    block_size: int,
+    *,
+    num_actual_tokens: int,
+    max_query_len: int,
+    max_kv_len: int,
+) -> RaggedStepViews:
+    """Derive reusable write/read views without rebuilding placement tensors."""
+    physical_slots = group_physical_slots(
+        cluster_rows,
+        source_effective_lens,
+        query_start_loc,
+        block_size,
+        num_actual_tokens,
+    )
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    post_write_group_seq_lens = source_effective_lens + query_lens.unsqueeze(1)
+    return RaggedStepViews(
+        cluster_block_table=cluster_rows,
+        member_block_table=member_virtual_block_table(
+            cluster_rows,
+            member_to_cluster,
+            member_to_column,
+            page_group_size,
+        ),
+        member_slot_mapping=member_virtual_slots(
+            physical_slots,
+            member_to_cluster,
+            member_to_column,
+            page_group_size,
+            block_size,
+        ),
+        member_seq_lens=member_seq_lens(
+            post_write_group_seq_lens,
+            member_to_cluster,
+        ),
+        query_start_loc=query_start_loc,
+        num_actual_tokens=num_actual_tokens,
+        page_group_size=page_group_size,
+        block_size=block_size,
+        max_query_len=max_query_len,
+        max_kv_len=max_kv_len,
+    )
