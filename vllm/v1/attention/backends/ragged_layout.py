@@ -171,6 +171,7 @@ member2 → cluster1, column0
 member3 → cluster1, column1
 member_to_cluster = [0, 0, 1, 1]
 member_to_column  = [0, 1, 0, 1]
+vllm 原生接收得格式是 二维得 一页 然后这一页得位置
 '''
 def member_virtual_slots(
     physical_slots: torch.Tensor,
@@ -235,7 +236,11 @@ class RaggedStepViews:
     max_query_len: int
     max_kv_len: int
 
-
+'''
+group_physical_slots() 基于 source effective length（当前 KV frontier）+
+flattened query token 与 request 的映射关系 + cluster page table，
+将每个新 token 在每个 cluster 上的逻辑位置解析成真实的 physical slot。
+'''
 def group_physical_slots(
     cluster_rows: torch.Tensor,
     source_effective_lens: torch.Tensor,
@@ -244,6 +249,26 @@ def group_physical_slots(
     num_actual_tokens: int,
 ) -> torch.Tensor:
     """Build ``[Q, C]`` physical slots from source effective frontiers."""
+    '''
+    返回 [Q C] physical_slots
+    flattened token q0/q1/q2 分别属于哪个 request、它在这个 request 内部是第几个新 token？
+    '''
+    '''
+    query_start_loc = [0,2,3]
+    request0:
+    [0,2) → 2 tokens
+
+    request1:
+    [2,3) → 1 token
+  `query_lens = [2,1]
+    '''
+    '''
+    [1:] 从1 开始取到最后 [:-1] 从0开始取到 倒数 第二个 交差相减 得到结果
+    query_lens.shape[0] 请求长度 request id
+    第一个元素重复 query_lens[0] 次，第二个元素重复 query_lens[1] 次。
+    就是说清楚 输入的token 是哪个请求 [0,query_lens]id 然后  query_lens.to(dtype=torch.long), 长度
+    torch.repeat_interleave(x, 2) 每个元素分别重复
+    '''
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     request_indices = torch.repeat_interleave(
         torch.arange(
@@ -254,11 +279,60 @@ def group_physical_slots(
         query_lens.to(dtype=torch.long),
         output_size=num_actual_tokens,
     )
+    '''
+    [0,1,2]
+    '''
     token_indices = torch.arange(
         num_actual_tokens,
         device=query_start_loc.device,
         dtype=query_start_loc.dtype,
     )
+    '''
+    request_indices = [0,0,1]
+
+    query_start_loc[:-1]
+    = [0,2]
+    [0,0,2]
+    token_indices
+    `[0,1,2]
+
+    -
+    request starts
+    [0,0,2]
+
+    =
+
+    local_offsets
+    [0,1,0]`
+    Q0 = req0 第0个新 token
+    Q1 = req0 第1个新 token
+    Q2 = req1 第0个新 token
+    假设是 [0,2,3] 得到[0,2] 就是每个request的起始位置 
+    index_select 在某个维度上 给出 下表去元素
+
+    [0,2].index_select(
+    dim=0,
+    index=[0,0,1],
+    )
+    [0,2].index_select(
+    dim=0,
+    index=[0,0,1],
+    )
+    得到他的启示位置
+
+    ① 算每个 request 这轮有几个 query token
+
+    ② 给 flattened 的每个 token 标记：
+    “你属于哪个 request”
+
+    ③ 给 flattened token 编全局编号：
+    0,1,2,...
+
+    ④ 找出每个 token 所属 request 的起始位置
+
+    ⑤ 全局 token index - request 起点
+    得到它在 request 内部的 local offset
+    '''
     local_offsets = token_indices - query_start_loc[:-1].index_select(
         0, request_indices
     )
@@ -267,13 +341,38 @@ def group_physical_slots(
     ) + local_offsets.unsqueeze(1)
     page_depths = torch.div(physical_positions, block_size, rounding_mode="floor")
     block_offsets = torch.remainder(physical_positions, block_size)
+    '''
+    cluster_rows
+    shape = [R, C, MaxPages]
+    cluster_rows = [
+        # req0
+        [
+            [10,12,14],   # cluster0
+            [20,25,28],   # cluster1
+        ],
+
+        # req1
+        [
+            [30,31,32],   # cluster0
+            [40,41,42],   # cluster1
+        ],
+    ]
+    就是把cluster 转化为token row 原本是基于请求的 现在是基于 token的
+    '''
+    '''
+    unsqueeze：增加一个维度（加一个轴）
+    squeeze：删除一个长度为 1 的维度（去掉一个轴）
+    '''
     token_rows = cluster_rows.index_select(0, request_indices)
     physical_pages = token_rows.gather(
         2, page_depths.to(dtype=torch.long).unsqueeze(2)
     ).squeeze(2)
     return physical_pages * block_size + block_offsets
 
-
+'''
+把一个 scheduler step 所需要的所有 Ragged execution metadata 一次性构造出来，
+并封装成 immutable execution view
+'''
 def build_ragged_step_views(
     cluster_rows: torch.Tensor,
     source_effective_lens: torch.Tensor,
@@ -287,6 +386,10 @@ def build_ragged_step_views(
     max_query_len: int,
     max_kv_len: int,
 ) -> RaggedStepViews:
+    '''
+    输入分为两类： layout/state 输入
+    execution shape
+    '''
     """Derive reusable write/read views without rebuilding placement tensors."""
     physical_slots = group_physical_slots(
         cluster_rows,

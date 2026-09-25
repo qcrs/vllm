@@ -20,7 +20,12 @@ def _virtual_kv_cache(
     page_group_size: int,
     head_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    '''
+    把 vLLM 内部存储的 physical KV cache，转换成 Attention kernel 使用的 K/V 两个 view。
+    physical_cache: torch.Tensor, [P Hp B 2D]
+    '''
     virtual_cache = as_virtual_block_view(physical_cache, page_group_size)
+    # [P*Hp,1,B,2D] 交换维度
     return virtual_cache.transpose(1, 2).split(head_size, dim=-1)
 
 
@@ -37,6 +42,9 @@ def ragged_kv_cache_update(
     v_scale: torch.Tensor,
 ) -> None:
     """Write current-step K/V through the existing FA cache kernel."""
+    '''
+    将当前 step 的 K/V 按照 ragged layout 的 slot mapping 写入 paged KV cache。
+    '''
     head_size = key.shape[-1]
     key_cache, value_cache = _virtual_kv_cache(
         physical_cache, views.page_group_size, head_size
@@ -44,6 +52,7 @@ def ragged_kv_cache_update(
     member_start = layer_idx * num_kv_heads
     member_end = member_start + num_kv_heads
     layer_slots = views.member_slot_mapping[:, member_start:member_end]
+    # [T*Hkv,1,D]
     reshape_and_cache_flash(
         key.reshape(-1, 1, head_size),
         value.reshape(-1, 1, head_size),
@@ -68,6 +77,19 @@ def ragged_attention_forward(
     fa_version: int = 2,
 ) -> None:
     """Run focused FA2 Ragged decode or prefill/mixed attention."""
+    '''
+    当前层产生的Query
+    T  = 当前 step 实际 query token 数
+    Hq = query head 数
+    D  = head_size
+
+    physical_cache
+    `=
+    [P, Hp, B, 2D]` 包含所有 Ragged physical KV storage
+    output.shape = [T,Hq,D]
+    views RaggedStepViews 是最关键的 metadata。
+    “当前这一步 Ragged attention 所需要的地址说明书”
+    '''
     head_size = query.shape[-1]
     num_query_heads = query.shape[1]
     queries_per_kv_head = num_query_heads // num_kv_heads
