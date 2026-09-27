@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    RaggedAttentionSpec,
     RSWASpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
@@ -1916,6 +1917,13 @@ def register_all_kvcache_specs(vllm_config):
         FullAttentionSpec,
         FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
+    )
+    from vllm.v1.core.ragged_kv_cache_manager import RaggedAttentionManager
+
+    KVCacheSpecRegistry.register(
+        RaggedAttentionSpec,
+        RaggedAttentionManager,
+        uniform_type_base_spec=RaggedAttentionSpec,
     )
 
     KVCacheSpecRegistry.register(

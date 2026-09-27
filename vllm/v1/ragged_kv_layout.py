@@ -151,6 +151,7 @@ class MemberPlacementMap:
         groups_per_layer = num_kv_heads // page_group_size
         clusters = []
         columns = []
+        # 先得到 clustres的坐标
         for layer_idx in range(num_layers):
             for kv_head_idx in range(num_kv_heads):
                 clusters.append(
@@ -184,7 +185,7 @@ class ResolvedKVAddress:
     virtual_block_id: int
     virtual_slot: int
 
-
+# forward 不太合适
 def resolve_kv_address(
     layer_idx: int,
     kv_head_idx: int,

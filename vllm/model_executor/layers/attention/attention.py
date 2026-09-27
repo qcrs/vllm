@@ -37,11 +37,16 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionType,
 )
+from vllm.v1.attention.backends.ragged_forward import (
+    ragged_attention_forward,
+    ragged_kv_cache_update,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
+    RaggedAttentionSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -631,6 +636,22 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        if vllm_config.cache_config.page_group_size is not None:
+            if self.sliding_window is not None or self.attn_backend.is_mla():
+                raise ValueError("Ragged KV runtime requires full attention")
+            if self.head_size_v != self.head_size:
+                raise ValueError("Ragged KV runtime requires head_size_v == head_size")
+            page_group_size = vllm_config.cache_config.page_group_size
+            assert page_group_size is not None
+            return RaggedAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
+                page_group_size=page_group_size,
+            )
         if self.sliding_window is not None:
             assert not self.attn_backend.is_mla(), (
                 "MLA is not supported for sliding window"
@@ -754,7 +775,12 @@ def get_attention_context(
     attn_metadata_raw = forward_context.attn_metadata
     attn_metadata: AttentionMetadata
     if isinstance(attn_metadata_raw, dict):
-        attn_metadata = attn_metadata_raw[layer_name]
+        if layer_name in attn_metadata_raw:
+            attn_metadata = attn_metadata_raw[layer_name]
+        elif forward_context.ragged_step_views is not None:
+            attn_metadata = None  # type: ignore[assignment]
+        else:
+            raise KeyError(layer_name)
     elif isinstance(attn_metadata_raw, list):
         # list[dict[str, AttentionMetadata]]: used in speculative decoding
         # where [0] is the base-model (non-speculative) metadata dict.
@@ -782,6 +808,23 @@ def unified_kv_cache_update(
     """
     layer_name = _resolve_layer_name(layer_name)
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    forward_context = get_forward_context()
+    if forward_context.ragged_step_views is not None:
+        layer_idx = (forward_context.ragged_layer_indices or {}).get(layer_name)
+        if layer_idx is None:
+            raise RuntimeError(f"Missing Ragged layer index for {layer_name}")
+        ragged_kv_cache_update(
+            key,
+            value,
+            kv_cache,
+            forward_context.ragged_step_views,
+            layer_idx=layer_idx,
+            num_kv_heads=attn_layer.num_kv_heads,
+            kv_cache_dtype=attn_layer.kv_cache_dtype,
+            k_scale=attn_layer._k_scale,
+            v_scale=attn_layer._v_scale,
+        )
+        return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -831,6 +874,22 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    forward_context = get_forward_context()
+    if forward_context.ragged_step_views is not None:
+        layer_idx = (forward_context.ragged_layer_indices or {}).get(layer_name)
+        if layer_idx is None:
+            raise RuntimeError(f"Missing Ragged layer index for {layer_name}")
+        ragged_attention_forward(
+            query,
+            kv_cache,
+            output,
+            forward_context.ragged_step_views,
+            layer_idx=layer_idx,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.impl.scale,
+            fa_version=getattr(self.impl, "vllm_flash_attn_version", 2) or 2,
+        )
+        return
 
     self.impl.forward(
         self,

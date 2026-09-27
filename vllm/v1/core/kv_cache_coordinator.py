@@ -22,8 +22,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    RaggedAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.ragged_kv_layout import MemberPlacementMap
 from vllm.v1.request import Request
 
 
@@ -103,9 +105,10 @@ class KVCacheCoordinator(ABC):
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
-                kv_cache_spec=kv_cache_group.kv_cache_spec,
+        managers = []
+        for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = kv_cache_group.kv_cache_spec
+            kwargs = dict(
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
                 block_pool=self.block_pool,
@@ -116,8 +119,14 @@ class KVCacheCoordinator(ABC):
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
             )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+            if isinstance(spec, RaggedAttentionSpec):
+                kwargs["placement"] = MemberPlacementMap.identity(
+                    num_layers=len(kv_cache_group.layer_names),
+                    num_kv_heads=spec.num_kv_heads,
+                    page_group_size=spec.page_group_size,
+                )
+            managers.append(get_manager_for_kv_cache_spec(spec, **kwargs))
+        self.single_type_managers = tuple(managers)
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.

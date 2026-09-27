@@ -510,6 +510,7 @@ class EngineArgs:
         ParallelConfig.max_parallel_loading_workers
     )
     block_size: int | None = None
+    page_group_size: int | None = get_field(CacheConfig, "page_group_size")
     enable_prefix_caching: bool | None = None
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
@@ -1159,6 +1160,9 @@ class EngineArgs:
             description=CacheConfig.__doc__,
         )
         cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
+        cache_group.add_argument(
+            "--page-group-size", **cache_kwargs["page_group_size"]
+        )
         cache_group.add_argument(
             "--gpu-memory-utilization", **cache_kwargs["gpu_memory_utilization"]
         )
@@ -1903,6 +1907,7 @@ class EngineArgs:
 
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
+            page_group_size=self.page_group_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]

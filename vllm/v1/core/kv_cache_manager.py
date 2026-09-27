@@ -12,6 +12,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.ragged_kv_cache_manager import RaggedAttentionManager
+from vllm.v1.core.sched.output import (
+    RaggedPageAllocationDeltaData,
+    RaggedRequestStateSnapshotData,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -161,6 +166,15 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self.ragged_manager = next(
+            (
+                manager
+                for manager in self.coordinator.single_type_managers
+                if isinstance(manager, RaggedAttentionManager)
+            ),
+            None,
+        )
+        self._pending_ragged_deltas: dict[str, RaggedPageAllocationDeltaData] = {}
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -376,6 +390,33 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        if self.ragged_manager is not None:
+            has_computed_blocks = new_computed_blocks is not None and any(
+                len(group) > 0 for group in new_computed_blocks.blocks
+            )
+            if has_computed_blocks or num_external_computed_tokens:
+                raise ValueError("Ragged allocation does not support cached KV inputs")
+            if num_encoder_tokens or num_lookahead_tokens:
+                raise ValueError(
+                    "Ragged allocation does not support encoder/spec tokens"
+                )
+            state = self.ragged_manager.req_to_ragged_state.get(request.request_id)
+            source = (
+                state.effective_lens
+                if state is not None
+                else (0,) * self.ragged_manager.num_clusters
+            )
+            target = tuple(value + num_new_tokens for value in source)
+            plan = self.ragged_manager.plan_capacity(request.request_id, target)
+            required = plan.total_new_pages
+            if required > self.block_pool.get_num_free_blocks() - reserved_blocks:
+                return None
+            delta = self.ragged_manager.apply_capacity_plan(plan)
+            self._pending_ragged_deltas[request.request_id] = delta
+            # The Dense KVCacheBlocks transport is intentionally empty. Ragged
+            # physical rows travel through SchedulerOutput.ragged_kv_updates.
+            return self.empty_kv_cache_blocks
+
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -517,6 +558,35 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        self._pending_ragged_deltas.pop(request.request_id, None)
+
+    def take_ragged_allocation_delta(
+        self, request_id: str
+    ) -> RaggedPageAllocationDeltaData | None:
+        return self._pending_ragged_deltas.pop(request_id, None)
+
+    def export_ragged_snapshot(
+        self, request_id: str
+    ) -> RaggedRequestStateSnapshotData:
+        if self.ragged_manager is None:
+            raise RuntimeError("Ragged KV manager is not active")
+        return self.ragged_manager.export_snapshot(request_id)
+
+    def commit_ragged_effective_lens(
+        self,
+        request_id: str,
+        expected_state_version: int,
+        expected_source_effective_lens: Sequence[int],
+        new_effective_lens: Sequence[int],
+    ) -> None:
+        if self.ragged_manager is None:
+            raise RuntimeError("Ragged KV manager is not active")
+        self.ragged_manager.commit_effective_lens(
+            request_id,
+            expected_state_version,
+            expected_source_effective_lens,
+            new_effective_lens,
+        )
 
     def reconcile_reclaimed_blocks(
         self,

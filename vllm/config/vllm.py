@@ -2303,6 +2303,45 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_ragged_core(self) -> "VllmConfig":
+        """Reject unsupported production Ragged configurations centrally."""
+        if self.cache_config.page_group_size is None:
+            return self
+        unsupported: list[str] = []
+        if self.parallel_config.tensor_parallel_size != 1:
+            unsupported.append("tensor parallelism")
+        if self.parallel_config.pipeline_parallel_size != 1:
+            unsupported.append("pipeline parallelism")
+        if self.parallel_config.decode_context_parallel_size != 1:
+            unsupported.append("decode context parallelism")
+        if self.parallel_config.prefill_context_parallel_size != 1:
+            unsupported.append("prefill context parallelism")
+        if self.cache_config.enable_prefix_caching:
+            unsupported.append("prefix caching")
+        if self.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if self.scheduler_config.async_scheduling:
+            unsupported.append("async scheduling")
+        if self.cache_config.kv_offloading_size is not None:
+            unsupported.append("KV offloading")
+        if self.compilation_config.cudagraph_mode not in (None, CUDAGraphMode.NONE):
+            unsupported.append("CUDA Graph")
+        if self.model_config is not None and self.model_config.use_mla:
+            unsupported.append("MLA")
+        if (
+            self.model_config is not None
+            and self.model_config.get_sliding_window() is not None
+        ):
+            unsupported.append("sliding-window attention")
+        if self.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
+            unsupported.append("quantized KV cache")
+        if unsupported:
+            raise ValueError(
+                "Ragged KV runtime does not support: " + ", ".join(unsupported)
+            )
+        return self
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

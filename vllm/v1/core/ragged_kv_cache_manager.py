@@ -98,7 +98,7 @@ class RaggedCapacityPlan:
 
 
 class RaggedAttentionManager(SingleTypeKVCacheManager):
-    """Ragged physical-page authority; not registered for production yet."""
+    """Ragged physical-page authority for the single-GPU production path."""
     """
     把 vLLM 原来“单一 KV 类型 + 单条 Dense block row”的管理器，
     扩展成“单一 Ragged KV 类型 + C 条非均匀 physical rows”的管理器。
@@ -113,7 +113,15 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
         kv_cache_group_id: int,
         scheduler_block_size: int,
         placement: MemberPlacementMap,
+        max_in_flight_tokens: int = 0,
+        max_model_len: int = 0,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        needs_kv_cache_zeroing: bool = False,
     ) -> None:
+        del max_in_flight_tokens, max_model_len, needs_kv_cache_zeroing
+        if dcp_world_size != 1 or pcp_world_size != 1:
+            raise ValueError("RaggedAttentionManager requires DCP=1 and PCP=1")
         if enable_caching:
             raise ValueError("RaggedAttentionManager does not support prefix caching")
         if placement.num_kv_heads != kv_cache_spec.num_kv_heads:
@@ -135,6 +143,7 @@ class RaggedAttentionManager(SingleTypeKVCacheManager):
             └─ page_rows[C][variable depth]
         '''
         self.placement = placement
+        # 每个request需要维护多少行。
         self.num_clusters = placement.num_clusters
         self.req_to_ragged_state: dict[str, RaggedRequestPhysicalState] = {}
         self._last_state_versions: dict[str, int] = {}

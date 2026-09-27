@@ -47,6 +47,7 @@ from vllm.v1.core.sched.output import (
     CompactionResultData,
     GrammarOutput,
     NewRequestData,
+    RaggedKVUpdateData,
     ReclaimTransitionData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
@@ -1170,6 +1171,30 @@ class Scheduler(SchedulerInterface):
                 req_to_reclaim_transition,
             )
 
+        ragged_kv_updates = None
+        if self.kv_cache_manager.ragged_manager is not None:
+            snapshots = {}
+            allocations = {}
+            # New and resumed requests require a complete mirror materialization.
+            for request in itertools.chain(scheduled_new_reqs, scheduled_resumed_reqs):
+                snapshots[request.request_id] = (
+                    self.kv_cache_manager.export_ragged_snapshot(request.request_id)
+                )
+                self.kv_cache_manager.take_ragged_allocation_delta(
+                    request.request_id
+                )
+            # Running requests receive only the capacity delta for this step.
+            for request in scheduled_running_reqs:
+                delta = self.kv_cache_manager.take_ragged_allocation_delta(
+                    request.request_id
+                )
+                if delta is not None:
+                    allocations[request.request_id] = delta
+            ragged_kv_updates = RaggedKVUpdateData(
+                snapshots=snapshots,
+                allocations=allocations,
+            )
+
         # Record the request ids that were scheduled in this step (MRV1-only).
         if not self.use_v2_model_runner:
             self.prev_step_scheduled_req_ids.clear()
@@ -1222,6 +1247,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             compaction_plans=compaction_plans,
+            ragged_kv_updates=ragged_kv_updates,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1897,6 +1923,35 @@ class Scheduler(SchedulerInterface):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self.kv_cache_manager.ragged_manager is not None:
+            updates = scheduler_output.ragged_kv_updates
+            if updates is None:
+                raise RuntimeError("Ragged scheduler output missing state transport")
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                request = self.requests.get(req_id)
+                # A request may be aborted or finish while its model step is
+                # in flight.  The normal output path intentionally skips such
+                # requests, and their canonical KV state may already have
+                # been freed by the next scheduling turn.
+                if request is None or request.is_finished():
+                    continue
+                update = updates.snapshots.get(req_id)
+                if update is None:
+                    update = updates.allocations.get(req_id)
+                if update is None:
+                    raise RuntimeError(f"Missing Ragged update for {req_id}")
+                if req_id in updates.snapshots:
+                    source_e = update.effective_lens
+                    state_version = update.state_version
+                else:
+                    source_e = update.expected_source_effective_lens
+                    state_version = update.new_state_version
+                self.kv_cache_manager.commit_ragged_effective_lens(
+                    req_id,
+                    state_version,
+                    source_e,
+                    tuple(value + num_tokens for value in source_e),
+                )
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output

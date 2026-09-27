@@ -143,6 +143,12 @@ from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.ragged_layout import (
+    RaggedStepViews,
+    build_ragged_step_views,
+    placement_to_tensors,
+    ragged_physical_cache_shape,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -163,6 +169,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     KVQuantMode,
     MambaSpec,
+    RaggedAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -185,6 +192,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.ragged_kv_layout import MemberPlacementMap
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -219,6 +227,7 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker.gpu.ragged_kv_state import RaggedWorkerPhysicalState
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -673,6 +682,11 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.ragged_worker_state: RaggedWorkerPhysicalState | None = None
+        self.ragged_member_to_cluster: torch.Tensor | None = None
+        self.ragged_member_to_column: torch.Tensor | None = None
+        self.ragged_layer_indices: dict[str, int] | None = None
+        self.ragged_step_views: RaggedStepViews | None = None
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1190,7 +1204,12 @@ class GPUModelRunner(
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
+            req_index = self.input_batch.req_id_to_index.get(req_id)
             self.input_batch.remove_request(req_id)
+            if self.ragged_worker_state is not None:
+                # The request index is stable until InputBatch.condense().
+                if req_index is not None:
+                    self.ragged_worker_state.remove_request(req_index)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -1489,8 +1508,31 @@ class GPUModelRunner(
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
+        ragged_source_indices = None
+        if self.ragged_worker_state is not None:
+            ragged_source_indices = [
+                self.input_batch.req_id_to_index[req_id]
+                for req_id in self.input_batch.req_ids
+                if req_id is not None
+            ]
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
+        if self.ragged_worker_state is not None:
+            assert ragged_source_indices is not None
+            self.ragged_worker_state.reindex(ragged_source_indices)
+            updates = scheduler_output.ragged_kv_updates
+            if updates is None:
+                raise RuntimeError("Ragged worker state requires Ragged transport")
+            for req_id, snapshot in updates.snapshots.items():
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    raise RuntimeError(f"Missing Ragged request index for {req_id}")
+                self.ragged_worker_state.apply_snapshot(req_index, snapshot)
+            for req_id, delta in updates.allocations.items():
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is None:
+                    raise RuntimeError(f"Missing Ragged request index for {req_id}")
+                self.ragged_worker_state.apply_allocation_delta(req_index, delta)
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
@@ -2054,6 +2096,39 @@ class GPUModelRunner(
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+
+        if self.ragged_worker_state is not None:
+            mirror = self.ragged_worker_state.gather(range(num_reqs))
+            cluster_rows = torch.as_tensor(
+                mirror.cluster_rows, dtype=torch.int32, device=self.device
+            )
+            source_effective_lens = torch.as_tensor(
+                mirror.effective_lens, dtype=torch.int32, device=self.device
+            )
+            assert self.ragged_member_to_cluster is not None
+            assert self.ragged_member_to_column is not None
+            spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            assert isinstance(spec, RaggedAttentionSpec)
+            # ``effective_lens`` is already available in the CPU mirror.  Keep
+            # step-derived scalar metadata on the producer/control path instead
+            # of synchronizing a GPU reduction back to Python on every step.
+            max_kv_len = int(
+                (mirror.effective_lens + num_scheduled_tokens[:, None]).max()
+            )
+            self.ragged_step_views = build_ragged_step_views(
+                cluster_rows,
+                source_effective_lens,
+                query_start_loc,
+                self.ragged_member_to_cluster,
+                self.ragged_member_to_column,
+                spec.page_group_size,
+                spec.block_size,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=int(num_scheduled_tokens.max()),
+                max_kv_len=max_kv_len,
+            )
+        else:
+            self.ragged_step_views = None
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
@@ -4308,19 +4383,27 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
-                num_reqs_padded=(
-                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
-                ),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
-            )
-
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
+            if self.ragged_step_views is not None:
+                slot_mappings_by_group = {0: torch.empty(0, device=self.device)}
+                slot_mappings = {}
+                attn_metadata, spec_decode_common_attn_metadata = {}, None
+            else:
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=(
+                        num_tokens_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_tokens_unpadded
+                    ),
+                    num_reqs_padded=(
+                        num_reqs_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_reqs
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded,
+                )
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs,
@@ -4332,8 +4415,8 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    )
                 )
-            )
 
             (
                 input_ids,
@@ -4384,6 +4467,8 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                ragged_step_views=self.ragged_step_views,
+                ragged_layer_indices=self.ragged_layer_indices,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4522,6 +4607,28 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if self.ragged_worker_state is not None:
+            updates = scheduler_output.ragged_kv_updates
+            if updates is None:
+                raise RuntimeError("Ragged execution missing state transport")
+            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+                update = updates.snapshots.get(req_id)
+                if update is None:
+                    update = updates.allocations.get(req_id)
+                if update is None:
+                    raise RuntimeError(f"Missing Ragged update for {req_id}")
+                if req_id in updates.snapshots:
+                    source_e = update.effective_lens
+                    state_version = update.state_version
+                else:
+                    source_e = update.expected_source_effective_lens
+                    state_version = update.new_state_version
+                req_index = self.input_batch.req_id_to_index[req_id]
+                target_e = tuple(value + num_tokens for value in source_e)
+                self.ragged_worker_state.commit_effective_lens(
+                    req_index, state_version, source_e, target_e
+                )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -7333,6 +7440,25 @@ class GPUModelRunner(
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+                    if isinstance(kv_cache_spec, RaggedAttentionSpec):
+                        if packing is not None:
+                            raise NotImplementedError(
+                                "Packed KV cache tensors are unsupported for Ragged"
+                            )
+                        if kernel_block_size != kv_cache_spec.block_size:
+                            raise ValueError(
+                                "Ragged kernel block size must match the spec block size"
+                            )
+                        kv_cache_shape = ragged_physical_cache_shape(
+                            num_blocks,
+                            kv_cache_spec.page_group_size,
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.head_size,
+                        )
+                        kv_caches[layer_name] = raw_tensor.view(
+                            kv_cache_spec.dtype
+                        ).view(kv_cache_shape)
+                        continue
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -7572,6 +7698,35 @@ class GPUModelRunner(
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        ragged_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, RaggedAttentionSpec)
+        ]
+        if ragged_groups:
+            if len(ragged_groups) != 1 or len(kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError("Ragged production path requires one KV cache group")
+            group = ragged_groups[0]
+            spec = group.kv_cache_spec
+            placement = MemberPlacementMap.identity(
+                num_layers=len(group.layer_names),
+                num_kv_heads=spec.num_kv_heads,
+                page_group_size=spec.page_group_size,
+            )
+            self.ragged_worker_state = RaggedWorkerPhysicalState(
+                max_num_reqs=self.max_num_reqs,
+                placement=placement,
+                max_pages_per_cluster=cdiv(self.max_model_len, spec.block_size),
+                block_size=spec.block_size,
+            )
+            (
+                self.ragged_member_to_cluster,
+                self.ragged_member_to_column,
+            ) = placement_to_tensors(placement, device=self.device)
+            self.ragged_layer_indices = {
+                layer_name: layer_idx
+                for layer_idx, layer_name in enumerate(group.layer_names)
+            }
         self._mamba_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
