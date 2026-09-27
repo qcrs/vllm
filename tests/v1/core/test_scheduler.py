@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -2285,6 +2286,7 @@ def create_scheduler_with_priority(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
+    kv_cache_spec: KVCacheSpec | None = None,
 ) -> Scheduler:
     """Create scheduler with priority policy enabled.
 
@@ -2366,7 +2368,8 @@ def create_scheduler_with_priority(
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer"],
-                FullAttentionSpec(
+                kv_cache_spec
+                or FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,

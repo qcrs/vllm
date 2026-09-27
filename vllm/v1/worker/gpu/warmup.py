@@ -165,6 +165,14 @@ def warmup_kernels(
     decode_query_len + 1 prompt tokens each. The second iteration simulates
     a decode step with all requests generating decode_query_len tokens.
     """
+    if model_runner.ragged_worker_state is not None:
+        # The generic warmup fabricates SchedulerOutput rows without Ragged
+        # ownership transport. Do not materialize fake worker state or route
+        # that synthetic batch through production Ragged execution; real
+        # requests exercise the path after Scheduler snapshots are available.
+        logger.info("Skipping generic V2 warmup for Ragged KV execution")
+        return
+
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query

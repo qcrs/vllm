@@ -2308,6 +2308,8 @@ class VllmConfig:
         """Reject unsupported production Ragged configurations centrally."""
         if self.cache_config.page_group_size is None:
             return self
+        if not self.use_v2_model_runner:
+            raise ValueError("Ragged KV production requires the MRV2 model runner")
         unsupported: list[str] = []
         if self.parallel_config.tensor_parallel_size != 1:
             unsupported.append("tensor parallelism")

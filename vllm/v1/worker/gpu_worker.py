@@ -171,14 +171,7 @@ class Worker(WorkerBase):
         if self.profiler_config.profiler not in ("torch", "cuda", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
-        # The current production Ragged lifecycle is implemented in the V1
-        # runner.  Keep the V2 runner as the default for Dense execution, but
-        # route Ragged requests through the runner that owns the Ragged
-        # SchedulerOutput/mirror/step-view integration.
-        self.use_v2_model_runner = (
-            vllm_config.use_v2_model_runner
-            and vllm_config.cache_config.page_group_size is None
-        )
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 

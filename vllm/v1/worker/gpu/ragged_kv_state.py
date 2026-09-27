@@ -232,27 +232,6 @@ class RaggedWorkerPhysicalState:
         self.effective_lens[req_index].fill(0)
         self.state_versions[req_index] = -1
 
-    def reindex(self, source_indices: Sequence[int]) -> None:
-        """Compact active request rows to match InputBatch request order."""
-        indices = np.asarray(source_indices, dtype=np.int64)
-        if indices.ndim != 1:
-            raise ValueError("source_indices must be one-dimensional")
-        if np.any(indices < 0) or np.any(indices >= self.max_num_reqs):
-            raise IndexError("source_indices contain an out-of-range index")
-        count = len(indices)
-        rows = self.rows[indices].copy()
-        counts = self.counts[indices].copy()
-        effective_lens = self.effective_lens[indices].copy()
-        state_versions = self.state_versions[indices].copy()
-        self.rows.fill(0)
-        self.counts.fill(0)
-        self.effective_lens.fill(0)
-        self.state_versions.fill(-1)
-        self.rows[:count] = rows
-        self.counts[:count] = counts
-        self.effective_lens[:count] = effective_lens
-        self.state_versions[:count] = state_versions
-
     def gather(self, req_indices: Sequence[int]) -> RaggedClusterStepView:
         # 把任意 Sequence[int] 统一转换成 NumPy ndarray。
         indices = np.asarray(req_indices, dtype=np.int64)

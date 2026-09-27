@@ -49,14 +49,24 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.backends.ragged_layout import (
+    RaggedStepViews,
+    build_ragged_step_views,
+    placement_to_tensors,
+)
 from vllm.v1.core.sched.output import (
     CompactionPlanData,
     CompactionResultData,
     GrammarOutput,
     SchedulerOutput,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    RaggedAttentionSpec,
+)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.ragged_kv_layout import MemberPlacementMap
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -106,6 +116,10 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.ragged_kv_state import (
+    RaggedClusterStepView,
+    RaggedWorkerPhysicalState,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -243,6 +257,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+        self.ragged_worker_state: RaggedWorkerPhysicalState | None = None
+        self.ragged_member_to_cluster: torch.Tensor | None = None
+        self.ragged_member_to_column: torch.Tensor | None = None
+        self.ragged_layer_indices: dict[str, int] | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -431,9 +449,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return get_kv_cache_spec(self.vllm_config)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        # 深拉票呢哦 建立 本地得runtime
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+
+        ragged_groups = [
+            group
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, RaggedAttentionSpec)
+        ]
+        if ragged_groups:
+            if len(ragged_groups) != 1 or len(kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError("Ragged production path requires one KV cache group")
+            group = ragged_groups[0]
+            spec = group.kv_cache_spec
+            placement = MemberPlacementMap.identity(
+                num_layers=len(group.layer_names),
+                num_kv_heads=spec.num_kv_heads,
+                page_group_size=spec.page_group_size,
+            )
+            self.ragged_worker_state = RaggedWorkerPhysicalState(
+                max_num_reqs=self.max_num_reqs,
+                placement=placement,
+                max_pages_per_cluster=cdiv(self.max_model_len, spec.block_size),
+                block_size=spec.block_size,
+            )
+            (
+                self.ragged_member_to_cluster,
+                self.ragged_member_to_column,
+            ) = placement_to_tensors(placement, device=self.device)
+            self.ragged_layer_indices = {
+                layer_name: layer_idx
+                for layer_idx, layer_name in enumerate(group.layer_names)
+            }
+            missing_layers = set(group.layer_names) - set(
+                self.compilation_config.static_forward_context
+            )
+            if missing_layers:
+                raise ValueError(
+                    f"Ragged cache group references unknown layers: {missing_layers}"
+                )
+            for layer_name in group.layer_names:
+                layer = self.compilation_config.static_forward_context[layer_name]
+                if layer.num_kv_heads != spec.num_kv_heads:
+                    raise ValueError(
+                        f"Ragged KV head count mismatch for layer {layer_name}"
+                    )
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -782,6 +842,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.ragged_worker_state is not None:
+            self.ragged_worker_state.remove_request(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -790,6 +852,129 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
         return True
+
+    def _apply_ragged_kv_updates(self, scheduler_output: SchedulerOutput) -> None:
+        ragged_state = self.ragged_worker_state
+        updates = scheduler_output.ragged_kv_updates
+        if ragged_state is None:
+            if updates is not None:
+                raise RuntimeError("Dense MRV2 received Ragged state transport")
+            return
+        if updates is None:
+            raise RuntimeError("Ragged MRV2 execution is missing state transport")
+
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        update_req_ids = set(updates.snapshots) | set(updates.allocations)
+        if not update_req_ids.issubset(scheduled_req_ids):
+            raise RuntimeError("Ragged transport contains an unscheduled request")
+        new_req_ids = {
+            request.req_id for request in scheduler_output.scheduled_new_reqs
+        }
+        if not new_req_ids.issubset(updates.snapshots):
+            raise RuntimeError("New or resumed Ragged request is missing a snapshot")
+
+        for req_id, snapshot in updates.snapshots.items():
+            if snapshot.request_id != req_id:
+                raise RuntimeError("Ragged snapshot request identity mismatch")
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None:
+                raise RuntimeError(
+                    f"Ragged snapshot has no RequestState slot: {req_id}"
+                )
+            ragged_state.apply_snapshot(req_idx, snapshot)
+        for req_id, delta in updates.allocations.items():
+            if delta.request_id != req_id:
+                raise RuntimeError("Ragged allocation request identity mismatch")
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None:
+                raise RuntimeError(f"Ragged delta has no RequestState slot: {req_id}")
+            ragged_state.apply_allocation_delta(req_idx, delta)
+
+        for req_id in scheduled_req_ids:
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None or ragged_state.state_versions[req_idx] < 0:
+                raise RuntimeError(
+                    f"Scheduled Ragged request is not materialized: {req_id}"
+                )
+
+    def _prepare_ragged_step(
+        self, input_batch: InputBatch
+    ) -> tuple[RaggedStepViews, RaggedClusterStepView]:
+        if self.ragged_worker_state is None or self.kv_cache_config is None:
+            raise RuntimeError("Ragged worker runtime is not initialized")
+        if (
+            self.ragged_member_to_cluster is None
+            or self.ragged_member_to_column is None
+        ):
+            raise RuntimeError("Ragged placement tensors are not initialized")
+        if self.ragged_layer_indices is None:
+            raise RuntimeError("Ragged layer indices are not initialized")
+
+        req_indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
+        if len(req_indices) != input_batch.num_reqs:
+            raise RuntimeError("Ragged batch request mapping is incomplete")
+        source = self.ragged_worker_state.gather(req_indices)
+        if np.any(source.state_versions < 0):
+            raise RuntimeError("Ragged batch contains an unmaterialized request slot")
+
+        spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if not isinstance(spec, RaggedAttentionSpec):
+            raise RuntimeError("Ragged worker state has no Ragged cache spec")
+        query_lens = input_batch.num_scheduled_tokens
+        target_lens = source.effective_lens + query_lens[:, None]
+        if np.any(target_lens > source.page_counts * spec.block_size):
+            raise RuntimeError("Ragged page capacity is below the step target")
+        active_page_ids: list[int] = []
+        for row, counts in zip(source.cluster_rows, source.page_counts):
+            for cluster_row, count in zip(row, counts):
+                active_page_ids.extend(int(page_id) for page_id in cluster_row[:count])
+        if any(
+            page_id <= 0 or page_id >= self.kv_cache_config.num_blocks
+            for page_id in active_page_ids
+        ):
+            raise RuntimeError("Ragged mirror contains an invalid physical page ID")
+        if len(active_page_ids) != len(set(active_page_ids)):
+            raise RuntimeError("Ragged mirror contains duplicate physical page IDs")
+
+        cluster_rows = torch.as_tensor(
+            source.cluster_rows, dtype=torch.int32, device=self.device
+        )
+        source_effective_lens = torch.as_tensor(
+            source.effective_lens, dtype=torch.int32, device=self.device
+        )
+        query_start_loc = input_batch.query_start_loc[: input_batch.num_reqs + 1]
+        views = build_ragged_step_views(
+            cluster_rows,
+            source_effective_lens,
+            query_start_loc,
+            self.ragged_member_to_cluster,
+            self.ragged_member_to_column,
+            spec.page_group_size,
+            spec.block_size,
+            num_actual_tokens=input_batch.num_tokens,
+            max_query_len=int(query_lens.max()),
+            max_kv_len=int(target_lens.max()),
+        )
+        return views, source
+
+    def _commit_ragged_step(
+        self, input_batch: InputBatch, source: RaggedClusterStepView
+    ) -> None:
+        if self.ragged_worker_state is None:
+            raise RuntimeError("Ragged worker runtime is not initialized")
+        for batch_idx in range(input_batch.num_reqs):
+            req_idx = int(input_batch.idx_mapping_np[batch_idx])
+            source_e = tuple(int(value) for value in source.effective_lens[batch_idx])
+            target_e = tuple(
+                value + int(input_batch.num_scheduled_tokens[batch_idx])
+                for value in source_e
+            )
+            self.ragged_worker_state.commit_effective_lens(
+                req_idx,
+                int(source.state_versions[batch_idx]),
+                source_e,
+                target_e,
+            )
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
@@ -2079,6 +2264,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self._apply_ragged_kv_updates(scheduler_output)
             self.req_states.effective_kv_len.apply_write()
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -2126,17 +2312,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
-            # Mamba "align" pre-copy: migrate recurrent state across block
-            # boundaries before the forward. Runs only on real batches, and
-            # before model_state.prepare_attn gathers num_accepted_tokens so the
-            # boundary reset is visible to the attention metadata.
-            self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
-                self.kv_cache_config,
-                self.req_states.num_computed_tokens.gpu,
-            )
+            ragged_step_views = None
+            ragged_source_state = None
+            if self.ragged_worker_state is not None:
+                ragged_step_views, ragged_source_state = self._prepare_ragged_step(
+                    input_batch
+                )
+            else:
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
+                # Mamba align pre-copy runs only on Dense/Hybrid attention.
+                self.model_state.preprocess_state(
+                    input_batch,
+                    block_tables,
+                    self.kv_cache_config,
+                    self.req_states.num_computed_tokens.gpu,
+                )
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -2148,6 +2338,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
+            if self.ragged_worker_state is not None and not skip_attn_for_dummy_run:
+                raise RuntimeError(
+                    "Ragged dummy runs require skip_attn_for_dummy_run=True"
+                )
+            ragged_step_views = None
+            ragged_source_state = None
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
@@ -2163,22 +2359,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
-        attn_metadata = None
-        slot_mappings_by_layer = None
-        if not (dummy_run and skip_attn_for_dummy_run):
-            assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
-            )
-            assert block_tables is not None
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                self.attn_groups,
-                self.kv_cache_config,
-            )
+        if ragged_step_views is not None:
+            attn_metadata = {}
+            slot_mappings_by_layer = {}
+        else:
+            attn_metadata = None
+            slot_mappings_by_layer = None
+            if not (dummy_run and skip_attn_for_dummy_run):
+                assert slot_mappings is not None
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
+                )
+                assert block_tables is not None
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2263,6 +2463,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                ragged_step_views=ragged_step_views,
+                ragged_layer_indices=self.ragged_layer_indices
+                if ragged_step_views is not None
+                else None,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
@@ -2311,6 +2515,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             effective_kv_len_override_valid=effective_kv_len_override_valid,
             effective_kv_len_override=effective_kv_len_override,
             compaction_results=compaction_results,
+            ragged_source_state=ragged_source_state,
         )
 
         if not self.is_last_pp_rank:
@@ -2338,6 +2543,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         effective_kv_len_override = self.execute_model_state.effective_kv_len_override
         compaction_results = self.execute_model_state.compaction_results
+        ragged_source_state = self.execute_model_state.ragged_source_state
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2429,6 +2635,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             effective_kv_len_override_valid,
             effective_kv_len_override,
         )
+
+        if ragged_source_state is not None:
+            self._commit_ragged_step(input_batch, ragged_source_state)
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2586,6 +2795,7 @@ class ExecuteModelState(NamedTuple):
     effective_kv_len_override_valid: torch.Tensor
     effective_kv_len_override: torch.Tensor
     compaction_results: list[CompactionResultData]
+    ragged_source_state: RaggedClusterStepView | None
 
 
 def sort_batch_req_ids(

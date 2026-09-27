@@ -149,8 +149,17 @@ def test_scheduler_wire_worker_non_uniform_end_to_end_and_readd():
     worker.remove_request(req_index)
     assert not worker.rows[req_index].any()
     assert worker.state_versions[req_index] == -1
-    worker.apply_snapshot(req_index, committed_snapshot)
-    assert_worker_matches_snapshot(worker, req_index, committed_snapshot)
+    reused_snapshot = replace(
+        committed_snapshot,
+        state_version=committed_snapshot.state_version + 4,
+        effective_lens=(0, 16, 0, 0),
+        page_counts=(0, 1, 0, 0),
+        flat_page_ids=(61,),
+    )
+    worker.apply_snapshot(req_index, reused_snapshot)
+    assert_worker_matches_snapshot(worker, req_index, reused_snapshot)
+    assert not worker.rows[req_index, 0].any()
+    assert worker.rows[req_index, 1, 0] == 61
 
 
 @pytest.mark.parametrize(
