@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.kv_reclamation import ReclaimRequest, ReclaimResult
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -128,8 +129,10 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        enable_kv_reclamation: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
+        self.enable_kv_reclamation = enable_kv_reclamation
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -209,7 +212,9 @@ class KVCacheManager:
             request_id=request.request_id,
             logical_tokens=request.num_computed_tokens,
             settled_logical_tokens=settled,
-            effective_kv_len=getattr(request, "effective_kv_len", settled),
+            effective_kv_len=request.effective_kv_len
+            if self.enable_kv_reclamation
+            else settled,
             request_status=request.status.name,
             free_blocks=self.block_pool.get_num_free_blocks(),
             **row,
@@ -422,6 +427,13 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        if self.enable_kv_reclamation:
+            num_local_computed_tokens = (
+                request.effective_kv_len + num_new_computed_tokens
+            )
+            total_computed_tokens = (
+                num_local_computed_tokens + num_external_computed_tokens
+            )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -549,6 +561,38 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def commit_reclamation(
+        self, request: Request, intent: ReclaimRequest, result: ReclaimResult
+    ) -> None:
+        """Commit completed worker layout, then release canonical Block objects."""
+        manager = self.coordinator.single_type_managers[0]
+        blocks = manager.req_to_blocks[request.request_id]
+        ids = [block.block_id for block in blocks]
+        retained = result.retained_block_ids
+        block_size = manager.block_size
+        assert ids == intent.source_block_ids
+        assert result.request_id == request.request_id == intent.request_id
+        assert result.new_effective_kv_len == intent.target_keep_tokens
+        assert len(retained) == cdiv(result.new_effective_kv_len, block_size)
+        assert len(set(retained)) == len(retained)
+        assert set(retained).issubset(ids)
+        assert all(b.ref_cnt == 1 and not b.is_null for b in blocks)
+        by_id = {b.block_id: b for b in blocks}
+        retained_set = set(retained)
+        removed = [b for b in blocks if b.block_id not in retained_set]
+        manager.req_to_blocks[request.request_id] = [by_id[i] for i in retained]
+        request.effective_kv_len = result.new_effective_kv_len
+        self.block_pool.free_blocks(reversed(removed))
+        self.trace_request(
+            "reclaim_commit",
+            request,
+            source_effective_kv_len=intent.source_effective_kv_len,
+            released_blocks=len(removed),
+            released_ids=[b.block_id for b in removed]
+            if self.trace and self.trace.include_ids
+            else None,
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

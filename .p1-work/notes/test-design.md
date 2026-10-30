@@ -12,3 +12,10 @@
 ## M0 allocator
 
 沿已有 `tests/v1/core/test_scheduler.py` / `test_single_type_kv_cache_manager.py` suites 扩展真实 requirement/Pool 行为；Engine native/instrumentation 比较 token IDs。ID trace 不触发 GPU sync，Serving 默认只计数。
+
+## M1 canonical ownership
+
+- 模块用途：消费已完成的 Worker row/E，保留 canonical Block 对象并释放其余页。
+- I/O：原 Request、源 row/长度、完成结果；输出新 ownership/E 和真实 free queue。
+- 防止的失败：重复、null、外部、过期 ACK 导致错 free；按 logical L 重新申请已丢弃页；EOS/abort 双重释放。
+- 最低成本层级：复用 `test_kv_cache_utils.py` 的真实 Pool 和 Request helper，验证 commit 后按 E 增长并被 B 复用；GPU完成、EOS/abort 和 preemption 在 8B Engine 实验验证。

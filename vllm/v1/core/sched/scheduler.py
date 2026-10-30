@@ -55,6 +55,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_reclamation import ReclaimRequest, ReclamationConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -82,6 +83,9 @@ class Scheduler(SchedulerInterface):
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
+        self.reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
+        if self.reclamation_config is not None:
+            self.reclamation_config.validate_cache(kv_cache_config)
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
@@ -280,6 +284,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            enable_kv_reclamation=self.reclamation_config is not None,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1190,6 +1195,24 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def make_reclaim_request(
+        self, request: Request, scheduler_output: SchedulerOutput, keep_tokens: int
+    ) -> ReclaimRequest:
+        """Describe a deterministic post-forward reclamation of a decode request."""
+        assert self.reclamation_config is not None
+        q = scheduler_output.num_scheduled_tokens.get(request.request_id, 0)
+        assert request.status == RequestStatus.RUNNING and q in (0, 1)
+        assert (
+            request.num_computed_tokens - request.num_in_flight_tokens
+            >= request.num_prompt_tokens
+        )
+        assert request.num_in_flight_tokens == q
+        source_len = request.effective_kv_len + q
+        assert 0 < keep_tokens < source_len
+        row = self.kv_cache_manager.get_block_ids(request.request_id)[0]
+        assert len(row) > (keep_tokens + self.block_size - 1) // self.block_size
+        return ReclaimRequest(request.request_id, source_len, row.copy(), keep_tokens)
+
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1223,6 +1246,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.effective_kv_len = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1248,6 +1272,10 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self.reclamation_config is not None:
+            scheduler_output.effective_kv_lens = {
+                rid: self.requests[rid].effective_kv_len for rid in num_scheduled_tokens
+            }
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
@@ -1603,6 +1631,21 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        if self.reclamation_config is not None:
+            result = model_runner_output.reclaim_result
+            intent = scheduler_output.reclaim_request
+            assert (intent is None) == (result is None)
+            for rid, q in num_scheduled_tokens.items():
+                request = self.requests.get(rid)
+                if request is not None and not request.is_finished():
+                    request.effective_kv_len += q
+            if result is not None:
+                assert intent is not None
+                request = self.requests.get(result.request_id)
+                if request is not None and not request.is_finished():
+                    assert request.effective_kv_len == intent.source_effective_kv_len
+                    self.kv_cache_manager.commit_reclamation(request, intent, result)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

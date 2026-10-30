@@ -55,7 +55,27 @@ def main():
         "sampling_interval_s": 0.1,
     }
     record["source_files"] = {}
-    for source in [Path(__file__), *(Path(c) for c in command if c.endswith(".py"))]:
+    changed = (
+        subprocess.check_output(
+            [
+                "git",
+                "ls-files",
+                "--modified",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "vllm",
+                "tests",
+                "benchmarks",
+            ],
+            text=True,
+        )
+        .strip("\0")
+        .split("\0")
+    )
+    sources = {Path(__file__), *(Path(c) for c in command if c.endswith(".py"))}
+    sources.update(Path(p) for p in changed if p)
+    for source in sorted(sources):
         source = source.resolve()
         target = run / "source" / source.relative_to(root)
         target.parent.mkdir(parents=True, exist_ok=True)

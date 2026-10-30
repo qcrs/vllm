@@ -6,7 +6,7 @@
 | 阶段 | 状态 | 尚需证据 |
 | --- | --- | --- |
 | M0 | PASS | Native/trace identity、真实 allocator miss/free、CPU oracle、完整本地数据审计完成；28 tests passed |
-| M1 | NOT_RUN | E/physical metadata、whole-block live reuse、Stable CTA/编译IR、事件/ownership、重复回收/EOS/abort/maintenance、profiling |
+| M1 | PASS | Whole/token live reuse、重复回收、FP32 Attention、EOS/abort/maintenance/preempt/q0/fail-stop、42 tests、优化及NCU/NSYS完成；见reports/m1.md |
 | M2 | NOT_RUN | 真实miss/candidate/headroom/一次retry/native fallback、Tri shared/calibration/score reference、质量与Serving |
 | Prefix | NOT_RUN | shared保护、所有suffix aliases撤销、lossy后停止发布、真实APC命中与reuse |
 | Graph | NOT_RUN | FULL/PIECEWISE真实replay、静态地址、E/row/slot刷新、recapture计数 |

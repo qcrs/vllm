@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import dataclasses
 import hashlib
 import importlib
 from collections.abc import Callable
@@ -57,6 +58,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.kv_reclamation import ReclaimRequest, ReclaimResult
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -1542,6 +1544,75 @@ def test_allocate_with_lookahead():
         num_lookahead_tokens=4,
     )
     assert len(blocks.get_block_ids()[0]) == 2
+
+
+@pytest.fixture
+def reclamation_owner():
+    config = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], new_kv_cache_spec(block_size=16))],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        enable_caching=False,
+        enable_kv_reclamation=True,
+    )
+    request = make_request("A", [1] * 64, block_size=16)
+    manager.allocate_slots(request, 64)
+    request.num_computed_tokens = request.effective_kv_len = 64
+    row = manager.get_block_ids("A")[0]
+    intent = ReclaimRequest("A", 64, row.copy(), 16)
+    return manager, request, intent
+
+
+def test_reclamation_reuses_released_pages_and_grows_from_effective_length(
+    reclamation_owner,
+):
+    """An aligned retained tail grows one page, and B owns the released pages."""
+    manager, request, intent = reclamation_owner
+    original = manager.coordinator.single_type_managers[0].req_to_blocks["A"].copy()
+    manager.commit_reclamation(request, intent, ReclaimResult("A", 16, [1]))
+    assert request.num_computed_tokens == 64 and request.effective_kv_len == 16
+    assert (
+        manager.coordinator.single_type_managers[0].req_to_blocks["A"] == original[:1]
+    )
+    assert manager.block_pool.get_num_free_blocks() == 4
+    assert len(manager.allocate_slots(request, 1).get_block_ids()[0]) == 1
+    assert len(manager.get_block_ids("A")[0]) == 2
+    other = make_request("B", [2] * 48, block_size=16)
+    other_row = manager.allocate_slots(other, 48).get_block_ids()[0]
+    assert len(set(other_row) & {2, 3, 4}) >= 2
+    assert set(other_row).isdisjoint(manager.get_block_ids("A")[0])
+    manager.free(request)
+    manager.free(other)
+    assert manager.block_pool.get_num_free_blocks() == 5
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "null", "foreign", "stale", "shared"])
+def test_reclamation_rejects_invalid_ownership_before_free(reclamation_owner, invalid):
+    manager, request, intent = reclamation_owner
+    row = intent.source_block_ids[:2]
+    intent = dataclasses.replace(intent, target_keep_tokens=32)
+    if invalid == "duplicate":
+        row = [1, 1]
+    elif invalid == "null":
+        row = [1, 0]
+    elif invalid == "foreign":
+        row = [1, 5]
+    elif invalid == "stale":
+        intent = dataclasses.replace(intent, source_block_ids=[4, 3, 2, 1])
+    else:
+        manager.block_pool.blocks[2].ref_cnt += 1
+    before = manager.block_pool.get_num_free_blocks()
+    with pytest.raises(AssertionError):
+        manager.commit_reclamation(request, intent, ReclaimResult("A", 32, row))
+    assert manager.block_pool.get_num_free_blocks() == before
+    assert manager.get_block_ids("A")[0] == [1, 2, 3, 4]
+    assert request.effective_kv_len == 64
 
 
 def test_get_kv_cache_config_one_worker():

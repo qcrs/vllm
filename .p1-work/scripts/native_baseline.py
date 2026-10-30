@@ -40,6 +40,8 @@ def main():
         disable_log_stats=True,
     )
     pressure = os.environ.get("P1_PRESSURE") == "1"
+    if os.environ.get("P1_RECLAIM") == "1":
+        args.additional_config = {"kv_reclamation": {"retention": 1.0}}
     if pressure:
         args.max_model_len = 512
         args.max_num_batched_tokens = 256

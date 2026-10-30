@@ -166,6 +166,8 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Settled retained KV members; logical progress is independent.
+        self.effective_kv_len = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

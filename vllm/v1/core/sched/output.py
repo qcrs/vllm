@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from vllm.v1.kv_reclamation import ReclaimRequest
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -258,6 +260,9 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    reclaim_request: ReclaimRequest | None = None
+    effective_kv_lens: dict[str, int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

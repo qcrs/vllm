@@ -50,6 +50,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_reclamation import ReclaimRequest, ReclamationConfig
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -88,6 +89,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
+from vllm.v1.worker.gpu.kv_reclamation import KVReclamationWorker
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -225,6 +227,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             device=self.device,
+        )
+        reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
+        self.reclamation = (
+            KVReclamationWorker(reclamation_config, self.req_states, self.input_buffers)
+            if reclamation_config is not None
+            else None
         )
         if self.use_pp:
             self.pp_handler = PPHandler(
@@ -512,6 +520,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        if self.reclamation is not None:
+            self.reclamation.initialize_cache(kv_cache_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -809,6 +819,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            if self.reclamation is not None:
+                self.reclamation.add_request(
+                    req_index, new_req_data.num_computed_tokens
+                )
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -836,6 +850,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        if self.reclamation is not None:
+            self.reclamation.update_requests(scheduler_output)
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
@@ -1166,6 +1182,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
+                if scheduler_output.reclaim_request is not None:
+                    assert self.reclamation is not None
+                    result = self.reclamation.reclaim(
+                        scheduler_output.reclaim_request, self.block_tables
+                    )
+                    completion = torch.cuda.Event()
+                    completion.record(self.main_stream)
+                    completion.synchronize()
+                    return ModelRunnerOutput(
+                        req_ids=[],
+                        req_id_to_index={},
+                        sampled_token_ids=[],
+                        reclaim_result=result,
+                    )
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
@@ -1209,7 +1239,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            attn_input_batch = (
+                self.reclamation.prepare_attn(input_batch)
+                if self.reclamation is not None
+                else input_batch
+            )
+            block_tables, slot_mappings = self.prepare_attn(attn_input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1236,6 +1271,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
             )
+            attn_input_batch = input_batch
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
             else:
@@ -1255,7 +1291,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             assert block_tables is not None
             attn_metadata = self.model_state.prepare_attn(
-                input_batch,
+                attn_input_batch,
                 batch_desc.cg_mode,
                 block_tables,
                 slot_mappings,
@@ -1383,6 +1419,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            reclaim_request=scheduler_output.reclaim_request,
         )
 
         if not self.is_last_pp_rank:
@@ -1405,6 +1442,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        reclaim_request = self.execute_model_state.reclaim_request
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1462,6 +1500,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
+        if reclaim_request is not None:
+            assert self.reclamation is not None
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
+            self.reclamation.advance(input_batch)
+            model_runner_output.reclaim_result = self.reclamation.reclaim(
+                reclaim_request, self.block_tables
+            )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
@@ -1486,13 +1537,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        if reclaim_request is None:
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
+            if self.reclamation is not None:
+                self.reclamation.advance(input_batch)
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1647,6 +1701,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    reclaim_request: ReclaimRequest | None = None
 
 
 def sort_batch_req_ids(
