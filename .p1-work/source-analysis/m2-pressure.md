@@ -32,5 +32,7 @@ schedule 消费并清除；该轮仍 miss 时直接执行原生 preempt/break。
 覆盖已有 partial batch、q0 maintenance、waiting admission、R0、未完成prefill和
 一次重试仍不足时的原生 preempt。`test_kv_cache_utils.py` 覆盖覆盖量与成本的选择。
 
-当前实现仅 SinkRecent。TriAttention 的评分适配与正式质量/Serving仍未通过，不从
-这些小池实验推断 goodput 或质量收益。
+本压力控制路径产生的回收 intent 使用 SinkRecent。后续 M2 加入的
+TriAttention-inspired shared scoring、匹配质量样本和 HTTP Serving 结果分别记录在
+`m2-scoring.md`、`m2-evaluation.md`；本源码记录的小池轨迹不用于推断 Serving goodput
+或质量收益。

@@ -51,5 +51,6 @@ format更改一处格式后复跑，不跳过hook。
 未改变选择/R，不能声称headroom带来收益。小trace与首次Triton编译不用于Serving速度比较。
 
 本记录不重做M1全层字节/FP32 Attention证据，不以CPU凭证测试代替GPU completion。
-TriAttention、无压力总成本、质量、Serving和Prefix/Graph/TP/DP均仍TO_VERIFY/NOT_RUN。
+TriAttention共享评分与质量/Serving结果分别记录在`m2-scoring.md`、
+`m2-evaluation.md`；其边界见对应报告。Prefix/Graph/TP/DP仍为NOT_RUN。
 后续工作已由prompt1长期目标授权，无额外阶段确认需求。
