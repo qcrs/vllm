@@ -230,7 +230,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
         self.reclamation = (
-            KVReclamationWorker(reclamation_config, self.req_states, self.input_buffers)
+            KVReclamationWorker(
+                reclamation_config,
+                self.req_states,
+                self.input_buffers,
+                self.model_config,
+            )
             if reclamation_config is not None
             else None
         )

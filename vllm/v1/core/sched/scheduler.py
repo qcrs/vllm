@@ -1262,7 +1262,7 @@ class Scheduler(SchedulerInterface):
             if not 0 < keep < source_len or released <= 0:
                 continue
             prefix, recent = sink_recent_ranges(source_len, keep, config.sink_tokens)
-            zero_copy = (
+            zero_copy = config.policy == "sink_recent" and (
                 whole_block_row(
                     [b.block_id for b in blocks],
                     source_len,
@@ -1278,7 +1278,11 @@ class Scheduler(SchedulerInterface):
                     request.request_id,
                     keep,
                     released,
-                    0 if zero_copy else 2 * (keep - prefix) * member_bytes,
+                    0
+                    if zero_copy
+                    else 2
+                    * (keep - prefix if config.policy == "sink_recent" else keep)
+                    * member_bytes,
                     zero_copy,
                     request.arrival_time,
                 )

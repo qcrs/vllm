@@ -41,7 +41,13 @@ def main():
     )
     pressure = True
     if os.environ.get("P1_RECLAIM") == "1":
-        args.additional_config = {"kv_reclamation": {"min_keep_tokens": 32}}
+        args.additional_config = {
+            "kv_reclamation": {
+                "min_keep_tokens": 32,
+                "policy": os.environ.get("P1_POLICY", "sink_recent"),
+                "stats_path": os.environ.get("P1_STATS"),
+            }
+        }
     if pressure:
         args.max_model_len = 512
         args.max_num_batched_tokens = 256
@@ -243,7 +249,32 @@ def main():
             intent.source_effective_kv_len, intent.target_keep_tokens, 16
         )
         keep = [*range(prefix), *range(recent, intent.source_effective_kv_len)]
-        whole = (
+        policy = runner.reclamation.config.policy
+        if policy != "sink_recent":
+            recent = intent.source_effective_kv_len - 16
+            idx = runner.req_states.req_id_to_index[intent.request_id]
+            assert policy == "triattention"
+            logical_gpu = runner.req_states.num_computed_tokens.gpu[idx : idx + 1]
+            assert (
+                int(logical_gpu.cpu())
+                == scheduler.requests[intent.request_id].num_computed_tokens
+            )
+            keep = (
+                runner.reclamation.scorer.plan(
+                    list(views.values()),
+                    tables.block_tables[0].gpu[idx],
+                    logical_gpu,
+                    intent.source_effective_kv_len,
+                    intent.target_keep_tokens,
+                    prefix,
+                    recent,
+                )
+                .cpu()
+                .tolist()
+            )
+            assert len(keep) == len(set(keep)) == intent.target_keep_tokens
+            assert keep == sorted(keep)
+        whole = policy == "sink_recent" and (
             whole_block_row(
                 intent.source_block_ids,
                 intent.source_effective_kv_len,
@@ -263,7 +294,7 @@ def main():
             recent,
             16,
         )
-        if row is None:
+        if row is None or not whole:
             row = intent.source_block_ids[: (len(keep) + 15) // 16]
         result = original_reclaim(intent, tables)
         if lifecycle == "failure":

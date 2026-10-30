@@ -26,3 +26,10 @@
 - I/O：allocator同一计算点的required-available、当前ownership/E、已排定q；输出唯一intent或原生调度行为。
 - 防止的失败：以token数量冒充真实释放页、排序不确定、丢掉partial allocation、反复回收而不执行native fallback。
 - 最低成本层级：pure候选排序在既有KV suite检验；真实8B Engine小池验证miss→完成→release→下一step重新allocation，另用Scheduler真实Pool构造running miss与一次重试。
+
+## M2 shared scoring
+
+- 模块用途：按实际paged K_rot与校准Q频域统计产生唯一current-member有序集合。
+- I/O：packed4D/真实stride、nonmonotonic row、GPU logical L_after、各层/统计head数据，输出FP32 shared scores与int32[K]计划。
+- 防止的失败：用E作为时间、Qwen half pairing错误、query-head统计提前平均、GQA计权重复、保护域影响z-score、同分选择不稳定。
+- 最低成本层级：在现有GPU compaction suite内用独立CPU FP32 dense复数计算比较raw/shared score与计划；包含query-head和KV-head stats、非连续页、padding、保护窗口及零方差。之后8B真实K与GPU logical状态验证。

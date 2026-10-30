@@ -43,6 +43,8 @@ def main():
     if os.environ.get("P1_RECLAIM") == "1":
         args.additional_config = {
             "kv_reclamation": {
+                "policy": os.environ.get("P1_POLICY", "sink_recent"),
+                "stats_path": os.environ.get("P1_STATS"),
                 "retention": float(os.environ.get("P1_RETENTION", "1")),
                 "pressure": os.environ.get("P1_CONTROLLER") == "1",
                 "reserve_cap": int(os.environ.get("P1_RESERVE", "0")),

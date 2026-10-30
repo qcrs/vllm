@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ReclamationConfig:
+    policy: str = "sink_recent"
+    stats_path: str | None = None
     pressure: bool = False
     retention: float = 0.5
     sink_tokens: int = 16
@@ -33,6 +35,10 @@ class ReclamationConfig:
         if options is None:
             return None
         result = cls(**options)
+        if result.policy not in ("sink_recent", "random", "triattention"):
+            raise ValueError("Unknown KV reclamation policy")
+        if result.policy == "triattention" and result.stats_path is None:
+            raise ValueError("TriAttention requires calibrated frequency stats")
         if not 0 < result.retention <= 1:
             raise ValueError("KV reclamation retention must be in (0, 1]")
         if min(result.sink_tokens, result.recent_tokens, result.reserve_cap) < 0:

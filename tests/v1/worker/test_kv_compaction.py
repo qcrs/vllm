@@ -8,6 +8,98 @@ import torch
 from tests.v1.worker.kv_compaction_utils import scalar_retained_kv
 
 
+def dense_frequency_reference(kv, stats, logical_next, theta):
+    """Independent FP32 complex arithmetic; no production score/address helper."""
+    keys = kv[:, :, : kv.shape[2] // 2].float()
+    frequency = keys.shape[2] // 2
+    k = torch.complex(keys[..., :frequency], keys[..., frequency:]).transpose(0, 1)
+    mu = torch.complex(stats[:, 0], stats[:, 1])
+    omega = 1 / theta ** (torch.arange(frequency).float() / frequency)
+    outputs = []
+    group = stats.shape[0] // keys.shape[1]
+    for head, mean in enumerate(mu):
+        rotated = mean * k[head // group].conj()
+        score = torch.stack(
+            [
+                (
+                    rotated
+                    * torch.polar(torch.ones_like(omega), (logical_next + 2**o) * omega)
+                ).real.sum(dim=-1)
+                for o in range(17)
+            ]
+        ).mean(dim=0)
+        norm = (stats[head, 0].square() + stats[head, 1].square() + 1e-8).sqrt()
+        magnitude = (k[head // group].abs().square() + 1e-8).sqrt()
+        outputs.append(score + ((stats[head, 2] - norm) * magnitude).sum(dim=-1))
+    return torch.stack(outputs)
+
+
+@pytest.mark.parametrize("statistics_heads", [2, 8])
+def test_paged_shared_frequency_scores_use_logical_time_and_gqa(statistics_heads):
+    from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
+
+    generator = torch.Generator().manual_seed(91)
+    cpu_layers, layers = [], []
+    for _ in range(2):
+        cpu = torch.empty_strided((7, 2, 16, 256), (16513, 512, 1024, 2))
+        cpu.copy_(torch.randn(cpu.shape, generator=generator))
+        gpu = torch.empty_strided(
+            cpu.shape, cpu.stride(), device="cuda", dtype=torch.bfloat16
+        )
+        gpu.copy_(cpu)
+        cpu_layers.append(gpu.cpu().float())
+        layers.append(gpu)
+    row, source, logical_next = [6, 1, 4, 0, 5, 2], 95, 18123
+    row_gpu = torch.tensor(row, dtype=torch.int32, device="cuda")
+    logical_gpu = torch.tensor([logical_next], dtype=torch.int32, device="cuda")
+    stats = torch.randn((2, statistics_heads, 3, 64), generator=generator) * 0.2
+    stats[:, :, 2] = (stats[:, :, 0].square() + stats[:, :, 1].square()).sqrt() + 0.3
+    scorer = TriAttentionScorer(stats.cuda(), 2, 1e6, 128)
+    expected = []
+    prefix, recent, keep = 3, 88, 41
+    for layer in range(2):
+        dense, _ = scalar_retained_kv([cpu_layers[layer]], row, list(range(source)))
+        raw = dense_frequency_reference(dense[0], stats[layer], logical_next, 1e6)
+        actual = scorer.score_layer(layers[layer], row_gpu, logical_gpu, source, layer)
+        torch.testing.assert_close(actual.cpu(), raw, atol=2e-3, rtol=1e-3)
+        var, mean = torch.var_mean(raw[:, prefix:recent], dim=1, correction=0)
+        normalized = (raw - mean[:, None]) / var.sqrt()[:, None]
+        expected.append(
+            normalized.view(2, statistics_heads // 2, source).amax(1).mean(0)
+        )
+    reference = torch.stack(expected).mean(0)
+    actual = scorer.shared_scores(layers, row_gpu, logical_gpu, source, prefix, recent)
+    torch.testing.assert_close(actual.cpu(), reference, atol=2e-3, rtol=1e-3)
+    actual_plan = protected_topk(actual, keep, prefix, recent).cpu()
+    ranked = sorted(range(prefix, recent), key=lambda i: (-float(reference[i]), i))
+    expected_plan = sorted(
+        [
+            *range(prefix),
+            *ranked[: keep - prefix - (source - recent)],
+            *range(recent, source),
+        ]
+    )
+    assert actual_plan.tolist() == expected_plan
+
+
+def test_shared_frequency_zero_variance_and_stable_protection():
+    from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
+
+    cache = torch.ones((2, 2, 16, 256), dtype=torch.bfloat16, device="cuda")
+    stats = torch.ones((1, 8, 3, 64), device="cuda")
+    scorer = TriAttentionScorer(stats, 2, 1e6, 32)
+    scores = scorer.shared_scores(
+        [cache],
+        torch.tensor([1], dtype=torch.int32, device="cuda"),
+        torch.tensor([1234], dtype=torch.int32, device="cuda"),
+        10,
+        2,
+        7,
+    )
+    assert torch.equal(scores, torch.zeros_like(scores))
+    assert protected_topk(scores, 7, 2, 7).tolist() == [0, 1, 2, 3, 7, 8, 9]
+
+
 @pytest.mark.parametrize("whole_blocks", [False, True])
 def test_scalar_oracle_decodes_nonmonotonic_pages_and_partial_tail(whole_blocks):
     layers = []

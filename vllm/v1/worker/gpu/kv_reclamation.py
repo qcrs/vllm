@@ -18,6 +18,7 @@ from vllm.v1.kv_reclamation import (
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, prepare_pos_seq_lens
 from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
+from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
 
 
 @triton.jit
@@ -31,7 +32,9 @@ def _advance_effective(lengths, indices, starts, N: tl.constexpr, BLOCK: tl.cons
 
 
 class KVReclamationWorker:
-    def __init__(self, config: ReclamationConfig, req_states, input_buffers):
+    def __init__(
+        self, config: ReclamationConfig, req_states, input_buffers, model_config
+    ):
         self.config = config
         self.req_states = req_states
         self.effective_kv_len = StagedWriteTensor(
@@ -40,6 +43,17 @@ class KVReclamationWorker:
         self.effective_kv_len_np = np.zeros(req_states.max_num_reqs, dtype=np.int32)
         self.cache_positions = torch.zeros_like(input_buffers.positions)
         self.kv_seq_lens = torch.zeros_like(input_buffers.seq_lens)
+        self.scorer = (
+            TriAttentionScorer.from_file(
+                config.stats_path,
+                model_config,
+                model_config.max_model_len,
+                req_states.device,
+            )
+            if config.policy == "triattention"
+            else None
+        )
+        self.generator = torch.Generator(device=req_states.device).manual_seed(0)
 
     def initialize_cache(self, cache_config, layers) -> None:
         self.config.validate_cache(cache_config)
@@ -101,28 +115,51 @@ class KVReclamationWorker:
             self.config.sink_tokens,
             intent.protected_prefix_tokens,
         )
-        row = whole_block_row(
-            intent.source_block_ids,
-            intent.source_effective_kv_len,
-            intent.target_keep_tokens,
-            prefix,
-            recent,
-            block_tables.block_sizes[0],
-        )
-        if row is None:
-            keep = torch.cat(
-                (
-                    torch.arange(
-                        prefix, dtype=torch.int32, device=self.req_states.device
-                    ),
-                    torch.arange(
-                        recent,
-                        intent.source_effective_kv_len,
-                        dtype=torch.int32,
-                        device=self.req_states.device,
-                    ),
-                )
+        row = None
+        if self.config.policy == "sink_recent":
+            row = whole_block_row(
+                intent.source_block_ids,
+                intent.source_effective_kv_len,
+                intent.target_keep_tokens,
+                prefix,
+                recent,
+                block_tables.block_sizes[0],
             )
+        if row is None:
+            source = intent.source_effective_kv_len
+            if self.config.policy == "sink_recent":
+                keep = torch.cat(
+                    (
+                        torch.arange(
+                            prefix, dtype=torch.int32, device=self.req_states.device
+                        ),
+                        torch.arange(
+                            recent,
+                            source,
+                            dtype=torch.int32,
+                            device=self.req_states.device,
+                        ),
+                    )
+                )
+            else:
+                recent = max(prefix, source - self.config.recent_tokens)
+                if self.scorer is not None:
+                    keep = self.scorer.plan(
+                        self.layers,
+                        block_tables.block_tables[0].gpu[idx],
+                        self.req_states.num_computed_tokens.gpu[idx : idx + 1],
+                        source,
+                        intent.target_keep_tokens,
+                        prefix,
+                        recent,
+                    )
+                else:
+                    scores = torch.rand(
+                        source, device=self.req_states.device, generator=self.generator
+                    )
+                    keep = protected_topk(
+                        scores, intent.target_keep_tokens, prefix, recent
+                    )
             self.compactor.compact(block_tables.block_tables[0].gpu[idx], keep)
             b = block_tables.block_sizes[0]
             row = intent.source_block_ids[: (intent.target_keep_tokens + b - 1) // b]

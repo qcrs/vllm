@@ -7,7 +7,7 @@
 | --- | --- | --- |
 | M0 | PASS | Native/trace identity、真实 allocator miss/free、CPU oracle、完整本地数据审计完成；28 tests passed |
 | M1 | PASS | Whole/token live reuse、重复回收、FP32 Attention、EOS/abort/maintenance/preempt/q0/fail-stop、42 tests、优化及NCU/NSYS完成；见reports/m1.md |
-| M2 | TO_VERIFY | 压力控制定向16tests和5条8B小池轨迹通过，见reports/m2-pressure.md；Tri shared/calibration、质量与Serving未完成 |
+| M2 | TO_VERIFY | 压力控制16tests/5条8B轨迹通过；Tri校准/3评分tests/重复reuse及NCU优化通过，见reports/m2-scoring.md；四组质量与HTTP Serving进行中 |
 | Prefix | NOT_RUN | shared保护、所有suffix aliases撤销、lossy后停止发布、真实APC命中与reuse |
 | Graph | NOT_RUN | FULL/PIECEWISE真实replay、静态地址、E/row/slot刷新、recapture计数 |
 | TP | NOT_RUN | 全局distinct KV/GQA评分/统一plan、all-rank completion、延迟rank/reuse |
