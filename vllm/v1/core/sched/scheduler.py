@@ -443,7 +443,7 @@ class Scheduler(SchedulerInterface):
             and not self.reclaim_retry_pending
         )
         self.reclaim_retry_pending = False
-        reclaim_candidate: tuple[Request, int] | None = None
+        reclaim_candidate: tuple[Request, ReclaimCandidate] | None = None
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1065,6 +1065,8 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if self.reclamation_config is not None:
+                    request.effective_kv_len = num_computed_tokens
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -1225,16 +1227,19 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         if reclaim_candidate is not None:
-            candidate, keep = reclaim_candidate
+            request, candidate = reclaim_candidate
             scheduler_output.reclaim_request = self.make_reclaim_request(
-                candidate, scheduler_output, keep
+                request,
+                scheduler_output,
+                candidate.keep_tokens,
+                candidate.protected_prefix_tokens,
             )
             self.reclaim_retry_pending = True
         return scheduler_output
 
     def _select_reclaim_candidate(
         self, scheduled: dict[str, int]
-    ) -> tuple[Request, int] | None:
+    ) -> tuple[Request, ReclaimCandidate] | None:
         config = self.reclamation_config
         assert config is not None
         manager = self.kv_cache_manager.coordinator.single_type_managers[0]
@@ -1254,14 +1259,24 @@ class Scheduler(SchedulerInterface):
             if q not in (0, 1):
                 continue
             blocks = manager.req_to_blocks[request.request_id]
-            if any(b.ref_cnt != 1 or b.is_null for b in blocks):
+            if any(b.ref_cnt < 1 or b.is_null for b in blocks):
                 continue
+            protected_prefix = self.block_size * max(
+                (i + 1 for i, block in enumerate(blocks) if block.ref_cnt > 1),
+                default=0,
+            )
             source_len = request.effective_kv_len + q
-            keep = max(config.min_keep_tokens, int(config.retention * source_len))
+            keep = protected_prefix + max(
+                config.min_keep_tokens,
+                config.recent_tokens + max(0, config.sink_tokens - protected_prefix),
+                int(config.retention * (source_len - protected_prefix)),
+            )
             released = len(blocks) - (keep + self.block_size - 1) // self.block_size
             if not 0 < keep < source_len or released <= 0:
                 continue
-            prefix, recent = sink_recent_ranges(source_len, keep, config.sink_tokens)
+            prefix, recent = sink_recent_ranges(
+                source_len, keep, config.sink_tokens, protected_prefix
+            )
             zero_copy = config.policy == "sink_recent" and (
                 whole_block_row(
                     [b.block_id for b in blocks],
@@ -1278,13 +1293,10 @@ class Scheduler(SchedulerInterface):
                     request.request_id,
                     keep,
                     released,
-                    0
-                    if zero_copy
-                    else 2
-                    * (keep - prefix if config.policy == "sink_recent" else keep)
-                    * member_bytes,
+                    0 if zero_copy else 2 * (keep - prefix) * member_bytes,
                     zero_copy,
                     request.arrival_time,
+                    protected_prefix,
                 )
             )
         goal = self.kv_cache_manager.last_allocation_shortfall + min(
@@ -1305,14 +1317,19 @@ class Scheduler(SchedulerInterface):
                 keep_tokens=selected.keep_tokens,
                 estimated_copy_bytes=selected.copy_bytes,
                 zero_copy=selected.zero_copy,
+                protected_prefix_tokens=selected.protected_prefix_tokens,
                 q=scheduled.get(selected.request_id, 0),
             )
-        return request, selected.keep_tokens
+        return request, selected
 
     def make_reclaim_request(
-        self, request: Request, scheduler_output: SchedulerOutput, keep_tokens: int
+        self,
+        request: Request,
+        scheduler_output: SchedulerOutput,
+        keep_tokens: int,
+        protected_prefix_tokens: int | None = None,
     ) -> ReclaimRequest:
-        """Describe a deterministic post-forward reclamation of a decode request."""
+        """Deindex the private suffix and describe post-forward reclamation."""
         assert self.reclamation_config is not None
         q = scheduler_output.num_scheduled_tokens.get(request.request_id, 0)
         assert request.status == RequestStatus.RUNNING and q in (0, 1)
@@ -1323,9 +1340,34 @@ class Scheduler(SchedulerInterface):
         assert request.num_in_flight_tokens == q
         source_len = request.effective_kv_len + q
         assert 0 < keep_tokens < source_len
-        row = self.kv_cache_manager.get_block_ids(request.request_id)[0]
+        blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+        row = [block.block_id for block in blocks]
+        derived_protected_prefix = self.block_size * max(
+            (i + 1 for i, block in enumerate(blocks) if block.ref_cnt > 1),
+            default=0,
+        )
+        if protected_prefix_tokens is None:
+            protected_prefix_tokens = derived_protected_prefix
+        else:
+            assert protected_prefix_tokens == derived_protected_prefix
+        assert protected_prefix_tokens % self.block_size == 0
+        assert protected_prefix_tokens <= request.effective_kv_len
+        assert protected_prefix_tokens <= keep_tokens
+        protected_blocks = protected_prefix_tokens // self.block_size
+        assert all(
+            block.ref_cnt == 1 and not block.is_null
+            for block in blocks[protected_blocks:]
+        )
         assert len(row) > (keep_tokens + self.block_size - 1) // self.block_size
-        return ReclaimRequest(request.request_id, source_len, row.copy(), keep_tokens)
+        if self.kv_cache_manager.enable_caching:
+            self.kv_cache_manager.evict_blocks(set(row[protected_blocks:]))
+        return ReclaimRequest(
+            request.request_id,
+            source_len,
+            row,
+            keep_tokens,
+            protected_prefix_tokens,
+        )
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput

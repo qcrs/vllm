@@ -52,7 +52,6 @@ class ReclamationConfig:
             or config.max_concurrent_batches != 1
             or config.speculative_config is not None
             or config.kv_transfer_config is not None
-            or config.cache_config.enable_prefix_caching
             or config.scheduler_config.scheduler_reserve_full_isl
             or not config.model_config.enforce_eager
             or parallel.tensor_parallel_size != 1
@@ -103,6 +102,7 @@ class ReclaimCandidate:
     copy_bytes: int
     zero_copy: bool
     arrival_time: float
+    protected_prefix_tokens: int = 0
 
 
 def choose_reclaim_candidate(

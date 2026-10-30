@@ -166,6 +166,14 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        if enable_kv_reclamation and (
+            self.block_pool.hash_block_size != 16
+            or len(kv_cache_config.kv_cache_groups) != 1
+            or kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size != 16
+        ):
+            raise ValueError(
+                "KV reclamation requires hash_block_size == block_size == 16"
+            )
         trace_path = os.environ.get("VLLM_KV_TRACE_FILE")
         self.trace = KVCacheTrace(trace_path) if trace_path else None
 
@@ -561,7 +569,7 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -580,12 +588,29 @@ class KVCacheManager:
         assert len(retained) == cdiv(result.new_effective_kv_len, block_size)
         assert len(set(retained)) == len(retained)
         assert set(retained).issubset(ids)
-        assert all(b.ref_cnt == 1 and not b.is_null for b in blocks)
+        protected_blocks = intent.protected_prefix_tokens // block_size
+        assert intent.protected_prefix_tokens % block_size == 0
+        assert intent.protected_prefix_tokens <= result.new_effective_kv_len
+        assert retained[:protected_blocks] == ids[:protected_blocks]
+        assert all(
+            not block.is_null and block.ref_cnt > 0
+            for block in blocks[:protected_blocks]
+        )
+        assert all(
+            not block.is_null and block.ref_cnt == 1
+            for block in blocks[protected_blocks:]
+        )
         by_id = {b.block_id: b for b in blocks}
         retained_set = set(retained)
         removed = [b for b in blocks if b.block_id not in retained_set]
+        assert all(b.ref_cnt == 1 for b in removed)
         manager.req_to_blocks[request.request_id] = [by_id[i] for i in retained]
         request.effective_kv_len = result.new_effective_kv_len
+        if request.request_id in manager.num_cached_block:
+            assert manager.num_cached_block[request.request_id] >= protected_blocks
+            manager.num_cached_block[request.request_id] = protected_blocks
+        else:
+            assert protected_blocks == 0
         self.block_pool.free_blocks(reversed(removed))
         self.trace_request(
             "reclaim_commit",
@@ -792,8 +817,13 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+        if not self.enable_caching:
+            return
+        if self.enable_kv_reclamation and request.effective_kv_len < (
+            request.num_computed_tokens - request.num_in_flight_tokens
+        ):
+            return
+        self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

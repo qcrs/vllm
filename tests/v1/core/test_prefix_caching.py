@@ -49,6 +49,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.kv_reclamation import ReclaimResult
+from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -347,6 +349,126 @@ def test_prefill(hash_fn):
         free_block_queue.fake_free_list_tail.prev_free_block
         is free_block_queue.fake_free_list_head
     )
+
+
+@pytest.mark.parametrize("keep", [63, 64])
+def test_reclamation_deindexes_private_suffix_before_release_and_real_apc_hit(keep):
+    """Deindex all aliases before mutation, then reuse only unshared pages."""
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 11),
+        max_model_len=256,
+        enable_caching=True,
+        enable_kv_reclamation=True,
+        enable_kv_cache_events=True,
+        hash_block_size=16,
+    )
+    pool = manager.block_pool
+    owner = manager.coordinator.single_type_managers[0]
+    a = make_request("A", [1] * 32 + [2] * 64, 16, sha256)
+    b = make_request("B", [1] * 32 + [3] * 16, 16, sha256)
+    assert manager.allocate_slots(a, 96) is not None
+    a.status = RequestStatus.RUNNING
+    a.num_computed_tokens = a.effective_kv_len = 96
+    hits, hit_tokens, _ = manager.get_computed_blocks(b)
+    assert hit_tokens == 32
+    assert manager.allocate_slots(b, 16, hit_tokens, hits) is not None
+    b.num_computed_tokens = b.effective_kv_len = 48
+    source = list(owner.req_to_blocks["A"])
+    row = [block.block_id for block in source]
+    assert [block.ref_cnt for block in source] == [2, 2, 1, 1, 1, 1]
+    alias_request = make_request("aliases", [9] * 96, 16, sha256)
+    removed_hashes: set[BlockHashWithGroupId] = set()
+    for i, block in enumerate(source[2:], start=2):
+        alias = make_block_hash_with_group_id(alias_request.block_hashes[i], 0)
+        pool._insert_block_hash(alias, block, num_tokens=16)
+        assert block.block_hash is not None
+        removed_hashes.update((block.block_hash, alias))
+    pool.take_events()
+    free_before = pool.get_num_free_blocks()
+    scheduler = SimpleNamespace(
+        reclamation_config=object(), block_size=16, kv_cache_manager=manager
+    )
+    intent = Scheduler.make_reclaim_request(
+        scheduler, a, SimpleNamespace(num_scheduled_tokens={}), keep
+    )
+    assert intent.protected_prefix_tokens == 32
+    assert pool.get_num_free_blocks() == free_before
+    assert manager.get_block_ids("A")[0] == row
+    assert owner.num_cached_block["A"] == 6
+    assert [block.ref_cnt for block in source] == [2, 2, 1, 1, 1, 1]
+    for block in source[2:]:
+        assert block.block_hash is None
+        assert block.block_id not in pool.cached_block_hashes_by_block
+    assert all(
+        not pool.cached_block_hash_to_block.contain(key, block.block_id)
+        for block in source[2:]
+        for key in removed_hashes
+    )
+    events = pool.take_events()
+    assert len(events) == len(removed_hashes)
+    assert all(
+        isinstance(event, BlockRemoved) and event.group_idx == 0 for event in events
+    )
+    assert {h for event in events for h in event.block_hashes} == {
+        kv_cache_utils.maybe_convert_block_hash(get_block_hash(key))
+        for key in removed_hashes
+    }
+    c = make_request("C", list(a.prompt_token_ids), 16, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(c)
+    assert hit_tokens == 32 and hits.get_block_ids()[0] == row[:2]
+    retained = row[:2] + row[4:] if keep == 64 else row[:4]
+    manager.commit_reclamation(a, intent, ReclaimResult("A", keep, retained))
+    assert pool.get_num_free_blocks() == free_before + 2
+    assert owner.num_cached_block["A"] == 2
+    assert manager.get_block_ids("A")[0] == retained
+    assert a.num_computed_tokens == 96 and a.effective_kv_len == keep
+
+    # Both the public entry and allocate_slots must suppress lossy publication.
+    a.append_output_token_ids([42])
+    manager.cache_blocks(a, 96)
+    assert manager.allocate_slots(a, 1) is not None
+    assert owner.num_cached_block["A"] == 2
+    assert pool.take_events() == []
+    assert all(block.block_hash is None for block in owner.req_to_blocks["A"][2:])
+    hits, hit_tokens, _ = manager.get_computed_blocks(c)
+    assert hit_tokens == 32 and hits.get_block_ids()[0] == row[:2]
+    assert manager.allocate_slots(c, 64, hit_tokens, hits) is not None
+    released = set(row) - set(retained)
+    c_ids = set(manager.get_block_ids("C")[0])
+    a_ids = set(manager.get_block_ids("A")[0])
+    assert released & c_ids
+    assert released <= a_ids | c_ids
+    assert a_ids & c_ids == set(row[:2])
+    assert all(block.ref_cnt == 3 for block in source[:2])
+    manager.free(a)
+    manager.free(b)
+    assert all(block.ref_cnt == 1 for block in source[:2])
+    free_ids = {block.block_id for block in pool.free_block_queue.get_all_free_blocks()}
+    assert not free_ids.intersection(row[:2])
+    manager.free(c)
+    assert all(block.ref_cnt == 0 for block in source[:2])
+    assert pool.get_num_free_blocks() == 10
+
+
+def test_reclamation_canonical_inflight_cache_publication():
+    """Optimistic L ahead of E must still publish canonical completed blocks."""
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 5),
+        max_model_len=128,
+        enable_caching=True,
+        enable_kv_reclamation=True,
+        hash_block_size=16,
+    )
+    request = make_request("A", [1] * 48, 16, sha256)
+    assert manager.allocate_slots(request, 32, delay_cache_blocks=True) is not None
+    request.num_computed_tokens = request.num_in_flight_tokens = 32
+    manager.cache_blocks(request, 32)
+    probe = make_request("B", [1] * 48, 16, sha256)
+    assert manager.get_computed_blocks(probe)[1] == 32
+    request.num_in_flight_tokens = 0
+    request.effective_kv_len = 32
+    assert manager.allocate_slots(request, 16) is not None
+    assert manager.coordinator.single_type_managers[0].num_cached_block["A"] == 3
 
 
 def test_prefill_hybrid_model():

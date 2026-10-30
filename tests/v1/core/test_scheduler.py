@@ -54,12 +54,13 @@ def pressure_scheduler(tmp_path, monkeypatch):
     Qwen3Config().save_pretrained(model_path)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
 
-    def create(num_blocks, reserve=0, **kwargs):
+    def create(num_blocks, reserve=0, enable_prefix_caching=False, **kwargs):
         return create_scheduler(
             model=str(model_path),
             num_blocks=num_blocks,
             max_num_batched_tokens=256,
             use_v2_model_runner=True,
+            enable_prefix_caching=enable_prefix_caching,
             reclamation_config={
                 "pressure": True,
                 "min_keep_tokens": 16,
@@ -94,6 +95,60 @@ def complete_pressure_step(scheduler, output):
             reclaim_result=result,
         ),
     )
+
+
+def test_reclamation_apc_hit_initializes_effective_length(pressure_scheduler):
+    """A real APC hit must initialize E before publishing worker metadata."""
+    scheduler = pressure_scheduler(16, enable_prefix_caching=True)
+    a, b = create_requests(2, num_tokens=64, same_prompt=True, req_ids=["A", "B"])
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    scheduler.add_request(b)
+    output = scheduler.schedule()
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 48
+    assert output.num_scheduled_tokens == {"A": 1, "B": 16}
+    assert output.effective_kv_lens == {"A": 64, "B": 48}
+    assert b.num_computed_tokens - b.num_in_flight_tokens == b.effective_kv_len == 48
+    manager = scheduler.kv_cache_manager
+    assert manager.get_block_ids("A")[0][:3] == manager.get_block_ids("B")[0][:3]
+    complete_pressure_step(scheduler, output)
+    assert b.effective_kv_len == b.num_computed_tokens == 64
+
+
+@pytest.mark.parametrize("shared_indices", [(0,), (0, 2), tuple(range(6))])
+def test_pressure_prefix_protects_through_last_shared_page(
+    pressure_scheduler, shared_indices
+):
+    """A shared page after an exclusive gap still extends P; P=E must skip."""
+    scheduler = pressure_scheduler(12, enable_prefix_caching=True)
+    a = create_requests(1, num_tokens=96, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    manager = scheduler.kv_cache_manager
+    blocks = manager.get_blocks("A").blocks[0]
+    shared = [blocks[i] for i in shared_indices]
+    manager.block_pool.touch(shared)
+    selected = scheduler._select_reclaim_candidate({})
+    if len(shared_indices) == len(blocks):
+        assert selected is None
+    else:
+        request, candidate = selected
+        protected = 16 * (shared_indices[-1] + 1)
+        assert request is a and candidate.protected_prefix_tokens == protected
+        assert candidate.keep_tokens == protected + max(16, (96 - protected) // 2)
+        free_before = manager.block_pool.get_num_free_blocks()
+        output = SchedulerOutput.make_empty()
+        output.reclaim_request = scheduler.make_reclaim_request(
+            a, output, candidate.keep_tokens, candidate.protected_prefix_tokens
+        )
+        assert all(block.block_hash is not None for block in blocks[: protected // 16])
+        assert all(block.block_hash is None for block in blocks[protected // 16 :])
+        assert manager.block_pool.get_num_free_blocks() == free_before
+        complete_pressure_step(scheduler, output)
+        assert manager.block_pool.get_num_free_blocks() == (
+            free_before + candidate.released_blocks
+        )
+    manager.block_pool.free_blocks(shared)
 
 
 def test_pressure_running_miss_preserves_partial_batch_and_bounds_retry(
