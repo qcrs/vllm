@@ -1226,6 +1226,10 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        if self.kv_cache_manager.trace is not None:
+            self.kv_cache_manager.trace_request(
+                "native_preempt", request, num_preemptions=request.num_preemptions
+            )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 

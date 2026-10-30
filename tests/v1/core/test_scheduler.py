@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from concurrent.futures import Future
 from unittest.mock import Mock
 
@@ -42,6 +43,65 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_allocator_trace_observes_miss_and_free_without_changing_schedule(
+    monkeypatch, tmp_path
+):
+    """A real small pool must produce identical scheduling with trace enabled."""
+    outcomes = []
+    path = tmp_path / "allocator.jsonl"
+    from transformers import Qwen3Config
+
+    model_path = tmp_path / "model"
+    Qwen3Config().save_pretrained(model_path)
+    for trace_enabled in (False, True):
+        with monkeypatch.context() as patch:
+            patch.delenv("VLLM_KV_TRACE_FILE", raising=False)
+            if trace_enabled:
+                patch.setenv("VLLM_KV_TRACE_FILE", str(path))
+                patch.setenv("VLLM_KV_TRACE_IDS", "1")
+            scheduler = create_scheduler(
+                model=str(model_path),
+                num_blocks=5,
+                max_num_batched_tokens=64,
+                use_v2_model_runner=True,
+            )
+            requests = create_requests(num_requests=2, num_tokens=32)
+            for request in requests:
+                scheduler.add_request(request)
+            output = scheduler.schedule()
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=[r.request_id for r in requests],
+                    req_id_to_index={r.request_id: i for i, r in enumerate(requests)},
+                    sampled_token_ids=[[42], [43]],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                ),
+            )
+            following = scheduler.schedule()
+            outcomes.append(
+                (following.num_scheduled_tokens, [r.num_preemptions for r in requests])
+            )
+            for request in requests:
+                scheduler.finish_requests(
+                    request.request_id, RequestStatus.FINISHED_ABORTED
+                )
+            manager = scheduler.kv_cache_manager
+            assert manager.block_pool.get_num_free_blocks() == 4
+            assert all(
+                not m.req_to_blocks for m in manager.coordinator.single_type_managers
+            )
+    assert outcomes[0] == outcomes[1]
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    miss = next(e for e in events if e["event"] == "allocation_miss")
+    assert miss["request_status"] == "RUNNING"
+    assert (miss["required"], miss["available"]) == (1, 0)
+    assert any(e["event"] == "native_preempt" for e in events)
+    assert events[-1]["event"] == "free_after"
+    assert events[-1]["owned_blocks"] == [0]
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

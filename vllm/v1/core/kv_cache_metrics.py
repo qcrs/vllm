@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache metrics tracking."""
 
+import json
+import os
 import random
 import time
 from collections import deque
@@ -11,6 +13,20 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 from vllm.v1.metrics.stats import KVCacheEvictionEvent
+
+
+class KVCacheTrace:
+    """Opt-in host-only allocator evidence; does not synchronize the device."""
+
+    def __init__(self, path: str):
+        self.stream = open(path, "a", buffering=1)  # noqa: SIM115 (scheduler lifetime)
+        self.include_ids = os.environ.get("VLLM_KV_TRACE_IDS", "0") == "1"
+
+    def record(self, event: str, **fields) -> None:
+        self.stream.write(
+            json.dumps({"event": event, "time_ns": time.monotonic_ns(), **fields})
+            + "\n"
+        )
 
 
 class BlockMetricsState:

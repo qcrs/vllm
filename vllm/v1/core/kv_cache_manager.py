@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -10,7 +11,7 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
-from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector, KVCacheTrace
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -161,6 +162,8 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        trace_path = os.environ.get("VLLM_KV_TRACE_FILE")
+        self.trace = KVCacheTrace(trace_path) if trace_path else None
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -191,6 +194,27 @@ class KVCacheManager:
             The KV cache usage (between 0.0 and 1.0).
         """
         return self.block_pool.get_usage()
+
+    def trace_request(self, event: str, request: Request, **fields) -> None:
+        trace = self.trace
+        if trace is None:
+            return
+        blocks = self.coordinator.get_blocks(request.request_id)
+        settled = request.num_computed_tokens - request.num_in_flight_tokens
+        row: dict = {"owned_blocks": [len(group) for group in blocks]}
+        if trace.include_ids:
+            row["block_ids"] = [[b.block_id for b in group] for group in blocks]
+        trace.record(
+            event,
+            request_id=request.request_id,
+            logical_tokens=request.num_computed_tokens,
+            settled_logical_tokens=settled,
+            effective_kv_len=getattr(request, "effective_kv_len", settled),
+            request_status=request.status.name,
+            free_blocks=self.block_pool.get_num_free_blocks(),
+            **row,
+            **fields,
+        )
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -424,6 +448,15 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if self.trace is not None:
+                    self.trace_request(
+                        "allocation_miss",
+                        request,
+                        q=num_new_tokens,
+                        required=required_blocks,
+                        available=self.block_pool.get_num_free_blocks(),
+                        reason="full_sequence_reservation",
+                    )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -461,6 +494,18 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
+        if self.trace is not None:
+            self.trace_request(
+                "allocation_miss"
+                if required_blocks > available_blocks
+                else "allocation_check",
+                request,
+                q=num_new_tokens,
+                required=required_blocks,
+                available=available_blocks,
+                watermark=watermark_blocks,
+                reserved=reserved_blocks,
+            )
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
@@ -484,6 +529,8 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if self.trace is not None:
+            self.trace_request("allocation_done", request, q=num_new_tokens)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -511,7 +558,11 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if self.trace is not None:
+            self.trace_request("free_before", request)
         self.coordinator.free(request.request_id)
+        if self.trace is not None:
+            self.trace_request("free_after", request)
 
     def remove_skipped_blocks(
         self,
