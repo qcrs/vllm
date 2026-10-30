@@ -4,6 +4,8 @@ Prefix 正确性 Gate 为 **PASS**：真实 Qwen3-8B Engine 完成共享保护�
 真实 APC hit、取消私有 suffix 发布、完成后释放/重用及生命周期验证。
 本结论只覆盖 Eager、TP1/DP1、单在途、单 full-attention group、
 `hash_block_size == block_size == 16`；不将诊断轨迹判为 Serving 性能通过。
+新增HTTP对照见 [prefix-serving.md](prefix-serving.md)：8 GiB noop开销预算PASS，
+6 GiB SinkRecent延迟/Goodput预算PASS；3/1.5 GiB仍因TTFT超预算而性能FAIL。
 Graph、TP、DP 及必要组合仍为 NOT_RUN。按本次阶段边界要求停在 Prefix，Goal 保持 active。
 
 ## 实现与关键修复
@@ -128,8 +130,9 @@ CUDA Event诊断区间另保留原始值：whole约0.63–0.92 ms，final SinkRe
 本阶段复用原 kernel，未据此新增优化或推翻 M1/M2 的专门 profiling。
 真实页容量由36×8×16×256×BF16计算，为每页2.25 MiB；R6/8分别归还13.5/18 MiB
 给 allocator，预分配 Pool 的 NVML 占用不会因此同步下降。
-本报告未新增 Prefix on 的 HTTP Serving、SLO Goodput 或质量收益结论；
-相关性能验收保持 TO_VERIFY，不据正确性 Gate 扩大默认启用范围。
+Prefix on的12组HTTP Serving和两条诊断已另记于
+[prefix-serving.md](prefix-serving.md)，包含固定SLO、APC/重算口径和负收益。
+本节成本仍仅为正确性诊断；有损质量没有新增验收，不据正确性或单配置性能扩大默认启用范围。
 
 ## CPU、检查与保留的失败
 

@@ -8,7 +8,7 @@
 | M0 | PASS | Native/trace identity、真实 allocator miss/free、CPU oracle、完整本地数据审计完成；28 tests passed |
 | M1 | PASS | Whole/token live reuse、重复回收、FP32 Attention、EOS/abort/maintenance/preempt/q0/fail-stop、42 tests、优化及NCU/NSYS完成；见reports/m1.md |
 | M2 | PASS | 压力控制16tests/5条8B轨迹；Tri校准/3评分tests/重复reuse及NCU优化；四策略85样本质量评测；五策略在6 GiB与1.5 GiB下的真实HTTP Serving对照均完成，详见reports/m2-pressure.md、reports/m2-scoring.md、reports/m2-evaluation.md |
-| Prefix | PASS | 完整页APC正确性：shared/gap/P缩小、全部aliases撤销、lossy发布guard、全36层payload、三策略重复reuse、真实miss与EOS/abort/preempt通过；23项针对性tests、prefix全92项通过；诊断成本见reports/prefix.md，新增Serving性能收益仍TO_VERIFY |
+| Prefix | PASS | 完整页APC正确性、23项针对性tests及prefix全92项通过；12组HTTP对照/两条诊断完成：8 GiB noop开销0.68%满足预算，6 GiB Sink延迟/Goodput预算PASS，3/1.5 GiB因TTFT超预算性能FAIL；96个Native/noop输出相同；见reports/prefix.md、reports/prefix-serving.md |
 | Graph | NOT_RUN | FULL/PIECEWISE真实replay、静态地址、E/row/slot刷新、recapture计数 |
 | TP | NOT_RUN | 全局distinct KV/GQA评分/统一plan、all-rank completion、延迟rank/reuse |
 | DP | NOT_RUN | native dense双replica/pool/affinity，局部压力隔离、aggregate/per-replica指标 |
@@ -18,4 +18,5 @@
 大产物在 `/data_ssd/qcrs/experiments/p1-v8`。保留负结果，状态只在实际对应验证后更新。
 
 当前阶段边界：完成并提交 Prefix 后暂停推进，未经阶段转换授权不进入 Graph；
-Goal tracking 保持 active。Prefix PASS仅指报告限定的正确性，不将独立Gate推断为组合或Serving性能通过。
+Goal tracking 保持 active。Prefix PASS仅指报告限定的正确性；Serving按配置分别判定，
+3/1.5 GiB性能未通过，有损质量未新增验收，不将独立Gate推断为组合或所有配置性能通过。
