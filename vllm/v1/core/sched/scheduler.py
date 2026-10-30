@@ -55,7 +55,14 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_reclamation import ReclaimRequest, ReclamationConfig
+from vllm.v1.kv_reclamation import (
+    ReclaimCandidate,
+    ReclaimRequest,
+    ReclamationConfig,
+    choose_reclaim_candidate,
+    sink_recent_ranges,
+    whole_block_row,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -84,6 +91,7 @@ class Scheduler(SchedulerInterface):
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
+        self.reclaim_retry_pending = False
         if self.reclamation_config is not None:
             self.reclamation_config.validate_cache(kv_cache_config)
         self.lora_config = vllm_config.lora_config
@@ -429,6 +437,13 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        allow_reclamation = (
+            self.reclamation_config is not None
+            and self.reclamation_config.pressure
+            and not self.reclaim_retry_pending
+        )
+        self.reclaim_retry_pending = False
+        reclaim_candidate: tuple[Request, int] | None = None
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -576,6 +591,13 @@ class Scheduler(SchedulerInterface):
                         # The request can be scheduled.
                         break
 
+                    if allow_reclamation:
+                        reclaim_candidate = self._select_reclaim_candidate(
+                            num_scheduled_tokens
+                        )
+                        if reclaim_candidate is not None:
+                            break
+
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
@@ -668,7 +690,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and reclaim_candidate is None
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -954,6 +980,11 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
+                    if allow_reclamation:
+                        reclaim_candidate = self._select_reclaim_candidate(
+                            num_scheduled_tokens
+                        )
+
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
@@ -1193,7 +1224,86 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if reclaim_candidate is not None:
+            candidate, keep = reclaim_candidate
+            scheduler_output.reclaim_request = self.make_reclaim_request(
+                candidate, scheduler_output, keep
+            )
+            self.reclaim_retry_pending = True
         return scheduler_output
+
+    def _select_reclaim_candidate(
+        self, scheduled: dict[str, int]
+    ) -> tuple[Request, int] | None:
+        config = self.reclamation_config
+        assert config is not None
+        manager = self.kv_cache_manager.coordinator.single_type_managers[0]
+        group = self.kv_cache_config.kv_cache_groups[0]
+        member_bytes = group.kv_cache_spec.page_size_bytes // self.block_size
+        member_bytes *= len(group.layer_names)
+        candidates = []
+        live_decode_count = 0
+        for request in self.running:
+            if (
+                request.num_computed_tokens < request.num_prompt_tokens
+                or request.num_in_flight_tokens
+            ):
+                continue
+            live_decode_count += 1
+            q = scheduled.get(request.request_id, 0)
+            if q not in (0, 1):
+                continue
+            blocks = manager.req_to_blocks[request.request_id]
+            if any(b.ref_cnt != 1 or b.is_null for b in blocks):
+                continue
+            source_len = request.effective_kv_len + q
+            keep = max(config.min_keep_tokens, int(config.retention * source_len))
+            released = len(blocks) - (keep + self.block_size - 1) // self.block_size
+            if not 0 < keep < source_len or released <= 0:
+                continue
+            prefix, recent = sink_recent_ranges(source_len, keep, config.sink_tokens)
+            zero_copy = (
+                whole_block_row(
+                    [b.block_id for b in blocks],
+                    source_len,
+                    keep,
+                    prefix,
+                    recent,
+                    self.block_size,
+                )
+                is not None
+            )
+            candidates.append(
+                ReclaimCandidate(
+                    request.request_id,
+                    keep,
+                    released,
+                    0 if zero_copy else 2 * (keep - prefix) * member_bytes,
+                    zero_copy,
+                    request.arrival_time,
+                )
+            )
+        goal = self.kv_cache_manager.last_allocation_shortfall + min(
+            config.reserve_cap, live_decode_count
+        )
+        selected = choose_reclaim_candidate(candidates, goal)
+        if selected is None:
+            return None
+        request = self.requests[selected.request_id]
+        if self.kv_cache_manager.trace is not None:
+            self.kv_cache_manager.trace_request(
+                "reclaim_select",
+                request,
+                goal_blocks=goal,
+                shortfall=self.kv_cache_manager.last_allocation_shortfall,
+                candidates=len(candidates),
+                released_blocks=selected.released_blocks,
+                keep_tokens=selected.keep_tokens,
+                estimated_copy_bytes=selected.copy_bytes,
+                zero_copy=selected.zero_copy,
+                q=scheduled.get(selected.request_id, 0),
+            )
+        return request, selected.keep_tokens
 
     def make_reclaim_request(
         self, request: Request, scheduler_output: SchedulerOutput, keep_tokens: int

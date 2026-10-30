@@ -6,6 +6,7 @@ import torch
 import vllm.envs as envs
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
+    AttentionConfig,
     CacheConfig,
     ECTransferConfig,
     KVTransferConfig,
@@ -65,6 +66,7 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    reclamation_config: dict | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -85,6 +87,7 @@ def create_scheduler(
         dtype="float16",
         seed=42,
         skip_tokenizer_init=skip_tokenizer_init,
+        enforce_eager=reclamation_config is not None,
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
@@ -99,6 +102,7 @@ def create_scheduler(
         is_encoder_decoder=model_config.is_encoder_decoder,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
+        scheduler_reserve_full_isl=reclamation_config is None,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -165,6 +169,14 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        attention_config=AttentionConfig(
+            **({"backend": "FLASH_ATTN"} if reclamation_config is not None else {})
+        ),
+        additional_config=(
+            {"kv_reclamation": reclamation_config}
+            if reclamation_config is not None
+            else {}
+        ),
     )
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(

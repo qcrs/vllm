@@ -19,3 +19,10 @@
 - I/O：原 Request、源 row/长度、完成结果；输出新 ownership/E 和真实 free queue。
 - 防止的失败：重复、null、外部、过期 ACK 导致错 free；按 logical L 重新申请已丢弃页；EOS/abort 双重释放。
 - 最低成本层级：复用 `test_kv_cache_utils.py` 的真实 Pool 和 Request helper，验证 commit 后按 E 增长并被 B 复用；GPU完成、EOS/abort 和 preemption 在 8B Engine 实验验证。
+
+## M2 pressure controller
+
+- 模块用途：在真实allocation miss时选择一个可回收decode请求，保留partial batch并仅延迟一次重试。
+- I/O：allocator同一计算点的required-available、当前ownership/E、已排定q；输出唯一intent或原生调度行为。
+- 防止的失败：以token数量冒充真实释放页、排序不确定、丢掉partial allocation、反复回收而不执行native fallback。
+- 最低成本层级：pure候选排序在既有KV suite检验；真实8B Engine小池验证miss→完成→release→下一step重新allocation，另用Scheduler真实Pool构造running miss与一次重试。

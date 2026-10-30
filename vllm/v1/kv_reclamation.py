@@ -3,6 +3,7 @@
 """Physical KV reclamation contracts shared by scheduler and worker."""
 
 from dataclasses import dataclass
+from functools import cmp_to_key
 from typing import TYPE_CHECKING
 
 from vllm import envs
@@ -86,6 +87,39 @@ class ReclaimResult:
     request_id: str
     new_effective_kv_len: int
     retained_block_ids: list[int]
+
+
+@dataclass(frozen=True)
+class ReclaimCandidate:
+    request_id: str
+    keep_tokens: int
+    released_blocks: int
+    copy_bytes: int
+    zero_copy: bool
+    arrival_time: float
+
+
+def choose_reclaim_candidate(
+    candidates: list[ReclaimCandidate], goal_blocks: int
+) -> ReclaimCandidate | None:
+    """Prefer coverage, then zero copy and exact cost-per-released-page order."""
+    if not candidates:
+        return None
+    covering = [c for c in candidates if c.released_blocks >= goal_blocks]
+
+    def compare(a: ReclaimCandidate, b: ReclaimCandidate) -> int:
+        if not covering and a.released_blocks != b.released_blocks:
+            return -1 if a.released_blocks > b.released_blocks else 1
+        if a.zero_copy != b.zero_copy:
+            return -1 if a.zero_copy else 1
+        ratio = a.copy_bytes * b.released_blocks - b.copy_bytes * a.released_blocks
+        if ratio:
+            return -1 if ratio < 0 else 1
+        a_key = (-a.released_blocks, a.arrival_time, a.request_id)
+        b_key = (-b.released_blocks, b.arrival_time, b.request_id)
+        return (a_key > b_key) - (a_key < b_key)
+
+    return min(covering or candidates, key=cmp_to_key(compare))
 
 
 def sink_recent_ranges(

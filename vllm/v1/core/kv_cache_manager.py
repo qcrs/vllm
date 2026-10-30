@@ -133,6 +133,7 @@ class KVCacheManager:
     ) -> None:
         self.max_model_len = max_model_len
         self.enable_kv_reclamation = enable_kv_reclamation
+        self.last_allocation_shortfall = 0
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -506,6 +507,8 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
+        if self.enable_kv_reclamation:
+            self.last_allocation_shortfall = max(0, required_blocks - available_blocks)
         if self.trace is not None:
             self.trace_request(
                 "allocation_miss"

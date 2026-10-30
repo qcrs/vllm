@@ -41,12 +41,22 @@ def main():
     )
     pressure = os.environ.get("P1_PRESSURE") == "1"
     if os.environ.get("P1_RECLAIM") == "1":
-        args.additional_config = {"kv_reclamation": {"retention": 1.0}}
+        args.additional_config = {
+            "kv_reclamation": {
+                "retention": float(os.environ.get("P1_RETENTION", "1")),
+                "pressure": os.environ.get("P1_CONTROLLER") == "1",
+                "reserve_cap": int(os.environ.get("P1_RESERVE", "0")),
+                "min_keep_tokens": int(os.environ.get("P1_MIN_KEEP", "128")),
+                "sink_tokens": int(os.environ.get("P1_SINK", "16")),
+                "recent_tokens": int(os.environ.get("P1_RECENT", "16")),
+            }
+        }
     if pressure:
         args.max_model_len = 512
         args.max_num_batched_tokens = 256
         args.kv_cache_memory_bytes = 256 * 2**20
-        args.num_gpu_blocks_override = 33
+        args.num_gpu_blocks_override = int(os.environ.get("P1_BLOCKS", "33"))
+        args.max_model_len = min(512, (args.num_gpu_blocks_override - 1) * 16)
     engine = LLMEngine.from_engine_args(args)
     config = engine.vllm_config
     core = engine.engine_core.engine_core
@@ -84,7 +94,12 @@ def main():
     (run / "identity.json").write_text(json.dumps(identity, indent=2, default=str))
     assert config.max_concurrent_batches == 1 and core.batch_queue is None
     assert "gpu.model_runner" in identity["runner"]
-    params = SamplingParams(temperature=0, max_tokens=32, ignore_eos=True, seed=0)
+    params = SamplingParams(
+        temperature=0,
+        max_tokens=int(os.environ.get("P1_OUTPUT_TOKENS", "32")),
+        ignore_eos=True,
+        seed=0,
+    )
     prompts = {
         "A": "The following is a memory test. "
         + "Mary went to the garden. " * 256
@@ -94,8 +109,9 @@ def main():
     starts = {}
     outputs = {}
     ticks = []
-    for step in range(256):
-        for rid, arrival in [("A", 0), ("B", 5)]:
+    arrival_b = int(os.environ.get("P1_ARRIVAL_B", "5"))
+    for step in range(1024):
+        for rid, arrival in [("A", 0), ("B", arrival_b)]:
             if step == arrival:
                 text = tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompts[rid]}],
@@ -106,7 +122,12 @@ def main():
                 token_ids = tokenizer.encode(text, add_special_tokens=False)
                 if pressure:
                     token_ids = (token_ids * 16)[
-                        : int(os.environ.get("P1_PRESSURE_PROMPT_TOKENS", "256"))
+                        : int(
+                            os.environ.get(
+                                f"P1_PROMPT_{rid}",
+                                os.environ.get("P1_PRESSURE_PROMPT_TOKENS", "256"),
+                            )
+                        )
                     ]
                 starts[rid] = time.perf_counter()
                 engine.add_request(rid, {"prompt_token_ids": token_ids}, params)
@@ -120,7 +141,7 @@ def main():
                 "finished": output.finished,
                 "elapsed_s": time.perf_counter() - starts[output.request_id],
             }
-        if step >= 5 and not engine.has_unfinished_requests():
+        if step >= arrival_b and not engine.has_unfinished_requests():
             break
     assert set(outputs) == {"A", "B"} and all(o["finished"] for o in outputs.values())
     (run / "outputs.json").write_text(json.dumps(outputs, indent=2))

@@ -58,7 +58,12 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
-from vllm.v1.kv_reclamation import ReclaimRequest, ReclaimResult
+from vllm.v1.kv_reclamation import (
+    ReclaimCandidate,
+    ReclaimRequest,
+    ReclaimResult,
+    choose_reclaim_candidate,
+)
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -1567,6 +1572,17 @@ def reclamation_owner():
     row = manager.get_block_ids("A")[0]
     intent = ReclaimRequest("A", 64, row.copy(), 16)
     return manager, request, intent
+
+
+@pytest.mark.parametrize("goal,expected", [(2, "zero"), (5, "cheap"), (20, "large")])
+def test_reclamation_candidate_coverage_cost_and_stable_tie(goal, expected):
+    candidates = [
+        ReclaimCandidate("large", 128, 10, 100, False, 3),
+        ReclaimCandidate("cheap", 128, 6, 30, False, 2),
+        ReclaimCandidate("zero", 128, 4, 0, True, 1),
+        ReclaimCandidate("tie", 128, 6, 30, False, 2),
+    ]
+    assert choose_reclaim_candidate(candidates, goal).request_id == expected
 
 
 def test_reclamation_reuses_released_pages_and_grows_from_effective_length(

@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
+from vllm.v1.kv_reclamation import ReclaimResult
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -43,6 +44,142 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def pressure_scheduler(tmp_path, monkeypatch):
+    from transformers import Qwen3Config
+
+    model_path = tmp_path / "model"
+    Qwen3Config().save_pretrained(model_path)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    def create(num_blocks, reserve=0, **kwargs):
+        return create_scheduler(
+            model=str(model_path),
+            num_blocks=num_blocks,
+            max_num_batched_tokens=256,
+            use_v2_model_runner=True,
+            reclamation_config={
+                "pressure": True,
+                "min_keep_tokens": 16,
+                "sink_tokens": 0,
+                "recent_tokens": 0,
+                "reserve_cap": reserve,
+                **kwargs,
+            },
+        )
+
+    return create
+
+
+def complete_pressure_step(scheduler, output):
+    """Supply a completed worker result; use the real scheduler/pool commit."""
+    req_ids = list(output.num_scheduled_tokens)
+    result = None
+    if intent := output.reclaim_request:
+        result = ReclaimResult(
+            intent.request_id,
+            intent.target_keep_tokens,
+            intent.source_block_ids[: (intent.target_keep_tokens + 15) // 16],
+        )
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=[[42]] * len(req_ids),
+            logprobs=None,
+            prompt_logprobs_dict={},
+            reclaim_result=result,
+        ),
+    )
+
+
+def test_pressure_running_miss_preserves_partial_batch_and_bounds_retry(
+    pressure_scheduler,
+):
+    """A consumes its tail; B misses. One reclaim must precede native preempt."""
+    scheduler = pressure_scheduler(5)
+    a = create_requests(1, num_tokens=31, req_ids=["A"])[0]
+    b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
+    for request in (a, b):
+        scheduler.add_request(request)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    before = scheduler.kv_cache_manager.get_block_ids(a.request_id)[0].copy()
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"A": 1}
+    assert output.reclaim_request.request_id == "A"
+    assert output.reclaim_request.source_effective_kv_len == 32
+    assert a.num_preemptions == b.num_preemptions == 0
+    complete_pressure_step(scheduler, output)
+    assert a.effective_kv_len == 16 and a.num_computed_tokens == 32
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 1
+    retry = scheduler.schedule()
+    assert retry.reclaim_request is None
+    assert retry.num_scheduled_tokens == {"A": 1}
+    assert b.num_preemptions == 1
+    assert scheduler.kv_cache_manager.get_block_ids("A")[0] == before
+
+
+@pytest.mark.parametrize("reserve", [0, 3])
+def test_pressure_waiting_miss_retries_admission_with_released_pages(
+    pressure_scheduler, reserve
+):
+    scheduler = pressure_scheduler(5, reserve=reserve)
+    a = create_requests(1, num_tokens=48, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
+    scheduler.add_request(b)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"A": 1}
+    assert output.reclaim_request.request_id == "A"
+    assert output.reclaim_request.source_effective_kv_len == 49
+    complete_pressure_step(scheduler, output)
+    retry = scheduler.schedule()
+    assert retry.reclaim_request is None
+    assert retry.num_scheduled_tokens == {"A": 1, "B": 32}
+    assert b.status == RequestStatus.RUNNING
+
+
+def test_pressure_running_miss_can_use_maintenance_without_fake_forward(
+    pressure_scheduler,
+):
+    scheduler = pressure_scheduler(3)
+    a = create_requests(1, num_tokens=32, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    output = scheduler.schedule()
+    assert output.total_num_scheduled_tokens == 0
+    assert output.reclaim_request.source_effective_kv_len == 32
+    complete_pressure_step(scheduler, output)
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens == {"A": 1}
+    assert retry.reclaim_request is None
+    assert a.num_preemptions == 0
+
+
+def test_pressure_zero_releasable_pages_uses_native_preemption(pressure_scheduler):
+    scheduler = pressure_scheduler(3, retention=1)
+    a = create_requests(1, num_tokens=32, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    output = scheduler.schedule()
+    assert output.reclaim_request is None
+    assert a.num_preemptions == 1
+
+
+def test_pressure_incomplete_prefill_uses_native_preemption(pressure_scheduler):
+    scheduler = pressure_scheduler(3)
+    request = create_requests(1, num_tokens=48, req_ids=["A"])[0]
+    scheduler.add_request(request)
+    scheduler.max_num_scheduled_tokens = 32
+    complete_pressure_step(scheduler, scheduler.schedule())
+    assert request.num_computed_tokens < request.num_prompt_tokens
+    output = scheduler.schedule()
+    assert output.reclaim_request is None
+    assert request.num_preemptions == 1
 
 
 def test_allocator_trace_observes_miss_and_free_without_changing_schedule(
