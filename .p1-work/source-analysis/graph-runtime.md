@@ -14,10 +14,11 @@ E、L、Block IDs 都不是 graph key。`capture` 启动时分配的 graph pool�
 非 attention consumer（sampler/prompt logprob/chunked prefill）继续消费这些原生值。
 
 `KVReclamationWorker` 另外持有同shape的 `cache_positions`、`kv_seq_lens` 以及
-resident-request-index域的 staged effective lengths。`prepare_attn` 用当前 batch
-mapping 和 query starts gather E，计算 E+q/physical positions，返回临时 InputBatch
-view；CPU upper bound 按本轮 E+q 构造。view 生命周期只有本轮，backing allocation
-贯穿 runner。`advance` 在本轮 postprocess 后只推进实际请求 E，padding不参与。
+resident-request-index域的 staged effective lengths。原生 `prepare_pos_seq_lens`
+按当前 mapping 一次生成 logical 与 physical positions/lengths；`prepare_attn`
+返回临时 physical InputBatch view，CPU upper bound 按 E+q 构造。view 生命周期
+只有本轮，backing allocation 贯穿 runner。原生 `post_update` 在 postprocess
+边界同时推进 GPU L/E；`advance` 只推进实际请求的 CPU E mirror，padding不参与。
 
 `BlockTables` 原生持有 resident rows、gather后的 input rows、slot mappings。
 回收覆盖 resident row 后清旧 active tail；下轮按新 mapping gather 到同一 input row

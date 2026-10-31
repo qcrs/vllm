@@ -526,7 +526,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
         if self.reclamation is not None:
-            self.reclamation.initialize_cache(kv_cache_config, kv_caches_dict)
+            self.reclamation.initialize_cache(
+                kv_cache_config,
+                kv_caches_dict,
+                self.compilation_config.static_forward_context,
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -860,8 +864,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
-        if self.reclamation is not None:
-            self.reclamation.update_requests(scheduler_output)
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
@@ -993,6 +995,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
+            physical_inputs=(
+                self.reclamation.effective_kv_len.gpu,
+                self.reclamation.cache_positions,
+                self.reclamation.kv_seq_lens,
+            )
+            if self.reclamation is not None
+            else None,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
@@ -1167,6 +1176,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            effective_kv_len=self.reclamation.effective_kv_len.gpu
+            if self.reclamation is not None
+            else None,
         )
 
         self.model_state.postprocess_state(

@@ -11,6 +11,86 @@ import torch
 from tests.v1.worker.kv_compaction_utils import scalar_retained_kv
 
 
+def test_reclamation_rejects_alibi_before_cache_mutation():
+    """Compacted physical distances cannot preserve ALiBi's logical position bias."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.kv_reclamation import ReclamationConfig
+    from vllm.v1.worker.gpu.kv_reclamation import KVReclamationWorker
+
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        ],
+    )
+    worker = KVReclamationWorker.__new__(KVReclamationWorker)
+    worker.config = ReclamationConfig()
+    layer = SimpleNamespace(impl=SimpleNamespace(alibi_slopes=torch.tensor([0.5])))
+    with pytest.raises(ValueError, match="ALiBi position bias"):
+        worker.initialize_cache(config, {"layer": torch.empty(0)}, {"layer": layer})
+
+
+@pytest.mark.parametrize("physical", [False, True])
+def test_reclamation_lengths_share_native_prepare_and_postprocess(physical):
+    """Reordered requests retain logical positions and advance E only after work."""
+    from vllm.v1.worker.gpu.input_batch import post_update, prepare_pos_seq_lens
+
+    logical = torch.tensor([20, 7, 98, 1], dtype=torch.int32, device="cuda")
+    effective = torch.tensor([9, 2, 33, 0], dtype=torch.int32, device="cuda")
+    indices = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([0, 1, 4], dtype=torch.int32, device="cuda")
+    positions = torch.full((8,), -1, dtype=torch.int64, device="cuda")
+    lengths = torch.full((4,), -1, dtype=torch.int32, device="cuda")
+    cache_positions = torch.full_like(positions, -1)
+    kv_lengths = torch.full_like(lengths, -1)
+    prepare_pos_seq_lens(
+        indices,
+        starts,
+        logical,
+        positions,
+        lengths,
+        (effective, cache_positions, kv_lengths) if physical else None,
+    )
+    assert positions[:4].tolist() == [1, 7, 8, 9]
+    assert lengths.tolist() == [2, 10, 0, 0]
+    assert effective.tolist() == [9, 2, 33, 0]
+    if physical:
+        assert cache_positions[:4].tolist() == [0, 2, 3, 4]
+        assert kv_lengths.tolist() == [1, 5, 0, 0]
+    else:
+        assert kv_lengths.tolist() == [-1] * 4
+
+    # The third sampler row is masked; the second is an unfinished prefill.
+    post_update(
+        torch.tensor([3, 1, -1], dtype=torch.int32, device="cuda"),
+        logical,
+        torch.zeros_like(logical),
+        None,
+        torch.tensor([[42], [0], [0]], dtype=torch.int64, device="cuda"),
+        torch.tensor([1, 0, 0], dtype=torch.int32, device="cuda"),
+        torch.zeros(3, dtype=torch.int32, device="cuda"),
+        starts,
+        torch.zeros((4, 16), dtype=torch.int32, device="cuda"),
+        torch.tensor([0, 3, 0, 4], dtype=torch.int32, device="cuda"),
+        effective if physical else None,
+    )
+    assert logical.tolist() == [20, 10, 98, 2]
+    assert effective.tolist() == ([9, 5, 33, 1] if physical else [9, 2, 33, 0])
+
+
 def test_graph_attention_lengths_keep_logical_inputs_and_refresh_dummy_padding():
     from vllm.v1.worker.gpu.cudagraph_utils import prepare_inputs_to_capture
     from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers

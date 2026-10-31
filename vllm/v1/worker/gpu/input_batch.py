@@ -249,6 +249,9 @@ def _prepare_pos_seq_lens_kernel(
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
+    effective_kv_len_ptr,
+    cache_positions_ptr,
+    kv_seq_lens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -260,6 +263,8 @@ def _prepare_pos_seq_lens_kernel(
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < max_num_reqs
             tl.store(seq_lens_ptr + block, 0, mask=mask)
+            if effective_kv_len_ptr is not None:
+                tl.store(kv_seq_lens_ptr + block, 0, mask=mask)
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -271,12 +276,17 @@ def _prepare_pos_seq_lens_kernel(
 
     seq_len = num_computed_tokens + query_len
     tl.store(seq_lens_ptr + req_id, seq_len)
+    if effective_kv_len_ptr is not None:
+        effective = tl.load(effective_kv_len_ptr + req_state_idx)
+        tl.store(kv_seq_lens_ptr + req_id, effective + query_len)
 
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         pos = num_computed_tokens + block
         tl.store(pos_ptr + start + block, pos, mask=mask)
+        if effective_kv_len_ptr is not None:
+            tl.store(cache_positions_ptr + start + block, effective + block, mask=mask)
 
 
 def prepare_pos_seq_lens(
@@ -285,6 +295,7 @@ def prepare_pos_seq_lens(
     num_computed_tokens: torch.Tensor,
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    physical_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
@@ -295,6 +306,7 @@ def prepare_pos_seq_lens(
         idx_mapping,
         query_start_loc,
         num_computed_tokens,
+        *(physical_inputs if physical_inputs is not None else (None, None, None)),
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )
@@ -470,6 +482,7 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    effective_kv_len_ptr,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -514,6 +527,9 @@ def _post_update_kernel(
     if computed_delta != 0:
         num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+        if effective_kv_len_ptr is not None:
+            effective = tl.load(effective_kv_len_ptr + req_state_idx)
+            tl.store(effective_kv_len_ptr + req_state_idx, effective + computed_delta)
 
 
 def post_update(
@@ -537,6 +553,7 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    effective_kv_len: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     _post_update_kernel[(num_reqs,)](
@@ -553,6 +570,7 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        effective_kv_len,
         num_warps=1,
     )
 

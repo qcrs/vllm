@@ -581,13 +581,14 @@ class KVCacheManager:
         blocks = manager.req_to_blocks[request.request_id]
         ids = [block.block_id for block in blocks]
         retained = result.retained_block_ids
+        retained_set = set(retained)
         block_size = manager.block_size
         assert ids == intent.source_block_ids
         assert result.request_id == request.request_id == intent.request_id
         assert result.new_effective_kv_len == intent.target_keep_tokens
         assert len(retained) == cdiv(result.new_effective_kv_len, block_size)
-        assert len(set(retained)) == len(retained)
-        assert set(retained).issubset(ids)
+        assert len(retained_set) == len(retained)
+        assert retained_set.issubset(ids)
         protected_blocks = intent.protected_prefix_tokens // block_size
         assert intent.protected_prefix_tokens % block_size == 0
         assert intent.protected_prefix_tokens <= result.new_effective_kv_len
@@ -601,9 +602,7 @@ class KVCacheManager:
             for block in blocks[protected_blocks:]
         )
         by_id = {b.block_id: b for b in blocks}
-        retained_set = set(retained)
         removed = [b for b in blocks if b.block_id not in retained_set]
-        assert all(b.ref_cnt == 1 for b in removed)
         manager.req_to_blocks[request.request_id] = [by_id[i] for i in retained]
         request.effective_kv_len = result.new_effective_kv_len
         if request.request_id in manager.num_cached_block:

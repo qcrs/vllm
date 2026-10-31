@@ -262,7 +262,6 @@ class SchedulerOutput:
     num_spec_tokens_to_schedule: int = 0
 
     reclaim_request: ReclaimRequest | None = None
-    effective_kv_lens: dict[str, int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

@@ -8,7 +8,6 @@ import numpy as np
 import torch
 
 from vllm.distributed import get_tp_group
-from vllm.triton_utils import tl, triton
 from vllm.v1.kv_reclamation import (
     ReclaimRequest,
     ReclaimResult,
@@ -17,19 +16,9 @@ from vllm.v1.kv_reclamation import (
     whole_block_row,
 )
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
-from vllm.v1.worker.gpu.input_batch import InputBatch, prepare_pos_seq_lens
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
 from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
-
-
-@triton.jit
-def _advance_effective(lengths, indices, starts, N: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.arange(0, BLOCK)
-    mask = i < N
-    idx = tl.load(indices + i, mask, other=0)
-    q = tl.load(starts + i + 1, mask, other=0) - tl.load(starts + i, mask, other=0)
-    value = tl.load(lengths + idx, mask, other=0)
-    tl.store(lengths + idx, value + q, mask)
 
 
 class KVReclamationWorker:
@@ -63,8 +52,11 @@ class KVReclamationWorker:
         )
         self.generator = torch.Generator(device=req_states.device).manual_seed(0)
 
-    def initialize_cache(self, cache_config, layers) -> None:
+    def initialize_cache(self, cache_config, layers, attn_layers) -> None:
         self.config.validate_cache(cache_config)
+        for name in layers:
+            if attn_layers[name].impl.alibi_slopes is not None:
+                raise ValueError("KV reclamation does not support ALiBi position bias")
         self.layers = list(layers.values())
         for cache in self.layers:
             if cache.ndim != 4 or cache.dtype != torch.bfloat16:
@@ -80,19 +72,7 @@ class KVReclamationWorker:
         self.effective_kv_len.stage_write_elem(index, computed)
         self.effective_kv_len.apply_write()
 
-    def update_requests(self, scheduler_output) -> None:
-        for rid, value in (scheduler_output.effective_kv_lens or {}).items():
-            idx = self.req_states.req_id_to_index[rid]
-            assert self.effective_kv_len_np[idx] == value
-
     def prepare_attn(self, batch: InputBatch) -> InputBatch:
-        prepare_pos_seq_lens(
-            batch.idx_mapping,
-            batch.query_start_loc,
-            self.effective_kv_len.gpu,
-            self.cache_positions,
-            self.kv_seq_lens,
-        )
         upper = np.zeros(batch.num_reqs_after_padding, dtype=np.int32)
         upper[: batch.num_reqs] = (
             self.effective_kv_len_np[batch.idx_mapping_np] + batch.num_scheduled_tokens
@@ -105,13 +85,6 @@ class KVReclamationWorker:
         )
 
     def advance(self, batch: InputBatch) -> None:
-        _advance_effective[(1,)](
-            self.effective_kv_len.gpu,
-            batch.idx_mapping,
-            batch.query_start_loc,
-            batch.num_reqs,
-            triton.next_power_of_2(batch.num_reqs),
-        )
         self.effective_kv_len_np[batch.idx_mapping_np] += batch.num_scheduled_tokens
 
     def prepare_dummy_attn(self, batch: InputBatch) -> InputBatch:

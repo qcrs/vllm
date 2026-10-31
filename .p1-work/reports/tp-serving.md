@@ -93,3 +93,24 @@ invocation/source、NVML及result。失败`20261031-114106-http-long-full-0.75-n
 | short/full/8.0/noop | `20261031-120939-http-short-full-8-noop` |
 | short/eager/8.0/full | `20261031-121030-http-short-eager-8-full` |
 | short/eager/8.0/noop | `20261031-121131-http-short-eager-8-noop` |
+
+## 功能收尾复核（2026-10-31）
+
+普通decode的physical prepare / GPU E advance已合入原生prepare/post-update
+kernel；删除每步只为断言发送的E字典。三条新的Prefix+FULL+TP、q0慢rank、
+maintenance慢rank轨迹通过，见 [final-review.md](final-review.md)。
+
+相同short/eager协议、完整预热、每server3正式轮，修改前native/noop为
+59.874/61.910tokens/s，未稳定复现历史14.33%。修改后按native/noop/noop/native
+次序运行，A对61.541/53.426（13.187%开销），B对62.047/61.670（0.607%），
+两对全部轮合并为61.794/57.548（6.871%），仍为预算FAIL。12对输出逐token
+相同，短负载SLO均12/12；不挑选单组宣布已解决。独立host诊断观察到慢轮rank0
+CPU执行增加，rank1等待增加；跨server的完整原因尚未确定，不归因于两个小kernel。
+
+旧profile的missing span继续标PARTIAL；新
+`Review/20261031-144831-tp-full-tri-nsys-flush0`使用flush interval0，不改环境版本。
+窗口17.484s，424个graph spans完整；每rank三类通信各27次，162个collective spans
+全匹配，无incomplete/drop诊断，tail约5.70ms。每rank逻辑payload为
+score307356、plan153652、completion108 bytes；rank0 GPU累计
+0.429/0.218/5.026ms，rank1为217.364/17.219/56.698ms，仍包含等待。
+该诊断不合入正式吞吐。原始数据和重算入口见final-review。

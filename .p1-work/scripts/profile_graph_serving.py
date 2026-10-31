@@ -17,7 +17,8 @@ def main():
                 "profile",
                 "--trace=cuda,nvtx,osrt",
                 "--cuda-graph-trace=graph",
-                "--cuda-flush-interval=500",
+                "--cuda-flush-interval="
+                + os.environ.get("P1_NSYS_CUDA_FLUSH_MS", "500"),
                 "--sample=none",
                 "--cpuctxsw=none",
                 "--trace-fork-before-exec=true",

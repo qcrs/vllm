@@ -8,16 +8,25 @@ APC/spec/connector/async/cascade off。扩展必须独立验证后再开放配�
 
 Request 增加唯一持久语义 `effective_kv_len`（E）；`num_computed_tokens`（L）保持原逻辑。
 `KVCacheManager.allocate_slots` 的 requirement 与实际 allocation 共同使用 E。
-Scheduler 在 batch 收尾将 settled E 传给 Worker 校验，正常输出完成后 E 加本轮 q。
+Scheduler 在正常输出完成后 E 加本轮 q。Worker 由 add/preempt/reclaim/completion
+生命周期维护镜像；普通 step 不再重复传输 settled E 字典做一致性断言。
 
 Worker 的 E 为 indexed CPU/GPU mirror，复用 `StagedWriteTensor`。
 `prepare_inputs` 仍以 L 构造 input token、RoPE positions、sampling/prompt-logprob 输入。
 仅传给 `prepare_attn` / `model_state.prepare_attn` 的局部 `InputBatch` view 使用
 physical positions E..E+q、physical seq_lens E+q 及对应 CPU upper bound。
 因此 slot_mapping、max_seq_len、FA metadata 与 allocator 对物理长度的理解一致。
+收尾 review 将 physical positions/seq_lens 合入原生 `prepare_pos_seq_lens` 一次
+launch；GPU E+=q 合入原生 `post_update`，CPU mirror 在同一 postprocess 边界推进。
+feature-off 的可选 tensor 参数为 None，由 Triton specialization 删除物理分支。
 
 `finish_requests` 同时移除 preempted 的 Worker state，恢复的 Request 经 `add_requests`
 重新建立 E；Scheduler `_preempt_request` 将 L/E 一起清零，再由原生 prefill 重算。
+
+收尾的配置检查要求 generation runner；pooling不经过上述postprocess，不能继承
+E生命周期。`FullAttentionSpec`还可能含sliding/chunk/non-causal语义，需显式拒绝；
+Worker初始化检查实际FA impl的ALiBi，因为其bias按物理距离计算，不能靠旧K中的
+RoPE保留logical距离。这些是初始化支持边界，不在普通decode中重复检查。
 
 ## 回收与完成边界
 

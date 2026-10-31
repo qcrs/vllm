@@ -7,6 +7,10 @@
 `/data_ssd/qcrs/experiments/p1-v8`，各run保留命令、源快照/提交、参数、日志、
 NVML和退出码；失败产物未覆盖。
 
+2026-10-31 功能收尾 review 见 [final-review.md](final-review.md)：修复局部/非因果
+attention、pooling、ALiBi误放行，合并两个普通decode launch并删除重复E传输/校验；
+TP/DP真实回归通过，新Graph/TP profile完整。质量评测按用户最新要求冻结。
+
 ## 已实现的运行语义
 
 logical L用于RoPE、sampling和原token/hash chain；physical E用于attention
@@ -36,6 +40,7 @@ Prefix保护完整共享页，mutation前撤销私有suffix全部hash aliases；
 | Graph | 七条8B轨迹、FULL/PIECEWISE与Prefix组合，独立正确性PASS；17组Serving | `graph.md`、`graph-serving.md` |
 | TP | 11条8B轨迹、真实NCCL distinct-GQA/stable ties与23项回归PASS；12组Serving | `tp.md`、`tp-serving.md` |
 | DP | 双Engine局部压力/重写/abort与peer逐token对照PASS；10组正式Serving与5条独立诊断完成，含宽松池零评分/回收链 | `dp.md`、`dp-serving.md` |
+| 功能收尾 | 支持范围修复、普通decode融合、TP/DP回归、新完整profile；TP eager ABBA合并开销6.871%，仍为性能FAIL | `final-review.md` |
 
 性能优化使用CUDA Events、NSYS与NCU。固定36层/8 KV heads/D128/B16的32K
 half-retention compaction约18.39→3.66ms，寄存器128→56，无compiler spill；
@@ -49,10 +54,13 @@ half-retention compaction约18.39→3.66ms，寄存器128→56，无compiler spi
 探针，不把有损后tokens/s提升当作等量计算或生产质量保证。
 
 Prefix的3/1.5GiB、M2的1.5GiB尾延迟未满足既定SLO。TP的short/eager noop
-吞吐开销14.33%，超过5%预算；压力配置虽然降低preemption，Goodput仍为0。
+历史吞吐开销14.33%；收尾改动后ABBA两对分别13.187%与0.607%，全部合并6.871%，
+仍超过5%预算，不能挑选后一组宣布修复；压力配置虽然降低preemption，Goodput仍为0。
 TP宽松long配置也只有18/24请求达SLO，不能将noop吞吐预算PASS当作全部延迟通过。
-Graph/TP各有一条NSYS缺少graph GPU span，时间窗完整但相关成本仅为PARTIAL；
-TP eager差异主要表现为rank等待，CPU具体热函数尚未定位，不声称已修复。
+Graph/TP历史各一条NSYS缺少graph GPU span，原记录继续标PARTIAL；收尾使用
+flush interval0补采，274/424个graph spans及TP全部collective spans匹配完整。
+TP eager的额外小kernel已融合，但跨server的host执行/launch节奏差异仍未解决，
+不声称仅此改动消除了旧14.33%。
 DP native压力下三种有损策略均24/24达SLO，Sink的preemption三轮570→0、
 吞吐22.40→109.25tokens/s；人工skewed Sink仍18/24达标，TTFT超预算，性能FAIL。
 DP native/noop两档共48个请求输出逐token相同，宽松noop开销约0；未新增routing
@@ -85,6 +93,12 @@ DP复现使用`../scripts/run_dp_serving.sh`，局部ownership轨迹命令见`dp
 shell及其余适用钩子的通过结果保存在`delivery-pre-commit-rerun.log`；首次失败
 日志`delivery-pre-commit.log`保留了上述`re`导入问题。
 
-剩余TO_VERIFY限于上述未通过预算的进一步优化、质量保持及未测组合；本次固定
-实施路线已执行到DP，当前不扩大实验矩阵。项目GPU进程已退出；同机其他用户
-任务保留。下一步可从各负结果对应的raw/profile继续定位，不需要重新建立基线。
+本轮功能收尾另有154项相关测试通过；整个上游suite受离线模型配置资源限制，
+失败和排除范围详见`final-review.md`。最终staged文件的全部适用pre-commit钩子
+通过（含mypy3.10），日志为`Review/final-review-pre-commit.log`；
+`git diff --check`通过。
+
+功能收尾的支持范围、冗余校验审查、Triton落地与TP/DP回归见final-review。
+保留项为上述性能FAIL和未测组合；质量保持未证明，按用户最新要求不再扩大评测。
+不将固定路线执行到DP等同于所有预算通过。项目GPU进程已退出；同机其他用户
+任务保留。

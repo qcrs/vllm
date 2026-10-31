@@ -67,3 +67,13 @@ Graph独立与组合证据见对应报告。部分进程的原生DP coordinator�
 跨DP回收barrier；局部ownership与worker TP1分支不执行TP回收通信。
 Serving的10组正式配置和5条独立诊断均已完成；本Gate范围内没有待补的正确性
 轨迹。剩余SLO失败、质量限制与未测组合在Serving报告和交付索引中单列。
+
+## 普通decode融合后的回归
+
+`Review/20261031-144010-dp-local-pressure-reuse-abort`在新physical prepare/
+post-update kernel下重跑同一双Engine轨迹，guard PASS。C取得10–17共8个
+released页并在36层实际覆盖；A retained bytes、peer不回收、abort affinity、
+abort后112次peer forward与最终free32/32均通过。peer的128个输出与上述native
+Full轨迹逐token相同，证据在新run的`peer-output-comparison.json`。
+本轮未增加路由hint或修改DP实现；审查结论及已知性能限制见
+[final-review.md](final-review.md)。

@@ -58,6 +58,7 @@ class ReclamationConfig:
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
             or config.model_config.is_encoder_decoder
+            or config.model_config.runner_type != "generate"
             or config.attention_config.backend != AttentionBackendEnum.FLASH_ATTN
             or config.attention_config.use_non_causal
             or not config.model_config.disable_cascade_attn
@@ -73,7 +74,14 @@ class ReclamationConfig:
             cache.kv_cache_groups[0].kv_cache_spec, FullAttentionSpec
         ):
             raise ValueError("KV reclamation requires one full-attention KV group")
-        if cache.kv_cache_groups[0].kv_cache_spec.block_size != 16:
+        spec = cache.kv_cache_groups[0].kv_cache_spec
+        if (
+            spec.sliding_window is not None
+            or spec.attention_chunk_size is not None
+            or spec.non_causal
+        ):
+            raise ValueError("KV reclamation requires unrestricted causal attention")
+        if spec.block_size != 16:
             raise ValueError("KV reclamation requires B16")
 
 

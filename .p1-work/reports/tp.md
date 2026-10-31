@@ -113,3 +113,13 @@ maintenance均通过。该失败不作为Runtime故障，也不删除旧产物�
 NVML和result。逐步payload hook只用于正确性，正式HTTP无该hook；Serving和
 通信成本独立记录于`tp-serving.md`。不将合成Serving当作有损任务质量。
 TP完成后继续DP；本阶段未修改模型权重/校准，不新增跨拓扑任务质量通过声明。
+
+## 收尾后的回归
+
+`Review/20261031-143734-tp-prefix-full-token`在融合普通decode长度kernel后重跑
+Prefix+FULL+TP，10页全层真实重写、每rank61 FULL/3 NONE、47次FP32 attention、
+46次matched-eager检查通过。`143830-tp-full-token-q0-delay`与
+`143924-tp-full-token-maintenance-delay`验证非output rank慢3s时全组ACK前不free，
+均PASS。初始化另拒绝pooling、局部/非因果spec与ALiBi误用。
+完整审查和测试限制见 [final-review.md](final-review.md)。吞吐预算仍有FAIL，
+新通信profile完整性已补齐；功能PASS不扩大为所有性能通过。

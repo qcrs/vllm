@@ -62,6 +62,7 @@ from vllm.v1.kv_reclamation import (
     ReclaimCandidate,
     ReclaimRequest,
     ReclaimResult,
+    ReclamationConfig,
     choose_reclaim_candidate,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -1549,6 +1550,29 @@ def test_allocate_with_lookahead():
         num_lookahead_tokens=4,
     )
     assert len(blocks.get_block_ids()[0]) == 2
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"sliding_window": 32},
+        {"attention_chunk_size": 32},
+        {"non_causal": True},
+    ],
+)
+def test_reclamation_rejects_restricted_full_attention(restriction):
+    """FullAttentionSpec can carry local or non-causal semantics despite its type."""
+    config = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"], dataclasses.replace(new_kv_cache_spec(), **restriction)
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="unrestricted causal attention"):
+        ReclamationConfig().validate_cache(config)
 
 
 @pytest.fixture

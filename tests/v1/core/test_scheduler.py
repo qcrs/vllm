@@ -36,7 +36,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.kv_reclamation import ReclaimResult
+from vllm.v1.kv_reclamation import ReclaimResult, ReclamationConfig
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -51,7 +51,7 @@ def pressure_scheduler(tmp_path, monkeypatch):
     from transformers import Qwen3Config
 
     model_path = tmp_path / "model"
-    Qwen3Config().save_pretrained(model_path)
+    Qwen3Config(architectures=["Qwen3ForCausalLM"]).save_pretrained(model_path)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
 
     def create(num_blocks, reserve=0, enable_prefix_caching=False, **kwargs):
@@ -72,6 +72,14 @@ def pressure_scheduler(tmp_path, monkeypatch):
         )
 
     return create
+
+
+def test_reclamation_rejects_pooling_lifecycle(pressure_scheduler, monkeypatch):
+    """Pooling never advances physical E at the generation postprocess boundary."""
+    scheduler = pressure_scheduler(16)
+    monkeypatch.setattr(scheduler.vllm_config.model_config, "runner_type", "pooling")
+    with pytest.raises(ValueError, match="validated MRV2 Core configuration"):
+        ReclamationConfig.from_vllm_config(scheduler.vllm_config)
 
 
 def complete_pressure_step(scheduler, output):
@@ -107,7 +115,7 @@ def test_reclamation_apc_hit_initializes_effective_length(pressure_scheduler):
     output = scheduler.schedule()
     assert output.scheduled_new_reqs[0].num_computed_tokens == 48
     assert output.num_scheduled_tokens == {"A": 1, "B": 16}
-    assert output.effective_kv_lens == {"A": 64, "B": 48}
+    assert a.effective_kv_len == 64
     assert b.num_computed_tokens - b.num_in_flight_tokens == b.effective_kv_len == 48
     manager = scheduler.kv_cache_manager
     assert manager.get_block_ids("A")[0][:3] == manager.get_block_ids("B")[0][:3]

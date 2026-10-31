@@ -126,3 +126,14 @@ NSYS2024.7.1还提示driver12.7使用12.6 trace libraries；不升级环境来�
 并逐correlation检查graph span；缺span明确标PARTIAL，不能静默当PASS。
 该证据已足以判断本配置的copy/physical metadata kernel不是主要GPU成本，
 不支持新增graph内compaction或额外metadata backend。
+
+## 收尾补采
+
+旧PARTIAL结果保留。`Review/20261031-145135-graph-sink-nsys-flush0`在普通decode
+kernel融合后，按相同FULL/Sink/1.5GiB压力协议补采，flush interval设为0、环境
+版本保持。新窗口9.893s中274次graph launch API与274个GPU graph spans全匹配，
+无incomplete/drop记录，最后活动距窗口结束5.71ms，profile完整性PASS。
+16次真实Stable CTA累计7.080ms；原生prepare与post-update各308次，GPU累计
+0.804/1.885ms，旧独立physical prepare/advance已消失。已匹配活动union
+8540.978ms，不能将窗口其余时间全算scheduler idle；工具driver版本提示仍保留。
+本轮trace不替代正式吞吐，更多边界见 [final-review.md](final-review.md)。
