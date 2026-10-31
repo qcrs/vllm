@@ -1,116 +1,74 @@
 # P1 v8 工程交付索引
 
-工作树与分支固定为`worktrees/p1-v8-physical-kv-reclamation`、
-`p1/v8-physical-kv-reclamation`，基线vLLM v0.26.0 `568afb3a13`。
-所有真实模型实验为本地Qwen3-8B BF16；单卡使用物理GPU1，TP2/DP2使用0,1。
-现有Python3.10/Torch2.11+cu129/Triton3.6与工具链保持不变。大型产物只在
-`/data_ssd/qcrs/experiments/p1-v8`，各run保留命令、源快照/提交、参数、日志、
-NVML和退出码；失败产物未覆盖。
+当前完成限定范围的功能收尾：R1请求生命周期误放行已封口，R2和D1–D4已修订。
+本次修改、验证命令和剩余边界集中在 [closeout-fixes.md](closeout-fixes.md)。
+[独立收尾Review](independent-closeout-review.md) 保留 `252c747ad6` 发现时的原文，
+其中“待修复”是历史基准；当前状态由 [status](../plans/status.md) 维护。
 
-2026-10-31 功能收尾 review 见 [final-review.md](final-review.md)：修复局部/非因果
-attention、pooling、ALiBi误放行，合并两个普通decode launch并删除重复E传输/校验；
-TP/DP真实回归通过，新Graph/TP profile完整。质量评测按用户最新要求冻结。
+工作树为 `worktrees/p1-v8-physical-kv-reclamation`，分支为
+`p1/v8-physical-kv-reclamation`，vLLM基线为v0.26.0 `568afb3a13`。
+沿用现有Python3.10/Torch2.11+cu129/Triton3.6环境；模型实验仅Qwen3-8B BF16。
+大产物位于 `/data_ssd/qcrs/experiments/p1-v8`，各run保留命令、源码状态、参数、
+日志和退出码；历史失败与原始产物未覆盖。
 
-后续性能收尾见 [performance-followup.md](performance-followup.md)：相同CPU20/21
-放置下TP eager ABBA合并开销0.868% PASS；DP skewed改用batch512后三轮24/24
-达SLO；TP压力batch1024后三轮17/24、零抢占，TTFT仍有缺口。优化为显式运行配置，
-未新增Runtime分支，不覆盖旧FAIL。
+## 当前支持契约
 
-## 已实现的运行语义
+logical L用于RoPE、sampling和原token/hash chain，physical E用于实际allocation、
+KV slot和attention长度。Scheduler持有canonical E和Block对象，Worker持有执行镜像。
+回收在post-forward/maintenance完成边界执行，GPU写入完成后才commit row/E、
+free removed blocks；后续请求真实复用原生Pool中的页。
 
-logical L用于RoPE、sampling和原token/hash chain；physical E用于attention
-长度、KV slot和allocator实际需求。回收只选择已完成prefill的decode请求，
-统一current-member升序KeepPlan，所有层/head使用同一保留集合。整页计划只改
-row，token计划由Stable CTA Triton原地压紧。Worker完成后Scheduler才提交
-canonical row/E并将removed Block对象归还原生Pool；不会以NVML下降代替释放证据。
+feature-on明确拒绝所有 `resumable=True` 和streaming-input，包括retention=1。
+`Scheduler.add_request` 在入队、分配或session mutation前失败；`AsyncLLM.add_request`
+在消费输入、注册输出或发送请求前清晰报错。feature-off保留原生能力。
+preempt释放KV、清零L/E后recompute仍受支持，与保留KV的streaming session重入不同。
+具体调用链与owner见 [m1-runtime](../source-analysis/m1-runtime.md)。
 
-allocation miss连接到确定性候选、真实页收益、bounded headroom与一次deferred
-retry；无可行收益后沿用native fallback。SinkRecent、Random与TriAttention-inspired
-shared scoring均集成真实Runtime；Tri使用离线完整GQA query-head统计，不能称为
-原论文per-head方案复现或无损压缩。
+当前Gate覆盖MRV2、单在途、BF16、FA2/NHD/B16、单dense full-attention group、
+generate runner。SinkRecent、Random、TriAttention-inspired shared scoring接入真实
+Runtime；Prefix保护完整共享页，Graph消费持久physical buffer，TP2等待全rank完成，
+dense DP2保持本地Pool和原生affinity。各组合只以实际轨迹为准。
 
-Prefix保护完整共享页，mutation前撤销私有suffix全部hash aliases；Graph使用
-持久row/E缓冲与图外回收。TP2先全局distinct-KV评分、rank0统一计划，各rank本地
-压紧后经过全组完成边界才释放。dense DP2保留两个独立Pool与原生请求affinity，
-空闲peer页不计入本地预算，不迁移active请求。
+Async scheduling/spec/connector、PP/DCP/PCP、SWA/hybrid、非标准位置偏置、
+fine-grained shared partial page、prefill-time回收及TP2×DP2未获支持或未验证。
+不由独立Gate推断全组合通过，也不改变原设计的治理状态或生产默认配置。
 
-## 证据入口
+## 当前性能与质量边界
 
-| 阶段 | 证据与结论 | 报告 |
+SLO保持 **TTFT ≤ 2s 且 TPOT ≤ 80ms**：
+
+- TP eager开销0.868%只支持本机CPU20/21、short/eager、8GiB/rank、batch2048的
+  ABBA有限样本预算通过。历史无绑核14.33%/6.871%仍为FAIL，不外推默认放置。
+- TP pressure batch1024为17/24、零抢占，七个TTFT超标，SLO仍FAIL。
+- DP skewed batch512为24/24，只覆盖本机CPU20/21、固定6/2路由及对应配置。
+  历史batch2048的18/24保留FAIL，不归因为router改进或跨池共享。
+
+历史M2/Prefix压力FAIL、TP其他配置FAIL、Graph/TP旧profile PARTIAL均保留在
+各自报告。新profile完整不追溯改变旧记录；diagnostic/profile不并入正式吞吐。
+累计归还blocks可包含同一页多次复用，不等于唯一物理页数或同时新增容量。
+
+85条质量样本保持冻结，只是探索性结果，未证明有损质量保持。
+token一致性或按KeepPlan搬移正确不能替代质量保证。本轮未扩大模型、质量或性能矩阵；
+O1–O3的证据判断与停止理由见 [本次修复报告](closeout-fixes.md)。
+
+## 实现与证据导航
+
+| 范围 | 源码学习入口 | 实验事实与历史负结果 |
 | --- | --- | --- |
-| M0 | 环境/数据审计、native baseline、真实allocator与CPU scalar oracle，28 tests | `m0.md` |
-| M1 | 真实整页/token释放与重写、重复回收、EOS/abort/q0/maintenance/preempt/fail-stop，42 tests | `m1.md` |
-| M2 | 真实miss/一次重试/回收、离线校准与shared scorer、85样本质量与HTTP压力评测 | `m2-pressure.md`、`m2-scoring.md`、`m2-evaluation.md` |
-| Prefix | 完整页APC保护/取消发布/真实hit及reuse，独立正确性PASS；12组Serving按配置判定 | `prefix.md`、`prefix-serving.md` |
-| Graph | 七条8B轨迹、FULL/PIECEWISE与Prefix组合，独立正确性PASS；17组Serving | `graph.md`、`graph-serving.md` |
-| TP | 11条8B轨迹、真实NCCL distinct-GQA/stable ties与23项回归PASS；12组Serving | `tp.md`、`tp-serving.md` |
-| DP | 双Engine局部压力/重写/abort与peer逐token对照PASS；10组正式Serving与5条独立诊断完成，含宽松池零评分/回收链 | `dp.md`、`dp-serving.md` |
-| 功能收尾 | 支持范围修复、普通decode融合、TP/DP回归、新完整profile；TP eager ABBA合并开销6.871%，仍为性能FAIL | `final-review.md` |
-| 性能收尾 | 同服务CPU交叉干预定位放置影响；本机绑核TP eager开销0.868% PASS；DP skewed batch512达SLO；TP压力17/24，保留FAIL | `performance-followup.md` |
+| M0 / native与allocator | [m0-call-chain](../source-analysis/m0-call-chain.md) | [m0](m0.md) |
+| M1 / L/E、搬移、completion、reuse | [m1-runtime](../source-analysis/m1-runtime.md) | [m1](m1.md) |
+| M2 / pressure与多策略评分 | [m2-pressure](../source-analysis/m2-pressure.md)、[m2-scoring](../source-analysis/m2-scoring.md) | [pressure](m2-pressure.md)、[scoring](m2-scoring.md)、[质量与Serving](m2-evaluation.md) |
+| Prefix / P与hash ownership | [prefix-runtime](../source-analysis/prefix-runtime.md) | [正确性](prefix.md)、[Serving](prefix-serving.md) |
+| Graph / active bounds与padding | [graph-runtime](../source-analysis/graph-runtime.md) | [正确性](graph.md)、[Serving](graph-serving.md) |
+| TP / distinct-GQA与全rank完成 | [tp-runtime](../source-analysis/tp-runtime.md) | [正确性](tp.md)、[Serving](tp-serving.md) |
+| DP / 本地页池与affinity | [dp-runtime](../source-analysis/dp-runtime.md) | [正确性](dp.md)、[Serving](dp-serving.md) |
+| 历史功能与性能收尾 | [final-review](final-review.md) | [performance-followup](performance-followup.md) |
+| 本次R1/R2/D1–D4 | [独立Review基准](independent-closeout-review.md) | [closeout-fixes](closeout-fixes.md) |
 
-性能优化使用CUDA Events、NSYS与NCU。固定36层/8 KV heads/D128/B16的32K
-half-retention compaction约18.39→3.66ms，寄存器128→56，无compiler spill；
-32K完整shared scoring plan约184.14→8.44ms。仅描述相同shape的microbenchmark，
-不外推为Serving加速倍数。资源/occupancy/grid与短shape限制见上述原始报告。
+本页只维护当前结论和导航；[status](../plans/status.md) 维护当前状态与未决项，
+reports保存实验事实与历史负结果，notes保存协议，source-analysis解释当前调用链、
+状态所有者和invariant。历史plan只指向结果，不重复维护实验数表。
 
-## 未通过的预算与支持边界
-
-质量评测为85条探索性配对样本。Full/Sink/Random/Tri target-contained分别
-45/41/39/44，不足以证明质量保持；中文QA四策略均0/2。正式HTTP是合成压力
-探针，不把有损后tokens/s提升当作等量计算或生产质量保证。
-
-Prefix的3/1.5GiB、M2的1.5GiB尾延迟未满足既定SLO。TP的short/eager noop
-历史吞吐开销14.33%；收尾改动后ABBA两对分别13.187%与0.607%，全部合并6.871%，
-该历史配置超过5%预算，不能挑选后一组宣布修复；旧压力配置虽降低preemption，Goodput仍为0。
-TP宽松long配置也只有18/24请求达SLO，不能将noop吞吐预算PASS当作全部延迟通过。
-Graph/TP历史各一条NSYS缺少graph GPU span，原记录继续标PARTIAL；收尾使用
-flush interval0补采，274/424个graph spans及TP全部collective spans匹配完整。
-TP eager的额外小kernel已融合；后续同服务CPU干预确认慢档随CPU1放置变化，
-CPU20/21放置的全部ABBA轮合并开销0.868%，12对输出相同。底层driver/IRQ/SMT
-机制未完全拆分，不声称仅kernel改动消除了旧14.33%或默认放置普遍达标。
-压力Sink新配置为CPU20/21+batch1024，吞吐100.917tokens/s、Goodput0.5584req/s、
-零抢占；三轮17/24达SLO，7个TTFT失败，仍为性能FAIL。
-DP native压力下三种有损策略均24/24达SLO，Sink的preemption三轮570→0、
-吞吐22.40→109.25tokens/s；原batch2048人工skewed Sink仅18/24达标，性能FAIL。
-DP skewed后续CPU20/21+batch512配置三轮24/24达SLO，零抢占，吞吐125.392tokens/s、
-Goodput0.9796req/s；原batch2048的18/24继续保留为历史FAIL。
-DP native/noop两档共48个请求输出逐token相同，宽松noop开销约0；未新增routing
-hint或把两个Pool的free合并为全局预算。各结论仅适用于对应报告中的固定负载。
-
-实现与Gate只覆盖既定MRV2、BF16、FA2/NHD/B16、单full-attention group与单在途
-配置。Async/spec/connector、PP/DCP/PCP、SWA/hybrid、fine-grained shared partial
-page、prefill-time回收及非标准位置偏置不从当前Gate推断支持。TP2×DP2与全量
-组合笛卡尔矩阵未执行。必要Prefix+Graph、Prefix+TP、Graph+TP及三项smoke的
-具体证据见对应报告。各独立Gate不自动改变v8设计的治理状态或生产默认配置。
-
-## 最终核验与可复现入口
-
-DP汇总器`../scripts/summarize_dp_serving.py`直接读取原始请求、原生路由、metrics、
-scheduler/allocator trace及guard结果，重算三轮聚合/逐副本指标、输出一致性与
-无压力零回收。`serving-summary.json`的PASS仅表示证据完整性和native/noop
-输出一致，不能覆盖上述性能FAIL；`correctness-summary.json`保留两条通过轨迹
-及一次已定位并重跑的诊断断言失败。大型原始产物均未加入Git。
-
-DP复现使用`../scripts/run_dp_serving.sh`，局部ownership轨迹命令见`dp.md`。
-质量评测入口`../scripts/quality_reclamation.py`随最终交付补入版本管理，沿用
-原M2实验保存的85样本配对协议。原脚本SHA与四组实验快照一致；提交钩子要求
-将`import re`改为`import regex as re`，对原始340条答案回放核对归一化与三个
-质量指标保持一致，未重新下载数据或改变既有结果。
-
-最终离线核验重算DP汇总后，两份summary的SHA保持不变；报告的10行聚合、20行
-逐副本、10行路由与10行诊断表逐格核对通过。记录位于DP产物根目录的
-`delivery-summary-verification.log`和`delivery-verification.json`。
-提交检查命令为`.venv/bin/python -m pre_commit run`；ruff、Markdown、mypy3.10、
-shell及其余适用钩子的通过结果保存在`delivery-pre-commit-rerun.log`；首次失败
-日志`delivery-pre-commit.log`保留了上述`re`导入问题。
-
-本轮功能收尾另有154项相关测试通过；整个上游suite受离线模型配置资源限制，
-失败和排除范围详见`final-review.md`。最终staged文件的全部适用pre-commit钩子
-通过（含mypy3.10），日志为`Review/final-review-pre-commit.log`；
-`git diff --check`通过。
-
-功能收尾的支持范围、冗余校验审查、Triton落地与TP/DP回归见final-review。
-性能配置、回收诊断及汇总入口见performance-followup。保留项为上述性能FAIL和未测
-组合；质量保持未证明，按用户最新要求不再扩大评测。
-不将固定路线执行到DP等同于所有预算通过。项目GPU进程已退出；同机其他用户
-任务保留。
+本次必要CPU回归28项通过，未执行GPU continuation；先前扩大选择时的上游fixture/
+async插件失败及适用静态检查均在 [closeout-fixes](closeout-fixes.md) 单独记录。
+旧154项、GPU轨迹、microbenchmark和完整profile仍按原报告范围使用，不并入本轮测试数。

@@ -2317,6 +2317,10 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if self.reclamation_config is not None and request.resumable:
+            raise ValueError(
+                "KV reclamation does not support resumable requests or streaming inputs"
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)

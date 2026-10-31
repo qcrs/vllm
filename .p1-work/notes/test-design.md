@@ -1,5 +1,12 @@
 # P1 v8 测试设计
 
+## R1 resumable请求入口
+
+- 模块用途：在reclamation支持域之外拒绝保留KV的streaming生命周期。
+- I/O：`Scheduler.add_request` / `AsyncLLM.add_request` 接收resumable请求或AsyncGenerator；feature-on抛清晰错误且不改变请求、队列、Pool或前端状态，feature-off按原生session控制链执行。
+- 防止的失败：allocator按retained E分配，而session再次admission把Scheduler/Worker E设回L。
+- 最低成本层级：复用现有Scheduler/Pool fixture及完成结果helper，用64-token prompt、3个输出、16-token追加验证feature-on拒绝与feature-off暂停/重入；既有AsyncLLM suite只检查消费/注册之前的入口失败，用 `asyncio.run`，不依赖新增异步插件。CPU完成helper不证明GPU completion或payload。
+
 ## Graph capture / replay
 
 - 模块用途：让原生模型 graph 读取持久 physical attention lengths，保留 logical RoPE/sampling 输入。

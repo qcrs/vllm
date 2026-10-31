@@ -9,9 +9,11 @@ Serving性能独立报告，不以源码推导或诊断同步hook代替性能实
 重置1、rank重置0，分别构造`EngineCoreProc(engine_index=dp_rank)`。每个进程各有
 Scheduler/KVCacheManager/BlockPool，MRV2 `dp_size=1`，不进入MoE DP padding同步。
 TP group每replica size1，回收代码的TP score/plan/completion通信分支均不执行。
-源码入口为`vllm/v1/engine/core_client.py:109`的client factory、
-`vllm/v1/engine/core.py:1287`的dense拆分和
-`vllm/v1/worker/gpu/kv_reclamation.py:122`的本地reclaim。
+源码入口为
+[`EngineCoreClient.make_async_mp_client`](../../vllm/v1/engine/core_client.py)、
+[`EngineCoreProc.run_engine_core`](../../vllm/v1/engine/core.py) 的dense拆分和
+[`KVReclamationWorker.reclaim`](../../vllm/v1/worker/gpu/kv_reclamation.py)。
+以symbol定位；旧 `kv_reclamation.py:122` 已落在内部计划分支，不能作为reclaim入口。
 
 `DPLBAsyncMPClient.get_core_engine_for_request`只在新请求ADD时选择replica：
 显式`request.data_parallel_rank`优先；否则按waiting*4+running最小值，轮换tie起点，
@@ -22,9 +24,14 @@ abort按该映射分组发向原engine，finished后删除映射。原生内部�
 HTTP completion从`X-data-parallel-rank` header取得显式rank，原生默认不返回replica
 编号。逐replica测量需要在诊断server入口记录原生router的返回值并关联request ID；
 该观测不改选择算法，也不把free摘要加入安全预算。原生Prometheus已有engine标签。
-HTTP入口在`vllm/entrypoints/openai/completion/serving.py:156`，路由与abort分别在
-`vllm/v1/engine/core_client.py:1413`和`:1533`；诊断server为
-`../scripts/dp_server.py`，独立CLI不改生产入口。
+HTTP调用入口为
+[`OpenAIServingCompletion._create_completion`](../../vllm/entrypoints/openai/completion/serving.py)，
+header解析由
+[`GenerateBaseServing._get_data_parallel_rank`](../../vllm/entrypoints/generate/base/serving.py)
+拥有；路由与abort分别为同一
+[`DPLBAsyncMPClient`](../../vllm/v1/engine/core_client.py) 的
+`get_core_engine_for_request` 和 `abort_requests_async`。诊断server为
+[dp_server.py](../scripts/dp_server.py)，独立CLI不改生产入口。
 
 `KVCacheTrace`只有time/request/Pool字段，未含replica身份。DP诊断按保留的
 `data_parallel_index`写独立replica目录，包含GPU UUID/PID、scheduler与payload

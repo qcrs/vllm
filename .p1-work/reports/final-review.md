@@ -1,5 +1,11 @@
 # P1 v8 功能收尾审查
 
+本报告保留 `4ad1a03e1c` 功能审查的实验事实与判断。后续独立Review在
+`252c747ad6` 发现R1（保留KV的streaming session重入），原先的resume声明不足；
+本次已在请求入口明确拒绝该feature-on组合，详见
+[closeout-fixes.md](closeout-fixes.md)。发现时的
+[独立Review](independent-closeout-review.md) 保持原文，下文历史测试数不并入本次回归。
+
 后续性能优化见 [performance-followup.md](performance-followup.md)：同服务CPU干预
 确认主线程放置影响，CPU20/21下TP eager ABBA合并0.868% PASS；DP skewed
 batch512三轮24/24达SLO，TP压力batch1024为17/24、仍FAIL。下文保留本次功能
@@ -30,7 +36,10 @@ pooling。fixture 现明确使用 `Qwen3ForCausalLM`，模拟本项目真实生�
 
 - **L/E 分离**：模型位置、sampling、原始 token/hash chain 使用 L；physical
   attention、slot、allocation 使用 E。新 kernel 一次生成两套输入，prepare 不推进 E。
-  postprocess 才推进 GPU E，CPU mirror 同步推进，prefill/resume 使用原生初始化。
+  postprocess 才推进 GPU E，CPU mirror 同步推进；fresh/APC prefill和preempt后
+  清空L/E的recompute使用原生初始化。保留KV的streaming session不满足该前提，
+  feature-on现在由 `Scheduler.add_request` 拒绝；`AsyncLLM.add_request` 提前报错，
+  feature-off保留原生能力。
 - **完成与释放**：回收先完成 sampling/postprocess，再更新 payload/row/E；
   AsyncOutput 的 event 或 maintenance event 覆盖写入。Scheduler 收到成功 ACK
   后才提交 canonical Block 对象与 free。source/ownership 检查位于破坏性状态交接处，
@@ -50,6 +59,7 @@ pooling。fixture 现明确使用 `Qwen3ForCausalLM`，模拟本项目真实生�
 BF16、FA2/NHD/B16、单 dense full-attention group、生成 runner；TP1/2、dense DP2
 与 Prefix/Graph 的具体组合以各报告实际用例为准。TP2×DP2、async/spec/connector、
 PP/DCP/PCP、prefill-time 回收、fine-grained shared partial page 均未新增支持。
+feature-on明确拒绝resumable/streaming-input；这与preempt/recompute可重新初始化E的契约不同。
 
 ## Triton 已调优并进入 Runtime
 

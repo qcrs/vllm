@@ -54,21 +54,31 @@ def pressure_scheduler(tmp_path, monkeypatch):
     Qwen3Config(architectures=["Qwen3ForCausalLM"]).save_pretrained(model_path)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
 
-    def create(num_blocks, reserve=0, enable_prefix_caching=False, **kwargs):
+    def create(
+        num_blocks,
+        reserve=0,
+        enable_prefix_caching=False,
+        enable_reclamation=True,
+        **kwargs,
+    ):
         return create_scheduler(
             model=str(model_path),
             num_blocks=num_blocks,
             max_num_batched_tokens=256,
             use_v2_model_runner=True,
             enable_prefix_caching=enable_prefix_caching,
-            reclamation_config={
-                "pressure": True,
-                "min_keep_tokens": 16,
-                "sink_tokens": 0,
-                "recent_tokens": 0,
-                "reserve_cap": reserve,
-                **kwargs,
-            },
+            reclamation_config=(
+                {
+                    "pressure": True,
+                    "min_keep_tokens": 16,
+                    "sink_tokens": 0,
+                    "recent_tokens": 0,
+                    "reserve_cap": reserve,
+                    **kwargs,
+                }
+                if enable_reclamation
+                else None
+            ),
         )
 
     return create
@@ -103,6 +113,47 @@ def complete_pressure_step(scheduler, output):
             reclaim_result=result,
         ),
     )
+
+
+@pytest.mark.parametrize("enable_reclamation", [True, False])
+def test_reclamation_resumable_admission(pressure_scheduler, enable_reclamation):
+    """Reject before enqueue; feature-off retains KV across streaming chunks."""
+    scheduler = pressure_scheduler(32, enable_reclamation=enable_reclamation)
+    request = create_requests(1, num_tokens=64, max_tokens=3, req_ids=["A"])[0]
+    request.resumable = True
+    manager = scheduler.kv_cache_manager
+    free_before = manager.block_pool.get_num_free_blocks()
+
+    if enable_reclamation:
+        with pytest.raises(ValueError, match="does not support resumable requests"):
+            scheduler.add_request(request)
+        assert not scheduler.requests
+        assert scheduler.get_request_counts() == (0, 0)
+        assert request.streaming_queue is None
+        assert request.num_computed_tokens == request.effective_kv_len == 0
+        assert manager.block_pool.get_num_free_blocks() == free_before
+        return
+
+    scheduler.add_request(request)
+    for _ in range(3):
+        complete_pressure_step(scheduler, scheduler.schedule())
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.num_computed_tokens == 66
+    row_before = manager.get_block_ids("A")[0].copy()
+    assert len(row_before) == 5
+
+    update = create_requests(1, num_tokens=16, max_tokens=8, req_ids=["A"])[0]
+    update.resumable = True
+    scheduler.add_request(update)
+    assert request.num_prompt_tokens == 82
+    assert manager.get_block_ids("A")[0] == row_before
+    output = scheduler.schedule()
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 66
+    assert output.num_scheduled_tokens == {"A": 16}
+    assert len(manager.get_block_ids("A")[0]) * 16 >= 82
+    complete_pressure_step(scheduler, output)
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens == 82
 
 
 def test_reclamation_apc_hit_initializes_effective_length(pressure_scheduler):

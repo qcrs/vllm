@@ -1,5 +1,10 @@
 # P1 v8 性能继续优化
 
+本计划已执行，实验事实和负结果见
+[performance-followup报告](../reports/performance-followup.md)；当前状态见
+[status](status.md)。本次独立Review限定收尾对O1–O3的停止判断见
+[closeout-fixes](../reports/closeout-fixes.md)，不从本历史计划重新启动性能实验。
+
 授权为用户在功能收尾提交 `4ad1a03e1c` 后要求继续优化 TP eager 与压力 SLO。
 保持模型、环境、GPU guard、负载、SLO 与历史证据；不新增任务质量评测。
 

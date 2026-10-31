@@ -300,6 +300,19 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise EngineDeadError()
 
+        if isinstance(prompt, AsyncGenerator) or (
+            isinstance(prompt, EngineCoreRequest) and prompt.resumable
+        ):
+            additional_config = self.vllm_config.additional_config
+            if (
+                isinstance(additional_config, dict)
+                and additional_config.get("kv_reclamation") is not None
+            ):
+                raise ValueError(
+                    "KV reclamation does not support resumable requests "
+                    "or streaming inputs"
+                )
+
         is_pooling = isinstance(params, PoolingParams)
 
         if (

@@ -1,28 +1,38 @@
-# P1 v8 执行状态
+# P1 v8 当前状态与未决项
 
-授权入口是 `.p1-work/prompts/prompt1.md` 与本次用户 Long-Running Goal，覆盖原reference的review-only身份。
-不升级核心环境、不修改学习基线、不移植旧Runtime、不创建上游PR。
+2026-10-31，限定收尾基于 `252c747ad6` 的独立Review执行。
+原始环境和工程约束见 [prompt1](../prompts/prompt1.md)；本次范围以用户限定修复要求
+和Review为准，未重启M0→DP。当前结论导航为 [delivery](../reports/delivery.md)，
+逐项修改和验证为 [closeout-fixes](../reports/closeout-fixes.md)。
 
-| 阶段 | 状态 | 证据与限制 |
+## 当前状态
+
+| 范围 | 状态 | 当前结论 |
 | --- | --- | --- |
-| M0 | PASS | Native/trace identity、真实 allocator miss/free、CPU oracle、完整本地数据审计完成；28 tests passed |
-| M1 | PASS | Whole/token live reuse、重复回收、FP32 Attention、EOS/abort/maintenance/preempt/q0/fail-stop、42 tests、优化及NCU/NSYS完成；见reports/m1.md |
-| M2 | PASS | 压力控制16tests/5条8B轨迹；Tri校准/3评分tests/重复reuse及NCU优化；四策略85样本质量评测；五策略在6 GiB与1.5 GiB下的真实HTTP Serving对照均完成，详见reports/m2-pressure.md、reports/m2-scoring.md、reports/m2-evaluation.md |
-| Prefix | PASS | 完整页APC正确性、23项针对性tests及prefix全92项通过；12组HTTP对照/两条诊断完成：8 GiB noop开销0.68%满足预算，6 GiB Sink延迟/Goodput预算PASS，3/1.5 GiB因TTFT超预算性能FAIL；96个Native/noop输出相同；见reports/prefix.md、reports/prefix-serving.md |
-| Graph | PASS | 7条8B轨迹覆盖whole/token、FULL/PIECEWISE与Prefix；17组HTTP、84个native/noop输出相同；8 GiB noop开销0.63%、1.5 GiB有损SLO通过；旧profile缺1个span保留PARTIAL，收尾新profile274个graph spans全匹配；见reports/graph.md、graph-serving.md、final-review.md |
-| TP | PASS（正确性） | 11条原8B轨迹及收尾组合/q0/maintenance慢rank回归PASS；FULL noop开销≤5%；short/eager历史无绑核14.33%/6.871% FAIL保留，本机CPU20/21的ABBA合并0.868% PASS、12对输出相同；压力Sink batch1024三轮17/24、零抢占，SLO仍FAIL；新profile424个graph spans及162个collective spans完整；见reports/performance-followup.md、tp-serving.md、final-review.md |
-| DP | PASS（正确性） | 两条8B双Engine局部压力/abort轨迹PASS；8页由C全层重写，peer128输出相同、abort后112次验证forward；原10组HTTP/5条诊断完成，48个native/noop输出相同；native压力三种有损策略24/24达SLO；skewed Sink历史18/24 FAIL保留，本机CPU20/21+batch512三轮24/24、零抢占，SLO PASS；见reports/performance-followup.md、dp-serving.md |
+| R1请求生命周期 | PASS | feature-on在入口拒绝resumable/streaming-input，feature-off的pause→append→admission控制链通过；preempt清L/E后recompute保留 |
+| R2、D1–D4 | PASS | Graph有效范围解释、生命周期声明、M2阶段快照、源码导航与文档职责已同步 |
+| 必要行为回归 | PASS | 28项CPU测试通过；不代表GPU continuation或payload验证 |
+| M0→DP既有实现与Gate | 已执行 | 只按各阶段报告的配置/正确性范围交付；历史记录见delivery导航，不重跑矩阵 |
+| O1–O3 | NOT_RUN | 已评估现有证据，本次未新增性能实验或Runtime优化；停止依据见closeout-fixes |
 
-必要组合：Prefix+Graph、Prefix+TP、Graph+TP、Prefix+Graph+TP smoke；不以独立Gate推断组合通过。
-所有模型实验统一Qwen3-8B BF16；单卡只用物理GPU1，TP2/DP2才用0,1，项目显存合计≤45GiB。
-大产物在 `/data_ssd/qcrs/experiments/p1-v8`。保留负结果，状态只在实际对应验证后更新。
+feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按computed length初始化E；
+保留有损KV的streaming重入不在契约内。MRV2/BF16/FA2/NHD/B16、单group、单在途与
+实际Prefix/Graph/TP/DP组合的边界见delivery。现有ownership、hash保护、source row/E、
+结果身份、全rank completion、AsyncOutput/maintenance等待与mutation后fail-stop均保留。
 
-完整M0→M1→M2→Prefix→Graph→TP→DP实施与验证已执行到末阶段，
-交付入口为`../reports/delivery.md`。各阶段PASS只适用于对应报告的实现/正确性
-范围；Serving按配置分别判定。M2/Prefix部分压力SLO、TP压力SLO仍为FAIL；
-TP eager与DP skewed在上述显式调优配置下PASS，历史默认配置FAIL不覆盖。
-CPU1/49底层慢因尚未精确拆分，不声称任意CPU放置或主机都通过；
-Graph/TP旧profile仍PARTIAL，新代表性补采完整。
-有损质量未证明保持，按用户最新要求不再扩大质量评测；不将独立Gate推断为全部
-组合或所有配置性能通过。功能缺陷、过度校验和Triton review详见
-`../reports/final-review.md`，包含本轮支持范围修复和普通decode热路径精简。
+## 明确保留的缺口
+
+- TP pressure仍因TTFT不满足既定SLO；继续追求该目标时，先关联enqueue、首次schedule、
+  prefill完成与reclaim完成，分解host/GPU/通信成本，再选择修法。
+- TP eager只在本机显式CPU放置和对应short/eager配置下通过预算；默认放置及CPU1/49
+  微观慢因未普遍解决。DP skewed只在固定6/2路由和对应配置下通过。
+- M2/Prefix/TP/DP历史性能FAIL及Graph/TP旧profile PARTIAL保留，详见各report；
+  SLO仍为TTFT≤2s且TPOT≤80ms，不因完成路线到DP改为全PASS。
+- TriAttention完整Runtime评分/normalization/selection/launch收益与decode metadata构造
+  的代表性净收益未量化；未增加融合、noop旁路、backend、dispatcher或DP跨池机制。
+- 85条质量样本冻结，有损质量保持未证明；token/payload正确不替代质量保证。
+  TP2×DP2、async/spec/connector及其余未测组合不扩张。
+- 完整上游suite受既有离线资源和fixture/插件条件限制；具体失败分列于历史final-review和
+  本次closeout-fixes，不安装升级依赖或下载替代模型。
+
+R1已封口、必要回归通过后，本次限定功能收尾完成。后续只在明确新目标或新证据下重开。

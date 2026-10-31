@@ -10,6 +10,7 @@ import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.output_processor import RequestOutputCollector
 
@@ -38,6 +39,42 @@ def mock_async_llm():
     llm.generate = AsyncLLM.generate.__get__(llm, AsyncLLM)
 
     return llm
+
+
+@pytest.mark.parametrize("core_request", [False, True])
+def test_reclamation_rejects_streaming_before_frontend_state(
+    mock_async_llm, core_request
+):
+    """Fail before consuming input or registering a request in the frontend."""
+    mock_async_llm.vllm_config.additional_config = {"kv_reclamation": {}}
+    params = SamplingParams(max_tokens=3, output_kind=RequestOutputKind.DELTA)
+    consumed = False
+
+    async def inputs():
+        nonlocal consumed
+        consumed = True
+        yield StreamingInput(prompt="Hello")
+
+    prompt = (
+        EngineCoreRequest(
+            request_id="A",
+            prompt_token_ids=[0] * 64,
+            mm_features=None,
+            sampling_params=params,
+            pooling_params=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            resumable=True,
+        )
+        if core_request
+        else inputs()
+    )
+    with pytest.raises(ValueError, match="does not support resumable requests"):
+        asyncio.run(AsyncLLM.add_request(mock_async_llm, "A", prompt, params))
+    assert not consumed
+    assert not mock_async_llm.mock_calls
 
 
 @pytest.mark.asyncio

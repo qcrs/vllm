@@ -23,6 +23,24 @@ feature-off 的可选 tensor 参数为 None，由 Triton specialization 删除�
 `finish_requests` 同时移除 preempted 的 Worker state，恢复的 Request 经 `add_requests`
 重新建立 E；Scheduler `_preempt_request` 将 L/E 一起清零，再由原生 prefill 重算。
 
+这里的恢复仅指preempt后的新重算生命周期，fresh/APC admission也没有保留有损KV。
+保留KV的streaming session则经 `_handle_stopped_request` 暂停、
+`_update_request_as_session` 追加输入，L/E并未清零；不能套用fresh初始化。
+独立Review R1已复现该误放行，修复记录见 [closeout-fixes](../reports/closeout-fixes.md)。
+
+当前请求契约由
+[`Scheduler.add_request`](../../vllm/v1/core/sched/scheduler.py) 拥有：
+feature-on拒绝所有 `resumable=True`，包括retention=1，在创建streaming queue、
+入队或修改既有session之前抛出 `ValueError`。Worker不会收到这种请求，因此其
+new-request E仍可从fresh/APC/recompute的computed length初始化。
+[`AsyncLLM.add_request`](../../vllm/v1/engine/async_llm.py) 是必要的公共前端入口，
+在消费AsyncGenerator、注册OutputProcessor或发送EngineCoreRequest之前，同样拒绝
+streaming-input及直接传入的resumable EngineCoreRequest。仅在Scheduler拒绝会让
+异步ADD异常离开EngineCore busy loop，前端得到EngineDead；前端检查用于清晰报错，
+Scheduler检查则覆盖直接调用及其他客户端。allocation/session/Worker不重复加guard。
+feature-off保留原生streaming能力；本次CPU回归验证pause→append→admission的真实Pool
+控制链，不声称证明GPU continuation或payload正确性。
+
 收尾的配置检查要求 generation runner；pooling不经过上述postprocess，不能继承
 E生命周期。`FullAttentionSpec`还可能含sliding/chunk/non-causal语义，需显式拒绝；
 Worker初始化检查实际FA impl的ALiBi，因为其bias按物理距离计算，不能靠旧K中的

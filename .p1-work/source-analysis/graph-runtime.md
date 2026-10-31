@@ -21,8 +21,19 @@ resident-request-index域的 staged effective lengths。原生 `prepare_pos_seq_
 边界同时推进 GPU L/E；`advance` 只推进实际请求的 CPU E mirror，padding不参与。
 
 `BlockTables` 原生持有 resident rows、gather后的 input rows、slot mappings。
-回收覆盖 resident row 后清旧 active tail；下轮按新 mapping gather 到同一 input row
-storage，并由 physical positions 构造 slot。此处没有新 row buffer 或 graph registry。
+[`BlockTables.append_block_ids`](../../vllm/v1/worker/gpu/block_table.py) 在
+`overwrite=True` 时只覆盖新 row 的有效 prefix，并缩小 `num_blocks`；不清除 resident
+row 的旧 tail。`_gather_block_tables_kernel` 也只复制当前 `num_blocks` 个 ID 到
+持久 input row，真实请求的无效 tail 可以保留旧值；只有 padded request row 整行清零。
+
+旧 tail 不可寻址依赖有效范围：下轮 allocator 先保证至少 `ceil((E+q)/B)` 页，
+[`prepare_pos_seq_lens`](../../vllm/v1/worker/gpu/input_batch.py) 生成
+`cache_positions=E+offset` 和 `kv_seq_lens=E+q`。slot kernel 按真实 query 范围写入，
+attention 按 physical seq_lens 读取，不能访问有效页外的旧 ID；slot kernel 本身不另查
+`num_blocks`，所以 allocator/E 一致性是必要前提。padding lengths 置0、padding slots
+置无效值，与真实 row tail 的保留是两种语义。无需清零旧 ID 或 payload。
+已有 released-page poison、C全层重写和A下一 replay 的证据见
+[Graph报告](../reports/graph.md)；本次R2仅静态核对这些 bounds，没有重跑GPU。
 
 ## 已捕获引用缺陷及修复
 
@@ -42,7 +53,8 @@ CPU测试在原 compaction suite 验证两次dummy内容刷新、相同地址、
 
 ## metadata与上界
 
-`model_states/default.py::prepare_attn` 在FULL/breakable PIECEWISE使用 padded范围，
+[`DefaultModelState.prepare_attn`](../../vllm/v1/worker/gpu/model_states/default.py)
+在FULL/breakable PIECEWISE使用 padded范围，
 Runtime max_seq_len 来自physical CPU upper bounds；`attn_utils.build_attn_metadata`
 继续走原backend builder。FA2在本A100使用普通varlen接口，FA3的persistent scheduler
 metadata与tail clearing虽沿原生链，但本硬件没有验证FA3。
