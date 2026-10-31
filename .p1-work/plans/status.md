@@ -10,8 +10,8 @@
 | M2 | PASS | 压力控制16tests/5条8B轨迹；Tri校准/3评分tests/重复reuse及NCU优化；四策略85样本质量评测；五策略在6 GiB与1.5 GiB下的真实HTTP Serving对照均完成，详见reports/m2-pressure.md、reports/m2-scoring.md、reports/m2-evaluation.md |
 | Prefix | PASS | 完整页APC正确性、23项针对性tests及prefix全92项通过；12组HTTP对照/两条诊断完成：8 GiB noop开销0.68%满足预算，6 GiB Sink延迟/Goodput预算PASS，3/1.5 GiB因TTFT超预算性能FAIL；96个Native/noop输出相同；见reports/prefix.md、reports/prefix-serving.md |
 | Graph | PASS | 7条8B轨迹覆盖whole/token、FULL/PIECEWISE与Prefix；17组HTTP、84个native/noop输出相同；8 GiB noop开销0.63%、1.5 GiB有损SLO通过；NSYS时间窗完整但缺1个GPU graph span，成本有PARTIAL限制；见reports/graph.md、graph-serving.md |
-| TP | TO_VERIFY | 全局distinct KV/GQA评分/统一plan、all-rank completion、延迟rank/reuse |
-| DP | NOT_RUN | native dense双replica/pool/affinity，局部压力隔离、aggregate/per-replica指标 |
+| TP | PASS（正确性） | 11条8B轨迹含q0/maintenance、组合、慢rank与fail-stop；两卡GQA/ties及23项回归PASS；12组HTTP中FULL noop开销≤5%，short/eager开销14.33%与压力SLO性能FAIL；通信profile缺1个graph span，见reports/tp.md、tp-serving.md |
+| DP | TO_VERIFY | 协议与诊断脚本已准备，进入native dense双replica/pool/affinity、局部压力隔离与aggregate/per-replica实测 |
 
 必要组合：Prefix+Graph、Prefix+TP、Graph+TP、Prefix+Graph+TP smoke；不以独立Gate推断组合通过。
 所有模型实验统一Qwen3-8B BF16；单卡只用物理GPU1，TP2/DP2才用0,1，项目显存合计≤45GiB。

@@ -7,6 +7,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
+from vllm.distributed import get_tp_group
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_reclamation import (
     ReclaimRequest,
@@ -43,12 +44,19 @@ class KVReclamationWorker:
         self.effective_kv_len_np = np.zeros(req_states.max_num_reqs, dtype=np.int32)
         self.cache_positions = torch.zeros_like(input_buffers.positions)
         self.kv_seq_lens = torch.zeros_like(input_buffers.seq_lens)
+        self.tp_group = get_tp_group()
+        self.local_reclaim_done = torch.cuda.Event()
+        self.completion_token = torch.zeros(
+            (), dtype=torch.int32, device=req_states.device
+        )
         self.scorer = (
             TriAttentionScorer.from_file(
                 config.stats_path,
                 model_config,
                 model_config.max_model_len,
                 req_states.device,
+                self.tp_group.world_size,
+                self.tp_group.rank_in_group,
             )
             if config.policy == "triattention"
             else None
@@ -149,22 +157,34 @@ class KVReclamationWorker:
             else:
                 recent = max(prefix, source - self.config.recent_tokens)
                 if self.scorer is not None:
-                    keep = self.scorer.plan(
+                    scores = self.scorer.shared_scores(
                         self.layers,
                         block_tables.block_tables[0].gpu[idx],
                         self.req_states.num_computed_tokens.gpu[idx : idx + 1],
                         source,
-                        intent.target_keep_tokens,
                         prefix,
                         recent,
                     )
-                else:
+                    if self.tp_group.world_size > 1:
+                        torch.distributed.all_reduce(
+                            scores, group=self.tp_group.device_group
+                        )
+                elif self.tp_group.rank_in_group == 0:
                     scores = torch.rand(
                         source, device=self.req_states.device, generator=self.generator
                     )
+                if self.tp_group.rank_in_group == 0:
                     keep = protected_topk(
                         scores, intent.target_keep_tokens, prefix, recent
                     )
+                else:
+                    keep = torch.empty(
+                        intent.target_keep_tokens,
+                        dtype=torch.int32,
+                        device=self.req_states.device,
+                    )
+                if self.tp_group.world_size > 1:
+                    self.tp_group.broadcast(keep, src=0)
             self.compactor.compact(block_tables.block_tables[0].gpu[idx], keep)
             b = block_tables.block_sizes[0]
             row = intent.source_block_ids[: (intent.target_keep_tokens + b - 1) // b]
@@ -173,4 +193,10 @@ class KVReclamationWorker:
         self.effective_kv_len_np[idx] = intent.target_keep_tokens
         self.effective_kv_len.stage_write_elem(idx, intent.target_keep_tokens)
         self.effective_kv_len.apply_write()
+        self.local_reclaim_done.record()
+        if self.tp_group.world_size > 1:
+            # ProcessGroup orders NCCL after local writes and gates the ACK stream.
+            torch.distributed.all_reduce(
+                self.completion_token, group=self.tp_group.device_group
+            )
         return ReclaimResult(intent.request_id, intent.target_keep_tokens, row)

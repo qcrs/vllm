@@ -47,3 +47,14 @@
 - I/O：真实 APC lookup/touch、当前 row/refcount、forward 后 E、临时 P/K；输出完成后的 row/E、缓存连续计数、free queue 与 KV events。
 - 防止的失败：APC admission 的 Scheduler/Worker E 不一致；漏撤 suffix alias 后新增共享；deindex 当 free；非连续 shared 页被写；lossy 后沿原 logical chain 重新发布；正常 in-flight 被误判 lossy；最后引用前重用与 EOS/abort double-free。
 - 最低成本层级：扩展现有 scheduler 与 prefix-caching suite，用真实 sha256 Request/BlockPool 复现 admission、lookup/event/ownership；仅 worker completion 用 CPU result。GPU Gate 使用 Qwen3-8B 的真实 A/B/C 请求、全层 payload 比较、FP32 attention、真实 release/rewrite/reuse，另在同配置 native 与 allocation pressure 下运行。CPU 不代替 GPU completion 或 payload 证据。
+
+## TP shared plan / completion
+
+四问与完整协议见`tp-protocol.md`。在现有compaction suite加入Hkv=1/4、TP2
+贡献与独立CPU复数全query-head reference对照，覆盖复制owner保留完整GQA stats、
+非owner零贡献及全局distinct-head等权。真实两GPU通信/统一plan与payload留给
+独立小fixture和Qwen3-8B MultiprocExecutor轨迹。
+
+扩展既有executor suite验证非output rank在sample_tokens失败会退出RPC loop，
+以及AsyncOutput设备完成异常不转成可继续执行的普通FAILURE；feature关闭维持
+原生行为。真实failure注入额外证明monitor终止TP组且canonical零commit/free。

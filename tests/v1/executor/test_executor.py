@@ -5,7 +5,9 @@ import asyncio
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,9 +23,52 @@ from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
 )
+from vllm.v1.outputs import AsyncModelRunnerOutput
 
 
 class Mock: ...
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_reclamation_non_output_rank_failure_exits_rpc_loop(enabled):
+    """A rank failing before the completion collective must terminate its group."""
+    worker = multiproc_executor_module.WorkerProc.__new__(
+        multiproc_executor_module.WorkerProc
+    )
+    worker.rank, worker.reclamation_enabled = 1, enabled
+    worker.rpc_broadcast_mq = MagicMock()
+    worker.rpc_broadcast_mq.dequeue.side_effect = [
+        ("sample_tokens", (), {}, 0),
+        StopIteration("end"),
+    ]
+    worker.worker = SimpleNamespace(
+        sample_tokens=MagicMock(side_effect=RuntimeError("injected rank failure"))
+    )
+    expected = RuntimeError if enabled else StopIteration
+    with pytest.raises(expected, match="injected rank failure" if enabled else "end"):
+        worker.worker_busy_loop()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_reclamation_async_completion_failure_is_fatal(enabled):
+    class FailedOutput(AsyncModelRunnerOutput):
+        def get_output(self):
+            raise RuntimeError("device completion failed")
+
+    worker = multiproc_executor_module.WorkerProc.__new__(
+        multiproc_executor_module.WorkerProc
+    )
+    worker.reclamation_enabled = enabled
+    worker.worker_response_mq = MagicMock()
+    if enabled:
+        with pytest.raises(RuntimeError, match="device completion failed"):
+            worker.enqueue_output(FailedOutput())
+        worker.worker_response_mq.enqueue.assert_not_called()
+    else:
+        worker.enqueue_output(FailedOutput())
+        worker.worker_response_mq.enqueue.assert_called_once_with(
+            (worker.ResponseStatus.FAILURE, "device completion failed")
+        )
 
 
 def test_supports_async_scheduling_base_executor():

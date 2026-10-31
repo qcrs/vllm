@@ -96,10 +96,30 @@ def protected_topk(
 
 
 class TriAttentionScorer:
-    def __init__(self, stats: torch.Tensor, kv_heads: int, theta: float, max_len: int):
+    def __init__(
+        self,
+        stats: torch.Tensor,
+        kv_heads: int,
+        theta: float,
+        max_len: int,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        device: torch.device | None = None,
+    ):
         # [layer, statistics_head, real/imag/abs, frequency].
-        self.stats = stats
-        self.kv_heads = kv_heads
+        self.global_kv_heads = kv_heads
+        self.group = stats.shape[1] // kv_heads
+        self.kv_heads = max(1, kv_heads // tp_size)
+        replicas = max(1, tp_size // kv_heads)
+        self.scoring_owner = tp_rank % replicas == 0
+        first = tp_rank * self.kv_heads if kv_heads >= tp_size else tp_rank // replicas
+        heads = self.kv_heads if self.scoring_owner else 0
+        self.stats = (
+            stats[:, first * self.group : (first + heads) * self.group]
+            .to(device=device, dtype=torch.float32)
+            .contiguous()
+        )
+        stats = self.stats
         self.theta = theta
         self.frequencies = 1 / (
             theta
@@ -108,7 +128,6 @@ class TriAttentionScorer:
                 / stats.shape[3]
             )
         )
-        self.group = stats.shape[1] // kv_heads
         self.coefficients = torch.empty(
             (2, stats.shape[3]), dtype=torch.float32, device=stats.device
         )
@@ -118,7 +137,7 @@ class TriAttentionScorer:
         self.total = torch.empty(max_len, dtype=torch.float32, device=stats.device)
 
     @classmethod
-    def from_file(cls, path, model_config, max_len, device):
+    def from_file(cls, path, model_config, max_len, device, tp_size=1, tp_rank=0):
         payload = torch.load(path, map_location="cpu", weights_only=True)
         metadata, stats = payload["metadata"], payload["stats"]
         hf = model_config.hf_text_config
@@ -146,10 +165,13 @@ class TriAttentionScorer:
         if stats.shape != shape or not torch.isfinite(stats).all():
             raise ValueError("Frequency stats require all model layers/query heads")
         return cls(
-            stats.to(device=device, dtype=torch.float32).contiguous(),
+            stats,
             hf.num_key_value_heads,
             rope["rope_theta"],
             max_len,
+            tp_size,
+            tp_rank,
+            device,
         )
 
     def score_layer(self, cache, row, logical_length, source_len, layer):
@@ -186,7 +208,7 @@ class TriAttentionScorer:
     def shared_scores(self, layers, row, logical_length, source_len, prefix, recent):
         total = self.total[:source_len]
         total.zero_()
-        if prefix == recent:
+        if prefix == recent or not self.scoring_owner:
             return total
         self.prepare_phase(logical_length)
         for layer, cache in enumerate(layers):
@@ -197,7 +219,10 @@ class TriAttentionScorer:
             std = variance.sqrt()
             scores.sub_(mean[:, None]).div_(torch.where(std > 0, std, 1)[:, None])
             grouped = scores.view(self.kv_heads, self.group, source_len).amax(dim=1)
-            total.add_(grouped.mean(dim=0), alpha=1 / len(layers))
+            total.add_(
+                grouped.mean(dim=0),
+                alpha=self.kv_heads / (self.global_kv_heads * len(layers)),
+            )
         return total
 
     def plan(self, layers, row, logical_length, source_len, keep, prefix, recent):

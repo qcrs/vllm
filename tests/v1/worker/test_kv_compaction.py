@@ -138,6 +138,58 @@ def test_shared_frequency_zero_variance_and_stable_protection():
     assert protected_topk(scores, 7, 2, 7).tolist() == [0, 1, 2, 3, 7, 8, 9]
 
 
+@pytest.mark.parametrize("kv_heads", [1, 4])
+def test_tp_frequency_contributions_match_complete_unique_gqa_reference(kv_heads):
+    from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
+
+    generator = torch.Generator().manual_seed(142)
+    source, logical, prefix, recent, keep = 47, 17031, 3, 41, 23
+    row = torch.tensor([3, 1, 0], dtype=torch.int32, device="cuda")
+    clock = torch.tensor([logical], dtype=torch.int32, device="cuda")
+    stats = torch.randn(2, 8, 3, 64, generator=generator) * 0.2
+    stats[:, :, 2] = stats[:, :, :2].square().sum(2).sqrt() + 0.3
+    layers = [
+        torch.randn(4, kv_heads, 16, 256, generator=generator).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    ]
+    expected = []
+    for layer, cache in enumerate(layers):
+        dense, _ = scalar_retained_kv([cache.cpu()], row.tolist(), list(range(source)))
+        raw = dense_frequency_reference(dense[0], stats[layer], logical, 1e6)
+        var, mean = torch.var_mean(raw[:, prefix:recent], dim=1, correction=0)
+        normalized = (raw - mean[:, None]) / var.sqrt()[:, None]
+        expected.append(
+            normalized.view(kv_heads, 8 // kv_heads, source).amax(1).mean(0)
+        )
+    reference = torch.stack(expected).mean(0)
+    total = torch.zeros(source, device="cuda")
+    for rank in range(2):
+        scorer = TriAttentionScorer(stats, kv_heads, 1e6, 64, 2, rank, row.device)
+        local = (
+            layers
+            if kv_heads == 1
+            else [v[:, rank * 2 : (rank + 1) * 2] for v in layers]
+        )
+        contribution = scorer.shared_scores(local, row, clock, source, prefix, recent)
+        if kv_heads == 1 and rank == 1:
+            assert scorer.stats.shape[1] == 0 and contribution.count_nonzero() == 0
+        else:
+            assert scorer.stats.shape[1] == (8 if kv_heads == 1 else 4)
+        total += contribution
+    torch.testing.assert_close(total.cpu(), reference, atol=2e-3, rtol=1e-3)
+    ranked = sorted(range(prefix, recent), key=lambda i: (-float(reference[i]), i))
+    expected_plan = sorted(
+        [
+            *range(prefix),
+            *ranked[: keep - prefix - (source - recent)],
+            *range(recent, source),
+        ]
+    )
+    assert protected_topk(total, keep, prefix, recent).tolist() == expected_plan
+
+
 @pytest.mark.parametrize("whole_blocks", [False, True])
 def test_scalar_oracle_decodes_nonmonotonic_pages_and_partial_tail(whole_blocks):
     layers = []

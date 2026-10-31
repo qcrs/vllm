@@ -605,6 +605,10 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        self.reclamation_enabled = (
+            isinstance(vllm_config.additional_config, dict)
+            and vllm_config.additional_config.get("kv_reclamation") is not None
+        )
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -945,6 +949,8 @@ class WorkerProc:
             try:
                 output = output.get_output()
             except Exception as e:
+                if self.reclamation_enabled:
+                    raise
                 logger.exception("Error getting async model runner output")
                 output = e
 
@@ -1001,6 +1007,11 @@ class WorkerProc:
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(output)
             except Exception as e:
+                if self.reclamation_enabled and method in (
+                    "execute_model",
+                    "sample_tokens",
+                ):
+                    raise
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())

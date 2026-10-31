@@ -95,7 +95,7 @@ async def workload(
 ):
     results = []
     limits = httpx.Limits(max_connections=16)
-    async with httpx.AsyncClient(timeout=180, limits=limits, trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=600, limits=limits, trust_env=False) as client:
         await completion(
             client, origin, prompts[0][:32], "warmup", 8, 0, time.perf_counter()
         )
@@ -186,6 +186,7 @@ def main():
     )
     parser.add_argument("--full-warmup", action="store_true")
     parser.add_argument("--workload", choices=["long", "short"], default="long")
+    parser.add_argument("--tp", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
     if args.workload == "short" and args.prefix_caching:
         parser.error("short workload does not define shared prefix identities")
@@ -215,6 +216,8 @@ def main():
         "/data/models/Qwen3-8B",
         "--dtype",
         "bfloat16",
+        "--tensor-parallel-size",
+        str(args.tp),
         "--attention-backend",
         "FLASH_ATTN",
         "--block-size",
@@ -301,6 +304,7 @@ def main():
         "warmup": "one 32-token prompt / 8 output tokens; excluded",
         "slo": {"ttft_s": 2, "tpot_s": 0.08},
         "timing": "client token_ids stream; same-chunk tokens share receipt time",
+        "transport_timeout_s": 600,
         "quality": "synthetic serving load; quality measured separately",
         "prompt_sha256": [
             hashlib.sha256(json.dumps(prompt).encode()).hexdigest()

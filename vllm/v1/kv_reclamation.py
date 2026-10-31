@@ -53,7 +53,7 @@ class ReclamationConfig:
             or config.speculative_config is not None
             or config.kv_transfer_config is not None
             or config.scheduler_config.scheduler_reserve_full_isl
-            or parallel.tensor_parallel_size != 1
+            or parallel.tensor_parallel_size not in (1, 2)
             or parallel.pipeline_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
