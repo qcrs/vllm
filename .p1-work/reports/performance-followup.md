@@ -5,6 +5,9 @@
 Qwen3-8B BF16、物理 GPU0/1、现有依赖及 44GiB 停止阈值保持不变。
 原始证据根目录为 `/data_ssd/qcrs/experiments/p1-v8/Perf/`。
 
+本页保留该轮正式性能和历史事实。后续O1请求级关联、独立诊断及代表性限制见
+[TP TTFT诊断](tp-ttft-diagnostic.md)，其profile数据不并入本页正式汇总。
+
 ## 结论与适用范围
 
 TP2 short/eager 在本机显式 `--worker-cpus 20 21` 配置下，原生 Full/noop

@@ -4,6 +4,8 @@
 原始环境和工程约束见 [prompt1](../prompts/prompt1.md)；本次范围以用户限定修复要求
 和Review为准，未重启M0→DP。当前结论导航为 [delivery](../reports/delivery.md)，
 逐项修改和验证为 [closeout-fixes](../reports/closeout-fixes.md)。
+功能收尾后，按用户新授权完成一次O1补采；当前性能诊断结果见
+[tp-ttft-diagnostic](../reports/tp-ttft-diagnostic.md)。
 
 ## 当前状态
 
@@ -13,7 +15,8 @@
 | R2、D1–D4 | PASS | Graph有效范围解释、生命周期声明、M2阶段快照、源码导航与文档职责已同步 |
 | 必要行为回归 | PASS | 28项CPU测试通过；不代表GPU continuation或payload验证 |
 | M0→DP既有实现与Gate | 已执行 | 只按各阶段报告的配置/正确性范围交付；历史记录见delivery导航，不重跑矩阵 |
-| O1–O3 | NOT_RUN | 已评估现有证据，本次未新增性能实验或Runtime优化；停止依据见closeout-fixes |
+| O1 | DIAGNOSTIC_DONE | 已审计旧trace并完成稳定ID/step/两rank设备关联；采样出现抢占且偏离原正式轨迹，不足以选择优化；未改Runtime，原SLO FAIL保留 |
+| O2/O3 | NOT_RUN | 未测Tri真实Runtime完整评分或证明metadata净收益；未融合、增旁路或扩展实验 |
 
 feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按computed length初始化E；
 保留有损KV的streaming重入不在契约内。MRV2/BF16/FA2/NHD/B16、单group、单在途与
@@ -22,8 +25,9 @@ feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按compute
 
 ## 明确保留的缺口
 
-- TP pressure仍因TTFT不满足既定SLO；继续追求该目标时，先关联enqueue、首次schedule、
-  prefill完成与reclaim完成，分解host/GPU/通信成本，再选择修法。
+- TP pressure仍因TTFT不满足既定SLO；O1已补齐一轮请求级关联，但profiling轨迹有
+  6次抢占及重复prefill，不能代表原零抢占正式样本。尚缺原场景代表性成本和优化
+  对照收益证据，本轮停止，不追加采样或盲扫batch。
 - TP eager只在本机显式CPU放置和对应short/eager配置下通过预算；默认放置及CPU1/49
   微观慢因未普遍解决。DP skewed只在固定6/2路由和对应配置下通过。
 - M2/Prefix/TP/DP历史性能FAIL及Graph/TP旧profile PARTIAL保留，详见各report；
@@ -35,4 +39,5 @@ feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按compute
 - 完整上游suite受既有离线资源和fixture/插件条件限制；具体失败分列于历史final-review和
   本次closeout-fixes，不安装升级依赖或下载替代模型。
 
-R1已封口、必要回归通过后，本次限定功能收尾完成。后续只在明确新目标或新证据下重开。
+R1已封口、必要回归通过，限定功能收尾完成；随后O1诊断也已按范围收尾。
+当前未追加Runtime优化，后续只在明确新目标或新证据下重开。

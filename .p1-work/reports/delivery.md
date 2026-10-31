@@ -5,6 +5,10 @@
 [独立收尾Review](independent-closeout-review.md) 保留 `252c747ad6` 发现时的原文，
 其中“待修复”是历史基准；当前状态由 [status](../plans/status.md) 维护。
 
+后续按用户授权完成O1的稳定请求ID/step/CUDA关联诊断，见
+[TP TTFT诊断](tp-ttft-diagnostic.md)。采样偏离原正式零抢占轨迹，未据此修改Runtime
+或宣称性能改善；原TP pressure SLO FAIL保留。
+
 工作树为 `worktrees/p1-v8-physical-kv-reclamation`，分支为
 `p1/v8-physical-kv-reclamation`，vLLM基线为v0.26.0 `568afb3a13`。
 沿用现有Python3.10/Torch2.11+cu129/Triton3.6环境；模型实验仅Qwen3-8B BF16。
@@ -48,8 +52,9 @@ SLO保持 **TTFT ≤ 2s 且 TPOT ≤ 80ms**：
 累计归还blocks可包含同一页多次复用，不等于唯一物理页数或同时新增容量。
 
 85条质量样本保持冻结，只是探索性结果，未证明有损质量保持。
-token一致性或按KeepPlan搬移正确不能替代质量保证。本轮未扩大模型、质量或性能矩阵；
-O1–O3的证据判断与停止理由见 [本次修复报告](closeout-fixes.md)。
+token一致性或按KeepPlan搬移正确不能替代质量保证。限定功能收尾的O1–O3判断见
+[修复报告](closeout-fixes.md)；其后O1仅补一轮诊断，O2/O3仍未实施，当前停止理由见
+[TP TTFT诊断](tp-ttft-diagnostic.md)，未扩展模型、质量或性能矩阵。
 
 ## 实现与证据导航
 
@@ -64,6 +69,7 @@ O1–O3的证据判断与停止理由见 [本次修复报告](closeout-fixes.md)
 | DP / 本地页池与affinity | [dp-runtime](../source-analysis/dp-runtime.md) | [正确性](dp.md)、[Serving](dp-serving.md) |
 | 历史功能与性能收尾 | [final-review](final-review.md) | [performance-followup](performance-followup.md) |
 | 本次R1/R2/D1–D4 | [独立Review基准](independent-closeout-review.md) | [closeout-fixes](closeout-fixes.md) |
+| 后续O1请求级TTFT诊断 | [tp-runtime](../source-analysis/tp-runtime.md) | [tp-ttft-diagnostic](tp-ttft-diagnostic.md) |
 
 本页只维护当前结论和导航；[status](../plans/status.md) 维护当前状态与未决项，
 reports保存实验事实与历史负结果，notes保存协议，source-analysis解释当前调用链、
