@@ -75,3 +75,10 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 输出逐token对照，两个Pool最后均free32；四个额外请求验证原生router真实分布。
 正式HTTP去掉payload同步hook，逐replica报告延迟/Goodput/preemption，独立trace
 记录queue/free/重试，不用静态源码检查替代双GPU证据。
+
+## D1 dense DP 状态闭环
+
+- 模块用途：EngineCore 发布 Scheduler 队列变化，Coordinator 汇总独立副本，Frontend 据快照和本地 affinity 表选择 engine。
+- I/O：`(running, waiting)` 经真实 Msgpack 进入 `[waiting, running]`；完成后归零，未变化不重复发布；MoE 保留 step/wave。
+- 防止的失败：dense 不发布、字段颠倒、完成后旧负载残留、把独立 step 当同步边界，以及快照覆盖乐观 waiting 后忽略本地在途请求。
+- 最低成本层级：复用两个 engine suite，CPU 检查 busy loop 发布与序列化、真实 Coordinator ZMQ 的独立更新、路由下界/完成/显式 rank/abort；DP2 HTTP 异构与均匀对照验证真实进程链。既有 suite 顶层 tokenizer 未缓存，选中 CPU 测试用已存在的 Qwen3 tokenizer 替换该无关模型资源，不运行其模型测试，原 collection 失败单独归档。

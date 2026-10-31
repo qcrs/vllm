@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Verify DP2 HTTP evidence and aggregate by the observed native affinity."""
 
+import argparse
 import hashlib
 import json
 import math
@@ -26,6 +27,164 @@ def preemptions(row, rank=None):
         if key.split("{")[0] == "vllm:num_preemptions_total"
         and (rank is None or f'engine="{rank}"' in key)
     )
+
+
+def engineering_summary(root, diagnostic, output):
+    runs = {}
+    tokens = {}
+    for run in sorted(root.iterdir()):
+        rounds = read(run / "serving.json")
+        requests = [
+            item
+            for row in rounds
+            for item in read(run / f"requests-{row['repeat']}.json")
+        ]
+        protocol = read(run / "protocol.json")
+        version = "d0" if "-d0-" in run.name else "d1"
+        key = f"{version}-{protocol['args']['scenario']}"
+        tokens[key] = [item["token_ids"] for item in requests]
+        runs[key] = dict(
+            directory=str(run),
+            guard=read(run / "result.json"),
+            rounds=rounds,
+            aggregate=aggregate(requests, sum(r["elapsed_s"] for r in rounds)),
+            replicas={
+                str(rank): dict(
+                    prompt_tokens=sum(
+                        r["prompt_tokens"] for r in requests if r["replica"] == rank
+                    ),
+                    **aggregate(
+                        [r for r in requests if r["replica"] == rank],
+                        sum(r["elapsed_s"] for r in rounds),
+                    ),
+                )
+                for rank in (0, 1)
+            },
+            requests=[
+                {k: v for k, v in r.items() if k not in ("itl_s", "token_ids", "usage")}
+                for r in requests
+            ],
+            max_ttft_s=max(r["ttft_s"] for r in requests),
+            max_tpot_s=max(r["tpot_s"] for r in requests),
+            preemptions=sum(preemptions(r) for r in rounds),
+        )
+        # Requests use round-relative clocks; only each round has an active span.
+        runs[key]["aggregate"].pop("active_span_s")
+        for replica in runs[key]["replicas"].values():
+            replica.pop("active_span_s")
+
+    events = sorted(
+        (
+            json.loads(line)
+            for f in diagnostic.glob("dp-load-*.jsonl")
+            for line in f.read_text().splitlines()
+        ),
+        key=lambda r: r["time_ns"],
+    )
+    routes = {
+        r["request"]: r
+        for r in map(
+            json.loads, (diagnostic / "routing.jsonl").read_text().splitlines()
+        )
+    }
+    publications, steps, frontend, replay = [], {}, None, []
+    propagation, delivery = [], []
+    seen_generation = set()
+    changed_delivery = []
+    for event in events:
+        site, now = event["site"], event["time_ns"]
+        if site == "coordinator_publish":
+            publications.append(event)
+        elif site == "scheduler_completed":
+            steps[event["rank"]] = event
+        elif site == "frontend_receive":
+            matching = next(
+                (p for p in reversed(publications) if p["counts"] == event["counts"]),
+                None,
+            )
+            frontend = dict(event, publication=matching)
+            if matching:
+                delivery.append((now - matching["time_ns"]) / 1e6)
+                propagation.extend(
+                    (matching["time_ns"] - s["generated_ns"]) / 1e6
+                    for s in matching["latest"].values()
+                )
+                for rank, state in matching["latest"].items():
+                    identity = (rank, state["generated_ns"])
+                    if identity not in seen_generation:
+                        seen_generation.add(identity)
+                        changed_delivery.append(
+                            dict(
+                                rank=rank,
+                                counts=state["counts"],
+                                generated_ns=state["generated_ns"],
+                                generation_to_publish_ms=(
+                                    matching["time_ns"] - state["generated_ns"]
+                                )
+                                / 1e6,
+                                generation_to_frontend_ms=(now - state["generated_ns"])
+                                / 1e6,
+                            )
+                        )
+        elif site == "route" and len(steps) == 2:
+            C = [max(4 * w + r, f) for (w, r), f in zip(event["counts"], event["F"])]
+            scores = [
+                (C[i] + steps[i]["U"] / 512) * (1 + steps[i]["usage"]) for i in (0, 1)
+            ]
+            order = [(event["start"] + i) % 2 for i in (0, 1)]
+            chosen = routes[event["request"]]["replica"]
+            assert min(order, key=lambda i: C[i]) == chosen
+            latest = frontend["publication"]["latest"]
+            replay.append(
+                dict(
+                    external=event["external"],
+                    time_ns=now,
+                    counts=event["counts"],
+                    local_inflight=event["F"],
+                    C=C,
+                    D1_choice=chosen,
+                    D2_score=scores,
+                    D2_choice=min(order, key=lambda i: scores[i]),
+                    U=[steps[i]["U"] for i in (0, 1)],
+                    usage=[steps[i]["usage"] for i in (0, 1)],
+                    poststep_age_ms=[(now - steps[i]["time_ns"]) / 1e6 for i in (0, 1)],
+                    snapshot_generation_age_ms=[
+                        (now - latest[str(i)]["generated_ns"]) / 1e6
+                        if str(i) in latest
+                        else None
+                        for i in (0, 1)
+                    ],
+                    frontend_age_ms=(now - frontend["time_ns"]) / 1e6,
+                )
+            )
+    result = dict(
+        runs=runs,
+        token_identity={
+            s: sum(a == b for a, b in zip(tokens[f"d0-{s}"], tokens[f"d1-{s}"]))
+            for s in ("native", "uniform")
+        },
+        diagnostic=dict(
+            directory=str(diagnostic),
+            serving=read(diagnostic / "serving.json"),
+            coordinator_state_age_ms=quantiles(propagation),
+            coordinator_to_frontend_ms=quantiles(delivery),
+            changed_generation_first_delivery=changed_delivery,
+            changed_generation_latency_ms={
+                name: quantiles([item[name] for item in changed_delivery])
+                for name in (
+                    "generation_to_publish_ms",
+                    "generation_to_frontend_ms",
+                )
+            },
+            final_publication=publications[-1],
+            final_frontend=frontend,
+            final_poststep=steps,
+            replay=replay,
+            replay_scope="Last observed poststep U/usage, not simulated D2 dynamics",
+        ),
+    )
+    output.write_text(json.dumps(result, indent=2))
+    print(output)
 
 
 def summarize_local():
@@ -339,4 +498,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--engineering", type=Path)
+    parser.add_argument("--diagnostic", type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    if args.engineering:
+        engineering_summary(args.engineering, args.diagnostic, args.output)
+    else:
+        main()

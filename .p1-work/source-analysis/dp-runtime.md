@@ -16,10 +16,28 @@ TP group每replica size1，回收代码的TP score/plan/completion通信分支�
 以symbol定位；旧 `kv_reclamation.py:122` 已落在内部计划分支，不能作为reclaim入口。
 
 `DPLBAsyncMPClient.get_core_engine_for_request`只在新请求ADD时选择replica：
-显式`request.data_parallel_rank`优先；否则按waiting*4+running最小值，轮换tie起点，
+显式`request.data_parallel_rank`优先，其后保留late-interaction sticky选择；否则按
+`max(waiting*4+running, local_inflight)`最小值，轮换tie起点，
 选中后本地waiting增量弥补约100ms coordinator统计间隔。`reqs_in_flight`保存affinity，
 abort按该映射分组发向原engine，finished后删除映射。原生内部控制和stats协调保留，
 不能将它误称为cross-DP reclamation barrier。
+
+本轮D1修复见 [工程报告](../reports/engineering-dp-load-chain.md)。普通dense
+`EngineCoreProc.run_busy_loop`在处理输入后和engine step后调用基类
+`_maybe_publish_request_counts`。Scheduler的`get_request_counts()`返回
+`(running, waiting)`；发布使用具名字段构造`SchedulerStats`，含最后一次归零。
+`last_counts`由EngineCore拥有，只抑制重复计数，不是请求生命周期表。
+既有output线程以client index -1经Msgpack/ZMQ送到Coordinator。
+
+`DPCoordinatorProc`只在`enable_wave_coordination`时保留MoE的step/wave聚合和
+最少等待；dense每rank独立推进，以各rank最新计数汇总。内部和frontend编码均为
+`[waiting, running]`，原有约100ms发布节奏不变。Frontend stats task替换
+`lb_engines`；这会覆盖乐观waiting增量，因此选择时从已有`reqs_in_flight.values()`
+派生Counter作本client下界F。该扫描是O(本client在途请求数)，未新增重复的完成/
+abort账本。F不覆盖其他client、不是token工作量，也不保证远端admission成功。
+
+MoE仍走`DPEngineCoreProc`自己的busy loop和publisher，保留step/wave。
+本轮只做CPU消息字段回归，未运行MoE模型；不能由dense结果扩张MoE支持声明。
 
 HTTP completion从`X-data-parallel-rank` header取得显式rank，原生默认不返回replica
 编号。逐replica测量需要在诊断server入口记录原生router的返回值并关联request ID；

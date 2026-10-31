@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import queue
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
 
 import pytest
@@ -22,12 +24,13 @@ from vllm.config import (
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from ...utils import create_new_process_for_each_test, multi_gpu_test
 
@@ -42,6 +45,47 @@ PROMPT = "I am Gyoubu Masataka Oniwa"
 PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 
 _REQUEST_COUNTER = 0
+
+
+def test_dense_dp_busy_loop_publishes_queue_transitions_and_idle_zero():
+    core = object.__new__(EngineCoreProc)
+    core.publish_dp_lb_stats = True
+    core.last_counts = (0, 0)
+    core.output_queue = queue.Queue()
+    state = SimpleNamespace(counts=(0, 0))
+    core.scheduler = SimpleNamespace(get_request_counts=lambda: state.counts)
+    running = iter([True, True, False])
+    core._handle_shutdown = lambda: next(running)
+    inputs = iter([(0, 2), (1, 0)])
+    outputs = iter([(1, 0), (0, 0)])
+    core._process_input_queue = lambda: setattr(state, "counts", next(inputs))
+    core._process_engine_step = lambda: setattr(state, "counts", next(outputs))
+
+    with pytest.raises(SystemExit):
+        core.run_busy_loop()
+
+    decoder = MsgpackDecoder(EngineCoreOutputs)
+    observed = []
+    while not core.output_queue.empty():
+        client_index, output = core.output_queue.get_nowait()
+        assert client_index == -1
+        stats = decoder.decode(MsgpackEncoder().encode(output)).scheduler_stats
+        observed.append((stats.num_running_reqs, stats.num_waiting_reqs))
+    assert observed == [(0, 2), (1, 0), (0, 0)]
+
+
+def test_moe_dp_request_counts_keep_step_and_wave():
+    core = object.__new__(DPEngineCoreProc)
+    core.publish_dp_lb_stats = True
+    core.last_counts = (0, 0)
+    core.output_queue = queue.Queue()
+    core.scheduler = SimpleNamespace(get_request_counts=lambda: (2, 3))
+    core.step_counter, core.current_wave = 7, 4
+    core._maybe_publish_request_counts()
+    _, output = core.output_queue.get_nowait()
+    stats = output.scheduler_stats
+    assert (stats.num_running_reqs, stats.num_waiting_reqs) == (2, 3)
+    assert (stats.step_counter, stats.current_wave) == (7, 4)
 
 
 def make_request() -> EngineCoreRequest:

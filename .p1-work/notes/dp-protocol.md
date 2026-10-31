@@ -49,3 +49,23 @@ HTTP transport timeout固定600秒，与SLO独立；超时run保留FAIL，不合
 正式矩阵完成后补一条4GiB/native/Sink trace，完整预热加一正式轮：逐replica核对
 allocation miss、reclaim_select/commit与schedule intent均为0，证明无压力时未
 调用评分/压紧链。沿用既定输入、SLO与资源约束，该诊断不加入正式吞吐。
+
+## 本轮D1增量协议
+
+以上为历史DP Gate，不能按其清单重启矩阵。本轮仅比较D0/D1两个源码状态：
+native为`[4096,8192]*4`、1.5GiB/replica，新增uniform为8×4096、4GiB/replica；
+两者均用SinkRecent、batch512、seqs8、CPU20/21、原到达时刻与128输出，完整
+负载预热后3轮。D1包含dense publisher、non-lockstep Coordinator和本地F下界，
+不包含D2工作量或KV usage路由。原生自动选择，无显式rank；保留sticky/abort。
+
+执行入口为`run_guard.py --stage Engineering-DP-Formal --name <version-scenario> --
+@python .p1-work/scripts/dp_serving.py --scenario native|uniform --policy sink_recent
+--pool-gib 1.5|4 --max-num-batched-tokens 512 --max-num-seqs 8 --worker-cpus 20 21
+--repeats 3`，先激活GPU0,1环境。命令实际展开、源码hash和ignored helper由run归档。
+
+只有独立diagnostic开启`--load-diagnostic`：观察消息生成→Coordinator→Frontend、
+post-output的`U=sum(max(0,L-C+inflight))`、BlockPool usage和route时F。观察器不改
+Runtime发布字段或路由。旧计数generation可因计数不变而长期不更新，年龄不是网络
+传播延迟；仅首次送达的generation单列传播分布。D2回放使用最后一次可见poststep，
+是即时反事实，不模拟改变route后的服务动态。正式结果与停止判断见
+[工程报告](../reports/engineering-dp-load-chain.md)。

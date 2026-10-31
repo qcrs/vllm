@@ -13,10 +13,12 @@ from dataclasses import dataclass
 from threading import Thread
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import msgspec.msgpack
 import pytest
 import torch
+import zmq
 from transformers import AutoTokenizer
 
 from tests.utils import multi_gpu_test
@@ -27,7 +29,8 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreReadyResponse, EngineCoreRequest
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreReadyResponse, EngineCoreRequest
+from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import (
     AsyncMPClient,
@@ -38,10 +41,12 @@ from vllm.v1.engine.core_client import (
 )
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.pool.late_interaction import (
     LATE_INTERACTION_MODE_CACHE_QUERY,
     LATE_INTERACTION_MODE_SCORE_DOC,
 )
+from vllm.v1.serial_utils import MsgpackEncoder
 
 from ...distributed.conftest import MockSubscriber
 from ...utils import create_new_process_for_each_test
@@ -198,13 +203,18 @@ def _make_pooling_request(
     )
 
 
-def test_dplb_late_interaction_sticky_routing():
+def _make_dplb_client():
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
     client.reqs_in_flight = {}
     client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
     client.lb_engines = [[0, 0], [0, 0], [0, 0]]
     client.eng_start_index = 0
+    return client
+
+
+def test_dplb_late_interaction_sticky_routing():
+    client = _make_dplb_client()
 
     query_key = "rerank-abc-query-0"
     query_request = _make_pooling_request(
@@ -223,18 +233,114 @@ def test_dplb_late_interaction_sticky_routing():
 
 
 def test_dplb_non_late_interaction_still_uses_lb():
-    client = object.__new__(DPLBAsyncMPClient)
-    client.client_count = 1
-    client.reqs_in_flight = {}
-    client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
+    client = _make_dplb_client()
     client.lb_engines = [[2, 1], [0, 0], [1, 0]]
-    client.eng_start_index = 0
 
     request = make_request(SamplingParams(max_tokens=1))
     chosen_engine = client.get_core_engine_for_request(request)
 
     assert chosen_engine == client.core_engines[1]
     assert client.lb_engines[1][0] == 1
+
+
+def test_dplb_snapshot_cannot_erase_local_inflight_and_completion_releases_it():
+    client = _make_dplb_client()
+    client.reqs_in_flight = {f"old-{i}": client.core_engines[0] for i in range(3)}
+    client.lb_engines = [[0, 0], [0, 2], [1, 0]]
+    request = make_request(SamplingParams(max_tokens=1))
+    assert client.get_core_engine_for_request(request) == client.core_engines[1]
+
+    asyncio.run(
+        DPLBAsyncMPClient.process_engine_outputs(
+            client, EngineCoreOutputs(finished_requests={"old-0", "old-1", "old-2"})
+        )
+    )
+    client.lb_engines = [[0, 0], [0, 2], [1, 0]]
+    assert (
+        client.get_core_engine_for_request(make_request(SamplingParams(max_tokens=1)))
+        == client.core_engines[0]
+    )
+
+
+def test_dplb_explicit_rank_and_abort_keep_affinity():
+    client = _make_dplb_client()
+    client.resources = SimpleNamespace(engine_dead=False)
+    client._abort_requests = AsyncMock()
+    client.lb_engines = [[0, 0], [20, 20], [0, 0]]
+    request = make_request(SamplingParams(max_tokens=1))
+    request.data_parallel_rank = 1
+    assert client.get_core_engine_for_request(request) == client.core_engines[1]
+    asyncio.run(client.abort_requests_async([request.request_id]))
+    client._abort_requests.assert_awaited_once_with(
+        [request.request_id], client.core_engines[1]
+    )
+
+
+def test_dplb_dense_coordinator_publishes_independent_latest_counts():
+    config = SimpleNamespace(
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        data_parallel_master_ip="127.0.0.1",
+        local_engines_only=False,
+        enable_elastic_ep=False,
+    )
+    coordinator = DPCoordinator(config, enable_wave_coordination=False)
+    ctx = zmq.Context()
+    sockets = []
+    try:
+        front = ctx.socket(zmq.SUB)
+        sockets.append(front)
+        front.setsockopt(zmq.SUBSCRIBE, b"")
+        front.connect(coordinator.get_stats_publish_address())
+        back_in, back_out = coordinator.get_engine_socket_addresses()
+        for _ in range(2):
+            engine = ctx.socket(zmq.SUB)
+            sockets.append(engine)
+            engine.setsockopt(zmq.SUBSCRIBE, b"")
+            engine.connect(back_in)
+        for engine in sockets[1:]:
+            assert engine.poll(5000)
+            assert engine.recv() == b"READY"
+        output = ctx.socket(zmq.PUSH)
+        sockets.append(output)
+        output.connect(back_out)
+        encoder = MsgpackEncoder()
+
+        def publish(rank, running, waiting, step):
+            output.send_multipart(
+                encoder.encode(
+                    EngineCoreOutputs(
+                        engine_index=rank,
+                        scheduler_stats=SchedulerStats(
+                            num_running_reqs=running,
+                            num_waiting_reqs=waiting,
+                            step_counter=step,
+                        ),
+                    )
+                )
+            )
+
+        def receive(expected):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                assert front.poll(1000)
+                counts, wave, running = msgspec.msgpack.decode(front.recv())
+                if counts == expected:
+                    assert (wave, running) == (0, False)
+                    return
+            pytest.fail(f"Coordinator did not publish {expected}")
+
+        publish(0, 2, 1, 7)
+        publish(1, 1, 0, 3)
+        publish(0, 3, 0, 8)
+        receive([[0, 3], [0, 1]])
+        publish(0, 0, 0, 9)
+        receive([[0, 0], [0, 1]])
+    finally:
+        for socket in sockets:
+            socket.close(linger=0)
+        ctx.term()
+        coordinator.shutdown()
 
 
 def test_apply_ready_response_syncs_block_size():

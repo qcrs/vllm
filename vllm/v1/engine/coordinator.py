@@ -259,9 +259,12 @@ class DPCoordinatorProc:
                 # changed, or otherwise every 5 seconds.
                 wait_for = self.stats_update_interval_ms if stats_changed else 5000
 
-                # Wait at least 50ms to ensure we've received all stats for
-                # the current step.
-                min_timeout = 50 if last_step_counts is None else 0
+                # Only MoE ranks share step boundaries.
+                min_timeout = (
+                    50
+                    if self.enable_wave_coordination and last_step_counts is None
+                    else 0
+                )
 
                 events = poller.poll(timeout=max(min_timeout, wait_for - elapsed))
                 if not events:
@@ -374,30 +377,33 @@ class DPCoordinatorProc:
                         # 1. Updated request load stats - update our local
                         # state with these.
                         stats = self.engines[eng_index].request_counts
-                        stats_step = scheduler_stats.step_counter
-                        stats_wave = scheduler_stats.current_wave
-                        if (
-                            stats_wave > last_stats_wave
-                            or stats_wave == last_stats_wave
-                            and stats_step > last_stats_step
-                        ):
-                            if stats_changed:
-                                last_step_counts = self._get_engine_counts(do_copy=True)
-                            last_stats_step = stats_step
-                            last_stats_wave = stats_wave
-                        elif stats_wave != last_stats_wave or (
-                            stats_step != last_stats_step
-                        ):
-                            logger.warning(
-                                "Received stats for out-of-order "
-                                "step (%d, %d) from engine %d (expected "
-                                "> (%d, %d))",
-                                stats_wave,
-                                stats_step,
-                                eng_index,
-                                last_stats_wave,
-                                last_stats_step,
-                            )
+                        if self.enable_wave_coordination:
+                            stats_step = scheduler_stats.step_counter
+                            stats_wave = scheduler_stats.current_wave
+                            if (
+                                stats_wave > last_stats_wave
+                                or stats_wave == last_stats_wave
+                                and stats_step > last_stats_step
+                            ):
+                                if stats_changed:
+                                    last_step_counts = self._get_engine_counts(
+                                        do_copy=True
+                                    )
+                                last_stats_step = stats_step
+                                last_stats_wave = stats_wave
+                            elif stats_wave != last_stats_wave or (
+                                stats_step != last_stats_step
+                            ):
+                                logger.warning(
+                                    "Received stats for out-of-order "
+                                    "step (%d, %d) from engine %d (expected "
+                                    "> (%d, %d))",
+                                    stats_wave,
+                                    stats_step,
+                                    eng_index,
+                                    last_stats_wave,
+                                    last_stats_step,
+                                )
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
                         stats_changed = True

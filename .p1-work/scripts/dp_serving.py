@@ -168,10 +168,13 @@ def main():
         required=True,
     )
     parser.add_argument("--pool-gib", type=float, required=True)
-    parser.add_argument("--scenario", choices=["native", "skewed"], default="native")
+    parser.add_argument(
+        "--scenario", choices=["native", "skewed", "uniform"], default="native"
+    )
     parser.add_argument("--stats")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--load-diagnostic", action="store_true")
     tuning_arguments(parser)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
@@ -181,13 +184,30 @@ def main():
         "serving_reclamation.py",
         "dp_hooks.py",
         "tp_worker_hooks.py",
+        "dp_load_diagnostic.py",
     ):
         shutil.copyfile(scripts / name, run / name)
+    source_root = scripts.parents[1]
+    source_hashes = {}
+    for relative in (
+        "vllm/v1/engine/core.py",
+        "vllm/v1/engine/coordinator.py",
+        "vllm/v1/engine/core_client.py",
+        "vllm/v1/core/sched/scheduler.py",
+    ):
+        source = source_root / relative
+        target = run / "source" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        source_hashes[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+    (run / "dp-source-hashes.json").write_text(json.dumps(source_hashes, indent=2))
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     origin = f"http://127.0.0.1:{port}"
     env = dict(os.environ, VLLM_ENABLE_V1_MULTIPROCESSING="1")
+    if args.load_diagnostic:
+        env["P1_DP_LOAD_DIAGNOSTIC"] = "1"
     env["PYTHONPATH"] = str(scripts) + os.pathsep + env["PYTHONPATH"]
     env.pop("VLLM_KV_TRACE_FILE", None)
     command = [
@@ -271,6 +291,8 @@ def main():
     lengths = [4096, 8192] * 4
     if args.scenario == "skewed":
         lengths[-2:] = [128, 256]
+    elif args.scenario == "uniform":
+        lengths = [4096] * 8
     prompts = [(seed * (length // len(seed) + 1))[:length] for length in lengths]
     arrivals = [0, 0.3, 0.6, 0.9, 5, 5.3, 5.6, 5.9]
     (run / "prompts.json").write_text(json.dumps(prompts))

@@ -11,6 +11,11 @@ from pathlib import Path
 
 from vllm.v1.engine.core_client import DPLBAsyncMPClient
 
+if os.environ.get("P1_DP_LOAD_DIAGNOSTIC") == "1":
+    from dp_load_diagnostic import install
+
+    install()
+
 
 def main():
     run = Path(os.environ["P1_RUN_DIR"])

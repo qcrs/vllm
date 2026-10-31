@@ -7,7 +7,7 @@ import sys
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -1420,6 +1420,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
+            local_inflight = Counter(self.reqs_in_flight.values())
             min_score = sys.maxsize
             eng_index = 0
             for i in range(num_engines):
@@ -1427,7 +1428,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
                 waiting, running = current_counts[idx]
-                score = waiting * 4 + running
+                score = max(
+                    waiting * 4 + running, local_inflight[self.core_engines[idx]]
+                )
                 if score < min_score:
                     min_score = score
                     eng_index = idx
