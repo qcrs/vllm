@@ -2,10 +2,48 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validate retained bytes, not undefined page tails or FullKV model quality."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
 from tests.v1.worker.kv_compaction_utils import scalar_retained_kv
+
+
+def test_graph_attention_lengths_keep_logical_inputs_and_refresh_dummy_padding():
+    from vllm.v1.worker.gpu.cudagraph_utils import prepare_inputs_to_capture
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.kv_reclamation import KVReclamationWorker
+
+    buffers = InputBuffers(4, 8, torch.device("cpu"))
+    physical = torch.full_like(buffers.seq_lens, 999)
+    model_state = MagicMock()
+    tables = SimpleNamespace(
+        cp_size=1,
+        get_dummy_block_tables=lambda n: (torch.zeros(n, 2, dtype=torch.int32),),
+        get_dummy_slot_mappings=lambda n: torch.full((1, n), -1),
+    )
+    cache = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["layer"])])
+    prepare_inputs_to_capture(
+        2, 2, model_state, buffers, tables, [], cache, attn_seq_lens=physical
+    )
+    captured_batch = model_state.prepare_attn.call_args.args[0]
+    assert captured_batch.seq_lens.data_ptr() == physical.data_ptr()
+    assert captured_batch.seq_lens.data_ptr() != buffers.seq_lens.data_ptr()
+    assert physical.tolist() == [1, 1, 0, 0]
+    physical[:2] = torch.tensor([13, 31])
+    assert captured_batch.seq_lens.tolist() == [13, 31]
+    assert buffers.seq_lens.tolist() == [1, 1, 0, 0]
+
+    worker = KVReclamationWorker.__new__(KVReclamationWorker)
+    worker.kv_seq_lens = physical
+    dummy = InputBatch.make_dummy(1, 3, buffers)
+    attn_dummy = worker.prepare_dummy_attn(dummy)
+    assert physical.tolist() == [3, 0, 0, 0]
+    assert attn_dummy.seq_lens.data_ptr() == captured_batch.seq_lens.data_ptr()
+    assert dummy.seq_lens.data_ptr() == buffers.seq_lens.data_ptr()
+    assert attn_dummy.positions is dummy.positions
 
 
 def dense_frequency_reference(kv, stats, logical_next, theta):

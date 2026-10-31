@@ -90,14 +90,20 @@ def counters(metrics):
     }
 
 
-async def workload(origin, prompts, repeats, run, prefix_caching):
+async def workload(
+    origin, prompts, repeats, run, prefix_caching, full_warmup, arrivals
+):
     results = []
     limits = httpx.Limits(max_connections=16)
     async with httpx.AsyncClient(timeout=180, limits=limits, trust_env=False) as client:
         await completion(
             client, origin, prompts[0][:32], "warmup", 8, 0, time.perf_counter()
         )
-        rounds = ["warmup", *range(repeats)] if prefix_caching else range(repeats)
+        rounds = (
+            ["warmup", *range(repeats)]
+            if prefix_caching or full_warmup
+            else range(repeats)
+        )
         for repeat in rounds:
             if prefix_caching:
                 reply = await client.post(origin + "/reset_prefix_cache")
@@ -117,10 +123,10 @@ async def workload(origin, prompts, repeats, run, prefix_caching):
                         prompts[i % len(prompts)],
                         f"r{repeat}-{i}",
                         128,
-                        (i // 4) * 5 + (i % 4) * 0.3,
+                        arrivals[i],
                         epoch,
                     )
-                    for i in range(8)
+                    for i in range(len(arrivals))
                 ]
             )
             elapsed = time.perf_counter() - epoch
@@ -175,7 +181,14 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--prefix-caching", action="store_true")
+    parser.add_argument(
+        "--graph-mode", choices=["eager", "full", "piecewise"], default="eager"
+    )
+    parser.add_argument("--full-warmup", action="store_true")
+    parser.add_argument("--workload", choices=["long", "short"], default="long")
     args = parser.parse_args()
+    if args.workload == "short" and args.prefix_caching:
+        parser.error("short workload does not define shared prefix identities")
     run = Path(os.environ["P1_RUN_DIR"])
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -185,6 +198,8 @@ def main():
     env.pop("VLLM_KV_TRACE_FILE", None)
     if args.prefix_caching:
         env["VLLM_SERVER_DEV_MODE"] = "1"
+    if args.graph_mode == "piecewise":
+        env["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
     if args.trace:
         env["VLLM_KV_TRACE_FILE"] = str(run / "kv-trace.jsonl")
         env["VLLM_KV_TRACE_IDS"] = "0"
@@ -200,7 +215,6 @@ def main():
         "/data/models/Qwen3-8B",
         "--dtype",
         "bfloat16",
-        "--enforce-eager",
         "--attention-backend",
         "FLASH_ATTN",
         "--block-size",
@@ -226,6 +240,24 @@ def main():
         "0",
         "--no-enable-log-requests",
     ]
+    if args.graph_mode == "eager":
+        command.append("--enforce-eager")
+    else:
+        command.extend(
+            [
+                "--compilation-config",
+                json.dumps(
+                    {
+                        "mode": 0,
+                        "cudagraph_mode": "FULL_DECODE_ONLY"
+                        if args.graph_mode == "full"
+                        else "PIECEWISE",
+                        "cudagraph_capture_sizes": [1, 2, 4, 8],
+                    }
+                ),
+                "--cudagraph-metrics",
+            ]
+        )
     if args.policy != "full":
         config = {
             "kv_reclamation": {
@@ -245,6 +277,10 @@ def main():
         add_special_tokens=False,
     )
     prompts = [(seed * (length // len(seed) + 1))[:length] for length in (4096, 8192)]
+    arrivals = [0, 0.3, 0.6, 0.9, 5, 5.3, 5.6, 5.9]
+    if args.workload == "short":
+        prompts = [(seed * (length // len(seed) + 1))[:length] for length in (128, 256)]
+        arrivals = [0, 0.3]
     if args.prefix_caching:
         shared = (seed * (256 // len(seed) + 1))[:256]
         prompts = []
@@ -259,9 +295,9 @@ def main():
         "args": vars(args),
         "command": command,
         "origin": origin,
-        "prompt_tokens": [4096, 8192] * 4,
+        "prompt_tokens": [len(prompts[i % len(prompts)]) for i in range(len(arrivals))],
         "output_tokens": 128,
-        "arrivals_s": [0, 0.3, 0.6, 0.9, 5, 5.3, 5.6, 5.9],
+        "arrivals_s": arrivals,
         "warmup": "one 32-token prompt / 8 output tokens; excluded",
         "slo": {"ttft_s": 2, "tpot_s": 0.08},
         "timing": "client token_ids stream; same-chunk tokens share receipt time",
@@ -281,6 +317,10 @@ def main():
             cached_tokens=(
                 "first streamed output usage; prefix counters exclude preempted queries"
             ),
+        )
+    elif args.graph_mode != "eager" or args.full_warmup:
+        protocol["warmup"] = (
+            "32/8 request, then one entire workload round; both excluded"
         )
     (run / "protocol.json").write_text(json.dumps(protocol, indent=2))
     with (run / "server.log").open("w") as log:
@@ -303,7 +343,15 @@ def main():
                 else:
                     raise TimeoutError("Server did not become healthy in 240 seconds")
             asyncio.run(
-                workload(origin, prompts, args.repeats, run, args.prefix_caching)
+                workload(
+                    origin,
+                    prompts,
+                    args.repeats,
+                    run,
+                    args.prefix_caching,
+                    args.full_warmup or args.graph_mode != "eager",
+                    arrivals,
+                )
             )
         finally:
             if server.poll() is None:

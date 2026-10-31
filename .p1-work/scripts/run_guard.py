@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pynvml
@@ -91,6 +92,7 @@ def main():
     peak = 0
     exceeded = False
     stopped_at = None
+    stop_groups = set()
     start = time.time()
     print(f"P1_RUN_DIR={run}", flush=True)
     with (
@@ -112,14 +114,24 @@ def main():
             for index, handle in enumerate(handles):
                 for gpu_proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
                     try:
-                        project = (
-                            b"P1_WORKTREE=" + str(root).encode() + b"\0"
-                            in Path(f"/proc/{gpu_proc.pid}/environ").read_bytes()
+                        process_env = Path(f"/proc/{gpu_proc.pid}/environ").read_bytes()
+                        project = any(
+                            marker in process_env
+                            for marker in (
+                                b"P1_WORKTREE=" + str(root).encode() + b"\0",
+                                b"P1_VLLM_ROOT=" + str(root).encode() + b"\0",
+                                b"P1_RUN_DIR=" + str(run).encode() + b"\0",
+                            )
                         )
-                        ours = os.getpgid(gpu_proc.pid) == proc.pid
                     except (FileNotFoundError, ProcessLookupError, PermissionError):
+                        project = False
+                    try:
+                        group = os.getpgid(gpu_proc.pid)
+                        ours = group == proc.pid
+                    except ProcessLookupError:
                         continue
                     if project or ours:
+                        stop_groups.add(group)
                         used = gpu_proc.usedGpuMemory
                         total += used
                         gpu_records.append(
@@ -140,13 +152,17 @@ def main():
             ):
                 exceeded = True
                 stopped_at = time.monotonic()
-                os.killpg(proc.pid, signal.SIGTERM)
+                for group in stop_groups | {proc.pid}:
+                    with suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGTERM)
             if (
                 stopped_at is not None
                 and time.monotonic() - stopped_at > 10
                 and proc.poll() is None
             ):
-                os.killpg(proc.pid, signal.SIGKILL)
+                for group in stop_groups | {proc.pid}:
+                    with suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGKILL)
             code = proc.poll()
             if code is not None:
                 break

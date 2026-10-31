@@ -750,6 +750,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                 lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                attn_seq_lens=(
+                    self.reclamation.kv_seq_lens
+                    if self.reclamation is not None
+                    else None
+                ),
             )
             if self.speculator is not None:
                 self.speculator.capture()
@@ -1276,7 +1281,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
             )
-            attn_input_batch = input_batch
+            attn_input_batch = (
+                self.reclamation.prepare_dummy_attn(input_batch)
+                if self.reclamation is not None
+                else input_batch
+            )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
             else:

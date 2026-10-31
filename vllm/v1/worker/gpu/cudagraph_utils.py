@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from typing import Any, NamedTuple, Protocol
 
@@ -450,6 +450,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        attn_seq_lens: torch.Tensor | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -497,6 +498,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     desc.cg_mode == CUDAGraphMode.PIECEWISE
                     and not self.use_breakable_cg
                 ),
+                attn_seq_lens=attn_seq_lens,
             )
 
             # Capture with dummy rows marked as padding.
@@ -589,8 +591,13 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     skip_attn: bool = False,
+    attn_seq_lens: torch.Tensor | None = None,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    if attn_seq_lens is not None:
+        # Bind capture to the same physical lengths used by real and dummy replay.
+        attn_seq_lens.copy_(input_buffers.seq_lens)
+        input_batch = replace(input_batch, seq_lens=attn_seq_lens[:num_reqs])
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(

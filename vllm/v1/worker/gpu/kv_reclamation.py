@@ -106,6 +106,11 @@ class KVReclamationWorker:
         )
         self.effective_kv_len_np[batch.idx_mapping_np] += batch.num_scheduled_tokens
 
+    def prepare_dummy_attn(self, batch: InputBatch) -> InputBatch:
+        self.kv_seq_lens.zero_()
+        self.kv_seq_lens[: batch.num_reqs].copy_(batch.seq_lens)
+        return replace(batch, seq_lens=self.kv_seq_lens[: batch.num_reqs_after_padding])
+
     def reclaim(self, intent: ReclaimRequest, block_tables) -> ReclaimResult:
         idx = self.req_states.req_id_to_index[intent.request_id]
         assert self.effective_kv_len_np[idx] == intent.source_effective_kv_len

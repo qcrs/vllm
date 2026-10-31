@@ -1,5 +1,12 @@
 # P1 v8 测试设计
 
+## Graph capture / replay
+
+- 模块用途：让原生模型 graph 读取持久 physical attention lengths，保留 logical RoPE/sampling 输入。
+- I/O：dummy capture 与实际 replay 的 `InputBatch`、独立 physical buffer；输出 metadata 必须绑定同一 allocation，dummy refresh 清除真实请求的残留 lengths。
+- 防止的失败：capture 绑定 logical L、运行时只换 Python metadata、dummy replay 读取旧 E、padding 未清零，以及回收后旧 row/tail 仍可读。
+- 最低成本层级：在已有 compaction suite 用 CPU dummy metadata 验证地址/长度分离与 dummy refresh；真实 Qwen3-8B FULL replay 检验重复回收、同 bucket、padding/reorder、立即 release/rewrite/reuse、retained attention reference 和 capture count。Graph/Eager 使用相同 KeepPlan 对照，性能另跑无逐步同步的负载。
+
 ## M0 / M1 Payload
 
 - 模块用途：将 current-member 有序 KeepPlan 映射到 retained KV；全层/Head 使用同一集合。
