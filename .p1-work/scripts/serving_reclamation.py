@@ -18,6 +18,29 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+def tuning_arguments(parser):
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument(
+        "--worker-cpus",
+        type=int,
+        nargs="+",
+        help="Optional Worker main-thread CPU per local GPU; host-specific",
+    )
+
+
+def configure_worker_cpus(args, command, env, run):
+    if args.worker_cpus is None:
+        return
+    import shutil
+
+    scripts = Path(__file__).parent
+    shutil.copyfile(scripts / "worker_affinity.py", run / "worker_affinity.py")
+    env["PYTHONPATH"] = str(scripts) + os.pathsep + env["PYTHONPATH"]
+    env["P1_WORKER_CPUS"] = json.dumps(args.worker_cpus)
+    command.extend(["--worker-cls", "worker_affinity.AffinityWorker"])
+
+
 async def completion(client, origin, ids, rid, output_tokens, arrival, epoch):
     await asyncio.sleep(max(0, epoch + arrival - time.perf_counter()))
     started = time.perf_counter()
@@ -187,6 +210,7 @@ def main():
     parser.add_argument("--full-warmup", action="store_true")
     parser.add_argument("--workload", choices=["long", "short"], default="long")
     parser.add_argument("--tp", type=int, choices=[1, 2], default=1)
+    tuning_arguments(parser)
     args = parser.parse_args()
     if args.workload == "short" and args.prefix_caching:
         parser.error("short workload does not define shared prefix identities")
@@ -232,9 +256,9 @@ def main():
         "--max-model-len",
         "9216",
         "--max-num-batched-tokens",
-        "2048",
+        str(args.max_num_batched_tokens),
         "--max-num-seqs",
-        "8",
+        str(args.max_num_seqs),
         "--kv-cache-memory-bytes",
         str(int(args.pool_gib * 2**30)),
         "--gpu-memory-utilization",
@@ -243,6 +267,7 @@ def main():
         "0",
         "--no-enable-log-requests",
     ]
+    configure_worker_cpus(args, command, env, run)
     if args.graph_mode == "eager":
         command.append("--enforce-eager")
     else:

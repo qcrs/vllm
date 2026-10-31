@@ -26,6 +26,7 @@ def install():
     events = []
     thread_events = []
     profile = cProfile.Profile()
+    forward_profile = os.environ.get("P1_TP_PROFILE_FORWARD") == "1"
     step = 0
 
     def instrument(cls, name, detailed=False):
@@ -38,12 +39,13 @@ def install():
                 step += 1
             start = time.perf_counter_ns()
             thread_start = time.thread_time_ns()
-            if detailed:
+            profiling = detailed and (not forward_profile or step >= 150)
+            if profiling:
                 profile.enable()
             try:
                 return original(*args, **kwargs)
             finally:
-                if detailed:
+                if profiling:
                     profile.disable()
                 events.append(
                     (step, cls.__name__ + "." + name, start, time.perf_counter_ns())
@@ -67,9 +69,13 @@ def install():
         "add_requests",
         "postprocess_sampled",
     ):
-        instrument(GPUModelRunner, name, name == "update_requests")
+        instrument(
+            GPUModelRunner,
+            name,
+            name == ("execute_model" if forward_profile else "update_requests"),
+        )
     for name in ("prepare_attn", "advance"):
-        instrument(KVReclamationWorker, name, True)
+        instrument(KVReclamationWorker, name, not forward_profile)
     shutdown = Worker.shutdown
 
     @wraps(shutdown)

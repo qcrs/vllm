@@ -16,7 +16,12 @@ from pathlib import Path
 
 import httpx
 import numpy as np
-from serving_reclamation import counters, quantiles
+from serving_reclamation import (
+    configure_worker_cpus,
+    counters,
+    quantiles,
+    tuning_arguments,
+)
 from transformers import AutoTokenizer
 
 
@@ -167,6 +172,7 @@ def main():
     parser.add_argument("--stats")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
+    tuning_arguments(parser)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
     scripts = Path(__file__).parent
@@ -211,9 +217,9 @@ def main():
         "--max-model-len",
         "9216",
         "--max-num-batched-tokens",
-        "2048",
+        str(args.max_num_batched_tokens),
         "--max-num-seqs",
-        "8",
+        str(args.max_num_seqs),
         "--kv-cache-memory-bytes",
         str(int(args.pool_gib * 2**30)),
         "--gpu-memory-utilization",
@@ -233,6 +239,7 @@ def main():
         ),
         "--cudagraph-metrics",
     ]
+    configure_worker_cpus(args, command, env, run)
     if args.policy != "full":
         command.extend(
             [

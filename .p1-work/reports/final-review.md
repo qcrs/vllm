@@ -1,5 +1,10 @@
 # P1 v8 功能收尾审查
 
+后续性能优化见 [performance-followup.md](performance-followup.md)：同服务CPU干预
+确认主线程放置影响，CPU20/21下TP eager ABBA合并0.868% PASS；DP skewed
+batch512三轮24/24达SLO，TP压力batch1024为17/24、仍FAIL。下文保留本次功能
+收尾时的原始6.871%结果及尚未定位时的判断，不用后续配置覆盖历史负结果。
+
 本轮依据 `../prompts/prompt1.md`、四份 v8 reference 与用户最新要求，聚焦
 Runtime 是否完整实现既定语义、功能遗漏、冗余检查、Triton 落地及 TP/DP。
 不扩大质量评测，也不将已有 85 条探索性样本升级为质量保持证明。

@@ -114,3 +114,19 @@ CPU执行增加，rank1等待增加；跨server的完整原因尚未确定，不
 score307356、plan153652、completion108 bytes；rank0 GPU累计
 0.429/0.218/5.026ms，rank1为217.364/17.219/56.698ms，仍包含等待。
 该诊断不合入正式吞吐。原始数据和重算入口见final-review。
+
+## 后续性能配置（2026-10-31）
+
+同服务框架切换与CPU交叉干预确认两档eager速度受主线程放置影响，慢执行随
+CPU1移到不同rank；CPU20/21及其对调均较快，不仅是远端NUMA差异。
+通过可选AffinityWorker设置双方相同主线程affinity，原生Full/noop四服务ABBA、
+各三正式轮合并62.712686/62.168299tok/s，开销0.868%≤5%，PASS；两对分别
+−0.037%和1.767%，全部轮保留，12对输出相同，双方各12/12达短负载SLO。
+这是本机显式放置配置的结果，历史无绑核14.33%/6.871% FAIL保留，底层CPU1/49
+慢因没有精确拆分。
+
+0.75GiB/rank压力Sink固定输入与SLO，CPU20/21+batch1024三轮
+101.409/101.431/99.911tok/s，SLO为6/8、6/8、5/8，合计17/24；零抢占，
+Goodput=0.5584req/s。TTFT P99=2.917s，7个请求TTFT超2s，SLO继续FAIL。
+只绑核保留batch2048的同轮对照为67.501tok/s、7抢占、1/8达标，增至4096
+更差；全部pilot和负结果保留。详见[performance-followup.md](performance-followup.md)。

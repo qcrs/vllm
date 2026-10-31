@@ -11,6 +11,11 @@ NVML和退出码；失败产物未覆盖。
 attention、pooling、ALiBi误放行，合并两个普通decode launch并删除重复E传输/校验；
 TP/DP真实回归通过，新Graph/TP profile完整。质量评测按用户最新要求冻结。
 
+后续性能收尾见 [performance-followup.md](performance-followup.md)：相同CPU20/21
+放置下TP eager ABBA合并开销0.868% PASS；DP skewed改用batch512后三轮24/24
+达SLO；TP压力batch1024后三轮17/24、零抢占，TTFT仍有缺口。优化为显式运行配置，
+未新增Runtime分支，不覆盖旧FAIL。
+
 ## 已实现的运行语义
 
 logical L用于RoPE、sampling和原token/hash chain；physical E用于attention
@@ -41,6 +46,7 @@ Prefix保护完整共享页，mutation前撤销私有suffix全部hash aliases；
 | TP | 11条8B轨迹、真实NCCL distinct-GQA/stable ties与23项回归PASS；12组Serving | `tp.md`、`tp-serving.md` |
 | DP | 双Engine局部压力/重写/abort与peer逐token对照PASS；10组正式Serving与5条独立诊断完成，含宽松池零评分/回收链 | `dp.md`、`dp-serving.md` |
 | 功能收尾 | 支持范围修复、普通decode融合、TP/DP回归、新完整profile；TP eager ABBA合并开销6.871%，仍为性能FAIL | `final-review.md` |
+| 性能收尾 | 同服务CPU交叉干预定位放置影响；本机绑核TP eager开销0.868% PASS；DP skewed batch512达SLO；TP压力17/24，保留FAIL | `performance-followup.md` |
 
 性能优化使用CUDA Events、NSYS与NCU。固定36层/8 KV heads/D128/B16的32K
 half-retention compaction约18.39→3.66ms，寄存器128→56，无compiler spill；
@@ -55,14 +61,19 @@ half-retention compaction约18.39→3.66ms，寄存器128→56，无compiler spi
 
 Prefix的3/1.5GiB、M2的1.5GiB尾延迟未满足既定SLO。TP的short/eager noop
 历史吞吐开销14.33%；收尾改动后ABBA两对分别13.187%与0.607%，全部合并6.871%，
-仍超过5%预算，不能挑选后一组宣布修复；压力配置虽然降低preemption，Goodput仍为0。
+该历史配置超过5%预算，不能挑选后一组宣布修复；旧压力配置虽降低preemption，Goodput仍为0。
 TP宽松long配置也只有18/24请求达SLO，不能将noop吞吐预算PASS当作全部延迟通过。
 Graph/TP历史各一条NSYS缺少graph GPU span，原记录继续标PARTIAL；收尾使用
 flush interval0补采，274/424个graph spans及TP全部collective spans匹配完整。
-TP eager的额外小kernel已融合，但跨server的host执行/launch节奏差异仍未解决，
-不声称仅此改动消除了旧14.33%。
+TP eager的额外小kernel已融合；后续同服务CPU干预确认慢档随CPU1放置变化，
+CPU20/21放置的全部ABBA轮合并开销0.868%，12对输出相同。底层driver/IRQ/SMT
+机制未完全拆分，不声称仅kernel改动消除了旧14.33%或默认放置普遍达标。
+压力Sink新配置为CPU20/21+batch1024，吞吐100.917tokens/s、Goodput0.5584req/s、
+零抢占；三轮17/24达SLO，7个TTFT失败，仍为性能FAIL。
 DP native压力下三种有损策略均24/24达SLO，Sink的preemption三轮570→0、
-吞吐22.40→109.25tokens/s；人工skewed Sink仍18/24达标，TTFT超预算，性能FAIL。
+吞吐22.40→109.25tokens/s；原batch2048人工skewed Sink仅18/24达标，性能FAIL。
+DP skewed后续CPU20/21+batch512配置三轮24/24达SLO，零抢占，吞吐125.392tokens/s、
+Goodput0.9796req/s；原batch2048的18/24继续保留为历史FAIL。
 DP native/noop两档共48个请求输出逐token相同，宽松noop开销约0；未新增routing
 hint或把两个Pool的free合并为全局预算。各结论仅适用于对应报告中的固定负载。
 
@@ -99,6 +110,7 @@ shell及其余适用钩子的通过结果保存在`delivery-pre-commit-rerun.log
 `git diff --check`通过。
 
 功能收尾的支持范围、冗余校验审查、Triton落地与TP/DP回归见final-review。
-保留项为上述性能FAIL和未测组合；质量保持未证明，按用户最新要求不再扩大评测。
+性能配置、回收诊断及汇总入口见performance-followup。保留项为上述性能FAIL和未测
+组合；质量保持未证明，按用户最新要求不再扩大评测。
 不将固定路线执行到DP等同于所有预算通过。项目GPU进程已退出；同机其他用户
 任务保留。

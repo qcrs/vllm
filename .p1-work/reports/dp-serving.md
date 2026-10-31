@@ -203,3 +203,16 @@ source、NVML与退出码；汇总为`serving-summary.json`。根status只表示
 | skewed/1.5/full | `20261031-130024-http-skewed-1.5-full-diagnostic` |
 | skewed/1.5/sink_recent | `20261031-130417-http-skewed-1.5-sink_recent-diagnostic` |
 | native/4/sink_recent | `20261031-130544-http-native-4-sink_recent-diagnostic` |
+
+## 后续压力配置（2026-10-31）
+
+人工skewed保持6/2路由、原prompt/arrival、1.5GiB/replica、retention=0.5和
+TTFT≤2s/TPOT≤80ms，仅采用本机CPU20/21主线程放置及batch512。
+完整预热后三轮125.462/125.299/125.416tok/s，24/24达SLO、零抢占，
+Goodput=0.9796req/s；TTFT P50/P95/P99为0.675/1.734/1.743s，
+TPOT为17.49/27.04/27.08ms。replica0长请求18/18、replica1短请求6/6均达标。
+该配置SLO PASS，历史batch2048的18/24、10次抢占继续保留为FAIL。
+没有改变原生路由或合并两个Pool，也未重做任务质量测评。
+
+原始结果为`Perf/20261031-155803-dp-skewed-batch512-formal`；pilot、独立回收诊断、
+峰值、复现及适用边界见[performance-followup.md](performance-followup.md)。
