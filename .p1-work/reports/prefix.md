@@ -6,7 +6,8 @@ Prefix 正确性 Gate 为 **PASS**：真实 Qwen3-8B Engine 完成共享保护�
 `hash_block_size == block_size == 16`；不将诊断轨迹判为 Serving 性能通过。
 新增HTTP对照见 [prefix-serving.md](prefix-serving.md)：8 GiB noop开销预算PASS，
 6 GiB SinkRecent延迟/Goodput预算PASS；3/1.5 GiB仍因TTFT超预算而性能FAIL。
-Graph、TP、DP 及必要组合仍为 NOT_RUN。按本次阶段边界要求停在 Prefix，Goal 保持 active。
+后续Graph/TP/DP及组合证据见对应报告与`../plans/status.md`；本报告保留Prefix
+阶段的配置范围，不从其他Gate推断全部组合通过。
 
 ## 实现与关键修复
 
@@ -162,4 +163,4 @@ alias 由原生 `_insert_block_hash` 构造，用于验证全 key 撤销，不�
 `20261031-022205-pressure` 才是通过的真实压力证据；没有为此改Runtime策略。
 早期 `20261031-021805-token-repeat` 也保留，后由 final版本补齐其他活请求全部payload比较。
 
-阶段完成后不进入 Graph；后续需要阶段转换授权，Goal tracking 保持 active。
+Prefix之后的阶段已按用户恢复的连续授权执行；当前总状态见`../plans/status.md`。

@@ -52,5 +52,5 @@ format更改一处格式后复跑，不跳过hook。
 
 本记录不重做M1全层字节/FP32 Attention证据，不以CPU凭证测试代替GPU completion。
 TriAttention共享评分与质量/Serving结果分别记录在`m2-scoring.md`、
-`m2-evaluation.md`；其边界见对应报告。Prefix/Graph/TP/DP仍为NOT_RUN。
-后续工作已由prompt1长期目标授权，无额外阶段确认需求。
+`m2-evaluation.md`；其边界见对应报告。本报告只验收M2；后续Prefix/Graph/TP/DP
+的独立证据见对应报告与`../plans/status.md`，不从M2结果继承兼容性结论。

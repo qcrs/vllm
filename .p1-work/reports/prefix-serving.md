@@ -4,7 +4,7 @@ Prefix Serving 的配置结论为：**8 GiB noop 开销预算 PASS；6 GiB SinkR
 延迟/Goodput预算 PASS；3 GiB和1.5 GiB SinkRecent性能 FAIL**。
 后两档虽然吞吐提高，TTFT仍超过预先固定的2秒预算；不能仅据回收或吞吐判通过。
 Prefix正确性沿用 [prefix.md](prefix.md) 的限定范围，本轮未修改Runtime或pytest tests。
-Graph、TP、DP及组合保持 NOT_RUN；停在Prefix边界，Goal保持active。
+后续Graph、TP、DP及组合另有独立报告，当前总状态见`../plans/status.md`。
 
 ## 协议、环境与复现
 

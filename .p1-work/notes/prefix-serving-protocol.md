@@ -67,7 +67,8 @@ computed prompt 指标解释依 pinned source，不能以 logical prompt 减一�
 脚本 snapshot、protocol、prompt IDs、server log、requests、metrics、NVML与退出码。
 协议在首条新 GPU 实验前固定；后续修正必须保留旧失败与说明，不能事后放宽 SLO。
 
-下一步只在已有 Prefix 授权内补性能证据；阶段转换问题仍 pending，Graph/TP/DP保持 NOT_RUN。
+本协议固定Prefix阶段的Serving方法；后续阶段已按用户恢复的连续授权执行，
+当前总状态见`../plans/status.md`，不改变本阶段的原始协议与负结果。
 
 ## 运行中补充：无压力基线
 

@@ -58,3 +58,13 @@
 扩展既有executor suite验证非output rank在sample_tokens失败会退出RPC loop，
 以及AsyncOutput设备完成异常不转成可继续执行的普通FAILURE；feature关闭维持
 原生行为。真实failure注入额外证明monitor终止TP组且canonical零commit/free。
+
+## DP replica-local ownership / routing
+
+四问见`dp-protocol.md`。复用真实AsyncLLM/internal dense DP2，不新增模拟allocator：
+副本0的A/C制造一页真实shortfall，副本1空闲页不得计入available；本地回收后C
+必须取得released ID并全层重写，A的retained KV保持不变。B在副本1持续decode，
+abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。native/Sink的B
+输出逐token对照，两个Pool最后均free32；四个额外请求验证原生router真实分布。
+正式HTTP去掉payload同步hook，逐replica报告延迟/Goodput/preemption，独立trace
+记录queue/free/重试，不用静态源码检查替代双GPU证据。

@@ -34,7 +34,7 @@ q=0 maintenance 在 `execute_model` 内记录并同步 main-stream event。
 worker monitor终止整个执行组。未启用回收时沿用原生异常处理。
 
 `TriAttentionScorer`按distinct KV head/layer权重生成local贡献；复制KV的唯一
-owner装载完整GQA query-head stats，非owner贡献0。`KVReclamationWorker.apply`
+owner装载完整GQA query-head stats，非owner贡献0。`KVReclamationWorker.reclaim`
 执行score SUM、rank0 stable top-K和plan broadcast；每rank更新payload/row/E后
 记录local event并调用标量completion SUM，随后AsyncOutput/maintenance的event
 覆盖该collective。canonical提交/free始终只在Scheduler。
