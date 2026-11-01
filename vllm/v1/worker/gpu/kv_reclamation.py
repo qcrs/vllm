@@ -62,6 +62,8 @@ class KVReclamationWorker:
         self.initialize_policy(0, self.config)
 
     def initialize_policy(self, version: int, config: ReclamationConfig) -> dict:
+        if version in self.policies:
+            raise ValueError("KV policy version is already prepared")
         policy = (
             POLICY_FACTORIES[config.policy](
                 config,
@@ -80,6 +82,39 @@ class KVReclamationWorker:
         )
         self.policies[version] = (PolicyBinding(version, config, fingerprint), policy)
         return self.policy_ack(version)
+
+    def prepare_policy(self, version: int, config: ReclamationConfig) -> dict:
+        self.initialize_policy(version, config)
+        policy = self.policies[version][1]
+        if policy is not None:
+            from vllm.v1.worker.gpu.kv_scoring import protected_topk
+
+            length = min(128, self.model_config.max_model_len)
+            scores = torch.zeros(length, device=self.req_states.device)
+            if policy.scorer is not None:
+                row = torch.zeros(
+                    (length + 15) // 16,
+                    dtype=torch.int32,
+                    device=self.req_states.device,
+                )
+                logical = torch.full(
+                    (1,), length, dtype=torch.int32, device=self.req_states.device
+                )
+                scores = policy.scorer.shared_scores(
+                    self.layers, row, logical, length, 0, length
+                )
+            protected_topk(scores, length // 2, 0, length)
+        # Preparation never writes KV or consumes the Random request RNG.
+        torch.accelerator.synchronize()
+        return self.policy_ack(version)
+
+    def retire_policies(self, versions: list[int]) -> dict:
+        # The engine has no logical references and prior output is committed.
+        # Complete every device stream before dropping the version's resources.
+        torch.accelerator.synchronize()
+        for version in versions:
+            del self.policies[version]
+        return {"rank": self.tp_group.rank_in_group, "versions": versions}
 
     def policy_ack(self, version: int) -> dict:
         return {

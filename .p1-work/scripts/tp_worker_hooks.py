@@ -99,6 +99,50 @@ class P1TPWorker:
         original_reclaim, original_compact = worker.reclaim, worker.compactor.compact
         original_execute, original_prepare = runner.execute_model, worker.prepare_attn
         original_dispatch = manager.dispatch
+        if options.get("policy_updates"):
+            original_policy_prepare = worker.prepare_policy
+            original_retire = worker.retire_policies
+
+            def policy_prepare(version, config):
+                before = torch.accelerator.memory_allocated()
+                (directory / f"prepare-start-{version}").write_text(
+                    str(time.monotonic_ns())
+                )
+                if version == 1 and rank == options["prepare_delay_rank"]:
+                    time.sleep(1)
+                ack = original_policy_prepare(version, config)
+                (directory / f"prepare-end-{version}").write_text(
+                    str(time.monotonic_ns())
+                )
+                state["counts"]["policy_prepares"] += 1
+                state.setdefault("policy_memory", []).append(
+                    {
+                        "version": version,
+                        "before": before,
+                        "after": torch.accelerator.memory_allocated(),
+                    }
+                )
+                return ack
+
+            def policy_retire(versions):
+                assert runner.execute_model_state is None
+                before = torch.accelerator.memory_allocated()
+                ack = original_retire(versions)
+                for version in versions:
+                    (directory / f"retire-{version}").write_text(
+                        str(time.monotonic_ns())
+                    )
+                state.setdefault("retire_memory", []).append(
+                    {
+                        "versions": versions,
+                        "before": before,
+                        "after": torch.accelerator.memory_allocated(),
+                    }
+                )
+                return ack
+
+            worker.prepare_policy = policy_prepare
+            worker.retire_policies = policy_retire
 
         def compact(row, keep, **kwargs):
             state["pending"]["compacted"] = True
@@ -363,6 +407,9 @@ class P1TPWorker:
             "rank": state["rank"],
             "counts": dict(state["counts"]),
             "rewritten": sorted(state["rewritten"]),
+            "policy_versions": sorted(worker.policies),
+            "policy_memory": state.get("policy_memory", []),
+            "retire_memory": state.get("retire_memory", []),
         }
 
     def p1_poison(self, released):

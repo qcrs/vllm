@@ -24,12 +24,19 @@ from vllm.config import (
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest
-from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, EngineCoreRequestType
+from vllm.v1.engine.core import (
+    DPEngineCoreProc,
+    EngineCore,
+    EngineCoreProc,
+    EngineShutdownState,
+)
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_reclamation import PolicyBinding, ReclamationConfig
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from ...utils import create_new_process_for_each_test, multi_gpu_test
@@ -45,6 +52,114 @@ PROMPT = "I am Gyoubu Masataka Oniwa"
 PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 
 _REQUEST_COUNTER = 0
+
+
+def reclamation_core():
+    core = object.__new__(EngineCoreProc)
+    core.has_coordinator = False
+    core.reclamation_config = ReclamationConfig()
+    core.reclamation_policies = {0: PolicyBinding(0, core.reclamation_config)}
+    core.default_reclamation_version = 0
+    core.next_reclamation_version = 1
+    core.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=2)
+    )
+    core.scheduler = SimpleNamespace(requests={})
+    core.scheduler.add_request = lambda r: core.scheduler.requests.update(
+        {r.request_id: r}
+    )
+    return core
+
+
+def test_reclamation_utility_publishes_after_all_acks_and_retires_after_last_request():
+    core = reclamation_core()
+    retired = []
+
+    def rpc(method, args):
+        if method == "prepare_reclamation_policy":
+            version, config = args
+            assert core.default_reclamation_version == 0
+            return [
+                dict(rank=r, binding=PolicyBinding(version, config)) for r in (0, 1)
+            ]
+        assert method == "retire_reclamation_policies"
+        retired.extend(args[0])
+        return [dict(rank=r, versions=args[0]) for r in (0, 1)]
+
+    core.model_executor = SimpleNamespace(collective_rpc=rpc)
+    old = Request("old", [1, 2], SamplingParams(), None)
+    core.add_request(old)
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.output_queue = queue.Queue()
+    payload = MsgpackDecoder().decode(
+        MsgpackEncoder().encode(
+            (0, 7, "update_reclamation_policy", ({"policy": "full"},))
+        )
+    )
+    core._handle_client_request(EngineCoreRequestType.UTILITY, payload)
+    _, output = core.output_queue.get_nowait()
+    assert output.utility_output.failure_message is None
+    assert core.default_reclamation_version == 1
+    new = Request("new", [1, 2], SamplingParams(), None)
+    core.add_request(new)
+    assert old.policy_binding.version == 0 and new.policy_binding.version == 1
+    assert new.policy_binding.config.policy == "full"
+    assert not core._retire_unused_reclamation_policies() and not retired
+    del core.scheduler.requests["old"]
+    assert core._retire_unused_reclamation_policies() == [0]
+    assert retired == [0] and set(core.reclamation_policies) == {1}
+    with pytest.raises(ValueError, match="Unknown or unprepared"):
+        core.add_request(
+            Request(
+                "stale",
+                [1],
+                SamplingParams(extra_args={"kv_reclamation_version": 0}),
+                None,
+            )
+        )
+
+
+@pytest.mark.parametrize("failure", ["raise", "missing", "duplicate", "config", "hash"])
+def test_reclamation_failed_prepare_never_publishes_or_reuses_version(failure):
+    from dataclasses import replace
+
+    core = reclamation_core()
+    before = core.reclamation_policies.copy()
+
+    def rpc(method, args):
+        version, config = args
+        if failure == "raise":
+            raise RuntimeError("injected prepare failure")
+        binding = PolicyBinding(version, config, "same")
+        acks = [dict(rank=r, binding=binding) for r in (0, 1)]
+        if failure == "missing":
+            acks.pop()
+        elif failure == "duplicate":
+            acks[1]["rank"] = 0
+        elif failure == "config":
+            acks[1]["binding"] = replace(
+                binding, config=replace(config, retention=0.75)
+            )
+        else:
+            acks[1]["binding"] = replace(binding, calibration_sha256="different")
+        return acks
+
+    core.model_executor = SimpleNamespace(collective_rpc=rpc)
+    with pytest.raises((ValueError, RuntimeError)):
+        core.update_reclamation_policy(
+            {"policy": "triattention", "stats_path": "stats"}
+        )
+    assert core.default_reclamation_version == 0
+    assert core.reclamation_policies == before and core.next_reclamation_version == 2
+    with pytest.raises(ValueError, match="unsupported"):
+        core.update_reclamation_policy({"budget_mode": "demand"})
+    core.vllm_config.parallel_config.data_parallel_size = 2
+    with pytest.raises(ValueError, match="single engine"):
+        core.update_reclamation_policy({"policy": "full"})
+    core.vllm_config.parallel_config.data_parallel_size = 1
+    core.has_coordinator = True
+    with pytest.raises(ValueError, match="single engine"):
+        core.update_reclamation_policy({"policy": "full"})
 
 
 def test_dense_dp_busy_loop_publishes_queue_transitions_and_idle_zero():

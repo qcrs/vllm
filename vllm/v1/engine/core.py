@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, replace
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -232,6 +233,7 @@ class EngineCore:
         self.reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
         self.reclamation_policies = {}
         self.default_reclamation_version = 0
+        self.next_reclamation_version = 1
         if self.reclamation_config is not None:
             acknowledgements = self.model_executor.collective_rpc(
                 "get_reclamation_policy", args=(0,)
@@ -501,6 +503,74 @@ class EngineCore:
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
 
+    def update_reclamation_policy(self, options: dict[str, Any]) -> dict[str, Any]:
+        """Prepare and publish a default for subsequent ADDs on this engine.
+
+        Invoked on the serial engine utility boundary, after prior model output
+        processing. Existing requests, including preempted requests, stay pinned.
+        """
+        if self.reclamation_config is None:
+            raise ValueError("KV reclamation is not enabled")
+        if self.vllm_config.parallel_config.data_parallel_size != 1:
+            raise ValueError("KV policy updates require a single engine")
+        allowed = {
+            "policy",
+            "stats_path",
+            "retention",
+            "sink_tokens",
+            "recent_tokens",
+            "min_keep_tokens",
+        }
+        if options.keys() - allowed:
+            raise ValueError("KV policy update contains unsupported parameters")
+        current = self.reclamation_policies[self.default_reclamation_version]
+        config = replace(current.config, **options)
+        version = self.next_reclamation_version
+        self.next_reclamation_version += 1
+        started = time.monotonic()
+        acknowledgements = self.model_executor.collective_rpc(
+            "prepare_reclamation_policy", args=(version, config)
+        )
+        binding = validate_policy_acks(
+            version,
+            config,
+            acknowledgements,
+            self.vllm_config.parallel_config.tensor_parallel_size,
+        )
+        self.reclamation_policies[version] = binding
+        self.default_reclamation_version = version
+        retired = self._retire_unused_reclamation_policies()
+        return {
+            "binding": asdict(binding),
+            "retired": retired,
+            "update_seconds": time.monotonic() - started,
+        }
+
+    def _retire_unused_reclamation_policies(self) -> list[int]:
+        live = {
+            request.policy_binding.version
+            for request in self.scheduler.requests.values()
+            if request.policy_binding is not None
+        }
+        versions = sorted(
+            self.reclamation_policies.keys() - live - {self.default_reclamation_version}
+        )
+        if not versions:
+            return []
+        acknowledgements = self.model_executor.collective_rpc(
+            "retire_reclamation_policies", args=(versions,)
+        )
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if (
+            len(acknowledgements) != tp_size
+            or {ack["rank"] for ack in acknowledgements} != set(range(tp_size))
+            or any(ack["versions"] != versions for ack in acknowledgements)
+        ):
+            raise RuntimeError("KV policy retirement ACKs disagree")
+        for version in versions:
+            del self.reclamation_policies[version]
+        return versions
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -633,6 +703,8 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
+        if self.reclamation_config is not None and len(self.reclamation_policies) > 1:
+            self._retire_unused_reclamation_policies()
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
@@ -1394,6 +1466,12 @@ class EngineCoreProc(EngineCore):
             self._maybe_publish_request_counts()
 
         raise SystemExit
+
+    def update_reclamation_policy(self, options: dict[str, Any]) -> dict[str, Any]:
+        # Dense DP rewrites each replica's local DP size to one at startup.
+        if self.has_coordinator:
+            raise ValueError("KV policy updates require a single engine")
+        return super().update_reclamation_policy(options)
 
     def _maybe_publish_request_counts(self):
         if not self.publish_dp_lb_stats:

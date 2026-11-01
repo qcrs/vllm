@@ -1450,6 +1450,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
+        if method == "update_reclamation_policy":
+            raise ValueError("KV policy updates require a single engine")
         # Only the result from the first engine is returned.
         return (
             await asyncio.gather(

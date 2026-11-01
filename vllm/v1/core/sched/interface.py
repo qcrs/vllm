@@ -35,6 +35,9 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    # Canonical logical requests, including preempted and deferred finishes.
+    requests: dict[str, "Request"]
+
     @abstractmethod
     def __init__(
         self,

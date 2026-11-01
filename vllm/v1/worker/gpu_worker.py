@@ -932,6 +932,18 @@ class Worker(WorkerBase):
         assert isinstance(self.model_runner, GPUModelRunner)
         return self.model_runner.reclamation.policy_ack(version)
 
+    def prepare_reclamation_policy(self, version: int, config) -> dict:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+        assert isinstance(self.model_runner, GPUModelRunner)
+        return self.model_runner.reclamation.prepare_policy(version, config)
+
+    def retire_reclamation_policies(self, versions: list[int]) -> dict:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+        assert isinstance(self.model_runner, GPUModelRunner)
+        return self.model_runner.reclamation.retire_policies(versions)
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

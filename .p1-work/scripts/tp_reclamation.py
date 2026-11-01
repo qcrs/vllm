@@ -35,9 +35,13 @@ def main():
         "--lifecycle", choices=["repeat", "q0", "maintenance"], default="repeat"
     )
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--worker-cpus", nargs=2, type=int)
+    parser.add_argument("--tp", type=int, choices=[1, 2], default=2)
+    parser.add_argument("--policy-updates", action="store_true")
+    parser.add_argument("--worker-cpus", nargs="+", type=int)
     parser.add_argument("--demand-pages", type=int)
     args = parser.parse_args()
+    if args.worker_cpus:
+        assert len(args.worker_cpus) == args.tp
     run = Path(os.environ["P1_RUN_DIR"])
     hook = Path(__file__).with_name("tp_worker_hooks.py")
     shutil.copyfile(hook, run / "tp_worker_hooks.py")
@@ -56,7 +60,7 @@ def main():
     options = EngineArgs(
         model="/data/models/Qwen3-8B",
         dtype="bfloat16",
-        tensor_parallel_size=2,
+        tensor_parallel_size=args.tp,
         distributed_executor_backend="mp",
         worker_extension_cls=(
             "tp_profile_hooks.P1TPProfileWorker"
@@ -99,7 +103,7 @@ def main():
     manager = scheduler.kv_cache_manager
     pool = manager.block_pool
     assert core.batch_queue is None and engine.vllm_config.max_concurrent_batches == 1
-    non_output = 1 - executor.output_rank
+    non_output = 1 - executor.output_rank if args.tp == 2 else 0
     worker_processes = [handle.proc for handle in executor.workers]
     identities = executor.collective_rpc(
         "p1_install",
@@ -108,6 +112,8 @@ def main():
                 "delay_rank": non_output if args.delay else -1,
                 "delay_s": 3,
                 "fail_rank": non_output if args.fail else -1,
+                "policy_updates": args.policy_updates,
+                "prepare_delay_rank": non_output,
             },
         ),
     )
@@ -128,6 +134,7 @@ def main():
         "A": common + tokenizer.encode("Alice visited the garden. " * 60)[:192],
         "B": common + tokenizer.encode("Bob stayed at the office. " * 40)[:64],
         "C": common + tokenizer.encode("Carol crossed the river. " * 60)[:128],
+        "D": common + tokenizer.encode("David stayed at home. " * 40)[:64],
     }
     ids, outputs, events = {}, {}, []
     original_schedule, original_update = (
@@ -137,11 +144,25 @@ def main():
     step = 0
     inflight, early_errors = {}, []
     stop = threading.Event()
+    policy_events, cold_steps = [], []
+    updating = {}
+    reclaim_steps = (
+        {16: "A", 24: "B", 32: "C"} if args.policy_updates else {16: "A", 32: "A"}
+    )
 
     def watch():
         marker = run / f"rank-{executor.output_rank}" / "local-done-1"
         delayed_done = run / f"rank-{non_output}" / "local-done-1"
         while not stop.wait(0.001):
+            if updating:
+                version = updating["version"]
+                started = run / f"rank-{non_output}" / f"prepare-start-{version}"
+                done = run / f"rank-{non_output}" / f"prepare-end-{version}"
+                if started.exists() and not done.exists():
+                    if core.default_reclamation_version != updating["old"]:
+                        early_errors.append("default changed before all-rank prepare")
+                        return
+                    updating["observed"] = True
             if marker.exists() and not delayed_done.exists() and inflight:
                 try:
                     assert pool.get_num_free_blocks() == inflight["free"]
@@ -163,8 +184,9 @@ def main():
         if q0:
             scheduler.running.insert(0, scheduler.requests[ids["A"]])
             assert output.total_num_scheduled_tokens > 0
-        if step in (16, 32):
-            request = scheduler.requests[ids["A"]]
+        if step in reclaim_steps:
+            victim = reclaim_steps[step]
+            request = scheduler.requests[ids[victim]]
             keep = (
                 (160 if step == 16 else 128)
                 if args.prefix
@@ -172,6 +194,8 @@ def main():
             )
             if args.path == "token":
                 keep -= 1 if step == 16 else 2
+            if args.policy_updates:
+                keep = {"A": 127, "B": 63, "C": 95}[victim]
             if args.demand_pages is not None:
                 source = request.effective_kv_len + output.num_scheduled_tokens.get(
                     request.request_id, 0
@@ -229,7 +253,7 @@ def main():
         if intent:
             markers = [
                 run / f"rank-{rank}" / f"local-done-{len(events) + 1}"
-                for rank in range(2)
+                for rank in range(args.tp)
             ]
             # The device ACK gates release; EventProbe only observes local completion.
             deadline = time.monotonic() + 2
@@ -265,19 +289,64 @@ def main():
     last_checks = None
     try:
         for step in range(120):
-            external = {0: "A", 2: "B", 17: "C"}.get(step)
+            external = (
+                {0: "A", 2: "B", 17: "C", 34: "D"}
+                if args.policy_updates
+                else {0: "A", 2: "B", 17: "C"}
+            ).get(step)
+            if args.policy_updates and external in ("B", "C", "D"):
+                policy = {"B": "random", "C": "triattention", "D": "full"}[external]
+                updating.update(
+                    version=core.next_reclamation_version,
+                    old=core.default_reclamation_version,
+                    observed=False,
+                )
+                changed = core.update_reclamation_policy(
+                    {
+                        "policy": policy,
+                        "stats_path": os.environ.get("P1_STATS"),
+                    }
+                )
+                published_ns = time.monotonic_ns()
+                version = changed["binding"]["version"]
+                assert all(
+                    int((run / f"rank-{rank}" / f"prepare-end-{version}").read_text())
+                    <= published_ns
+                    for rank in range(args.tp)
+                )
+                if version == 1:
+                    assert updating["observed"]
+                changed.update(
+                    published_ns=published_ns,
+                    step=step,
+                    observed_old=updating["observed"],
+                )
+                policy_events.append(changed)
+                updating.clear()
             if external:
                 params = SamplingParams(
                     temperature=0,
                     seed=0,
                     ignore_eos=True,
-                    max_tokens={"A": 64, "B": 40, "C": 20}[external],
+                    max_tokens={"A": 64, "B": 40, "C": 20, "D": 12}[external],
                 )
                 ids[external] = engine.add_request(
                     external, {"prompt_token_ids": prompts[external]}, params
                 )
+                if args.policy_updates:
+                    binding = scheduler.requests[ids[external]].policy_binding
+                    assert binding.version == {"A": 0, "B": 1, "C": 2, "D": 3}[external]
             try:
+                step_started = time.perf_counter()
                 results = engine.step()
+                if external:
+                    cold_steps.append(
+                        dict(
+                            request=external,
+                            step=step,
+                            seconds=time.perf_counter() - step_started,
+                        )
+                    )
             except Exception as error:
                 if not args.fail:
                     raise
@@ -315,8 +384,16 @@ def main():
             last_checks = executor.collective_rpc(
                 "p1_check", args=(list(scheduler.requests),)
             )
-            if step in (16, 32):
-                left, right = [c["reclaim"] for c in last_checks]
+            if args.policy_updates:
+                assert all(
+                    c["policy_versions"] == sorted(core.reclamation_policies)
+                    for c in last_checks
+                )
+                for request in scheduler.requests.values():
+                    assert request.policy_binding.version in core.reclamation_policies
+            if step in reclaim_steps:
+                left = last_checks[0]["reclaim"]
+                right = last_checks[-1]["reclaim"]
                 assert (
                     left["keep"] == right["keep"]
                     and left["row"] == right["row"]
@@ -331,10 +408,22 @@ def main():
                 executor.collective_rpc("p1_poison", args=(events[-1]["released"],))
             if step >= 17 and not engine.has_unfinished_requests():
                 break
-        assert not args.fail and len(events) == 2
+        assert not args.fail and len(events) == (3 if args.policy_updates else 2)
         assert all(item["finished"] for item in outputs.values())
         assert pool.get_num_free_blocks() == 32
         assert all(c["rewritten"] for c in last_checks)
+        if args.policy_updates:
+            assert sorted(core.reclamation_policies) == [3]
+            assert all(c["policy_versions"] == [3] for c in last_checks)
+            for rank in range(args.tp):
+                for version in range(3):
+                    retired_ns = int(
+                        (run / f"rank-{rank}" / f"retire-{version}").read_text()
+                    )
+                    completed_ns = int(
+                        (run / f"rank-{rank}" / f"local-done-{version + 1}").read_text()
+                    )
+                    assert retired_ns > completed_ns
         if args.mode == "full":
             assert all(
                 c["counts"]["FULL"] > 0 and c["counts"]["graph_eager"] > 0
@@ -349,6 +438,8 @@ def main():
                     "ranks": last_checks,
                     "outputs": outputs,
                     "free_final": pool.get_num_free_blocks(),
+                    "policy_events": policy_events,
+                    "cold_steps": cold_steps,
                 },
                 indent=2,
             )

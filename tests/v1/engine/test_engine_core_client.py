@@ -276,6 +276,16 @@ def test_dplb_explicit_rank_and_abort_keep_affinity():
     )
 
 
+def test_dplb_reclamation_updates_are_rejected_before_broadcast():
+    client = _make_dplb_client()
+    client._call_utility_async = AsyncMock()
+    with pytest.raises(ValueError, match="single engine"):
+        asyncio.run(
+            client.call_utility_async("update_reclamation_policy", {"policy": "full"})
+        )
+    client._call_utility_async.assert_not_called()
+
+
 def test_dplb_dense_coordinator_publishes_independent_latest_counts():
     config = SimpleNamespace(
         data_parallel_size=2,
