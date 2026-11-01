@@ -1,5 +1,34 @@
 # P1 v8 工程交付索引
 
+## 2026-11-01工程深化交付
+
+本轮完成dense DP负载闭环修复和一项TP评分归约融合，相关正确性与真实Runtime
+轨迹通过。三个真实shape、合成KV的micro完整reclaim耗时缩短约33–38%；
+**Serving正反向没有稳定收益**，TriAttention pressure各15/24 SLO，TTFT仍FAIL。
+D1主对照及均匀对照均24/24，性能差异落在波动内。SLO与质量边界没有放宽。
+
+| 交付 | 源码/协议 | 事实与停止依据 |
+| --- | --- | --- |
+| D1与条件D2 | [DP调用链](../source-analysis/dp-runtime.md)、[DP协议](../notes/dp-protocol.md) | [DP负载闭环](engineering-dp-load-chain.md)：D1保留，D2 NOT_RUN |
+| T0/T1 | [评分调用链](../source-analysis/m2-scoring.md)、[TP协议](../notes/tp-protocol.md) | [TP评分报告](engineering-tp-scoring.md)：有限局部收益，端到端无稳定收益 |
+| C0与条件C1/C2 | [既有pressure链](../source-analysis/m2-pressure.md) | [Controller成本](engineering-controller-cost.md)：C0 PARTIAL，C1/C2 NOT_RUN |
+| 可选H0/H1 | 绑定官方commit与当前FA2源码 | [H2O可行性](engineering-h2o-feasibility.md)：源码审查完成，GPU probe/H1 NOT_RUN |
+| 完成审计与简历叙事 | [当前状态](../plans/status.md)、[工程计划](../plans/engineering-optimization-experiment-plan.md) | [工程收尾](engineering-closeout.md)：归因、验证、provenance及本地提交 |
+
+既有物理回收Runtime仍是项目主体：L/E分离、共享KeepPlan、全rank completion、
+canonical commit/free、真实reuse以及Prefix/Graph边界按原Gate交付。D1是参考上游
+后的正确性修复，T1是本轮有限内核增量，不能把局部33–38%写成Serving吞吐收益。
+旧SinkRecent17/24 FAIL与全部历史负结果保留；85条质量样本冻结，token一致不
+证明有损质量保持。未扩展原支持域，未push或创建上游PR。
+
+新分析命令/源码/hash与静态检查保存于
+[收尾归档](../experiments/Engineering/20261101-0832-closeout)。初始用户dirty说明
+保留在working tree；本轮仅提交自己的新增内容。以下折叠旧正文保留历史支持契约、
+证据导航与用户计划说明，日期为2026-10-31，不覆盖上面的当前阶段结论。
+
+<details>
+<summary>2026-10-31功能收尾与计划记录（历史）</summary>
+
 当前完成限定范围的功能收尾：R1请求生命周期误放行已封口，R2和D1–D4已修订。
 本次修改、验证命令和剩余边界集中在 [closeout-fixes.md](closeout-fixes.md)。
 [独立收尾Review](independent-closeout-review.md) 保留 `252c747ad6` 发现时的原文，
@@ -78,3 +107,5 @@ reports保存实验事实与历史负结果，notes保存协议，source-analysi
 本次必要CPU回归28项通过，未执行GPU continuation；先前扩大选择时的上游fixture/
 async插件失败及适用静态检查均在 [closeout-fixes](closeout-fixes.md) 单独记录。
 旧154项、GPU轨迹、microbenchmark和完整profile仍按原报告范围使用，不并入本轮测试数。
+
+</details>

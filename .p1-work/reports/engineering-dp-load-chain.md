@@ -101,7 +101,7 @@ runner及日志为初始记录中的`run-d1-cpu-tests.py`、`d1-cpu-tests.log`�
 .venv/bin/python .p1-work/scripts/summarize_dp_serving.py \
   --engineering /data_ssd/qcrs/experiments/p1-v8/Engineering-DP-Formal \
   --diagnostic /data_ssd/qcrs/experiments/p1-v8/Engineering-DP-Diagnostic/20261031-233810-d1-native-load-chain \
-  --output /data_ssd/qcrs/experiments/p1-v8/Engineering/20261031-232434-initial-state/dp-summary.json
+  --output /tmp/p1-dp-summary-recomputed.json
 ```
 
 D1是学习上游后完成的跨进程正确性修复；不是本负载性能突破。旧固定6/2 DP结果

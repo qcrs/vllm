@@ -1,5 +1,39 @@
 # P1 v8 当前状态与未决项
 
+## 2026-11-01工程深化：当前状态
+
+本轮按[prompt2](../prompts/prompt2.md)和
+[工程实验计划](engineering-optimization-experiment-plan.md)完成，未重启M0→DP。
+总体审计、提交与简历叙事见[工程收尾](../reports/engineering-closeout.md)，
+当前交付导航见[delivery](../reports/delivery.md)。
+
+| 范围 | 状态 | 当前结论 |
+| --- | --- | --- |
+| 既有物理回收Runtime/R1/ownership | 保留 | 仍按既有配置与Gate使用，不扩大支持域或重跑旧矩阵 |
+| D1 dense DP负载链 | PASS | 发布/独立汇总/归零/本地在途下界完成；CPU与真实DP2通过；未测得可分辨性能收益 |
+| D2工作量/压力Router | NOT_RUN | 离线回放仅末次建议变化，未证明重复错选；[停止依据](../reports/engineering-dp-load-chain.md) |
+| T0/T1评分融合 | PASS（正确性及局部成本） | 三个真实shape、合成KV的完整reclaim缩短约33–38%；[reference/生命周期/测量](../reports/engineering-tp-scoring.md) |
+| T1 pressure Serving | FAIL（SLO） | 正反向无稳定收益；各run15/24，TTFT超标；timed零抢占，warmup另计 |
+| T1 short无压力 | PASS（本配置预算） | 各6/6、≤5%无退化预算；不触发scorer，不能归因为融合 |
+| TP通信/裁剪Runtime改动 | NOT_RUN | Reduce-root仅benchmark，完整链无稳定收益；保护区比例不足以支持继续裁剪 |
+| C0 Controller成本 | PARTIAL | 29次关联，24次首次retry成功，5次preempt后重算admission；缺增量成本/反事实校准 |
+| C1/C2 | NOT_RUN | 无重复时间错选或匹配动作成本证据；[Controller报告](../reports/engineering-controller-cost.md) |
+| H0源码/H1 | 源码审查完成；GPU probe/H1 NOT_RUN | 当前FA2无per-key统计，未得到满足约束的实现依据；[H2O报告](../reports/engineering-h2o-feasibility.md) |
+
+仍未解决：旧SinkRecent TP pressure为17/24 FAIL，T1不修复其TTFT；历史性能FAIL
+及旧profile PARTIAL保留。C0的旧重NSYS轨迹非正式成本基线，不能用inclusive时间
+建立已验证预测器。H0停止不表示测得性能FAIL，也不表示H2O不可实现。
+
+85条质量样本冻结，有损质量保持未证明。未扩TP2×DP2、async/spec/connector等
+支持域；未新建backend/dispatcher、controller policy或跨池机制。阶段所需实现、
+受影响验证与继续/停止判断已完成；源码事实、协议和实验归档均见各报告。
+
+以下折叠内容保留前一阶段正文和用户原有待提交说明，均为2026-10-31历史记录；
+其中“未实施/待执行”不覆盖上面的当前状态。
+
+<details>
+<summary>2026-10-31功能收尾与计划记录（历史）</summary>
+
 2026-10-31，限定收尾基于 `252c747ad6` 的独立Review执行。
 原始环境和工程约束见 [prompt1](../prompts/prompt1.md)；本次范围以用户限定修复要求
 和Review为准，未重启M0→DP。当前结论导航为 [delivery](../reports/delivery.md)，
@@ -41,3 +75,5 @@ feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按compute
 
 R1已封口、必要回归通过，限定功能收尾完成；随后O1诊断也已按范围收尾。
 当前未追加Runtime优化，后续只在明确新目标或新证据下重开。
+
+</details>

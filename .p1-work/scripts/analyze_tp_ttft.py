@@ -6,6 +6,7 @@ import argparse
 import bisect
 import json
 import sqlite3
+import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -30,11 +31,192 @@ def overlap_ns(start, end, intervals):
     )
 
 
+def controller_summary(run, analysis, output):
+    schedules = [
+        e
+        for e in read_events(run / "timeline-scheduler.jsonl")
+        if e["event"] == "schedule"
+    ]
+    by_step = {e["step"]: e for e in schedules}
+    events = read_events(run / "kv-trace.jsonl")
+    rows = []
+    for reclaim in analysis["reclaims"]:
+        scheduled = by_step[reclaim["step"]]
+        victim = reclaim["intent"]["request_id"]
+        selections = [
+            e
+            for e in events
+            if e["event"] == "reclaim_select"
+            and scheduled["start_ns"] <= e["time_ns"] <= scheduled["end_ns"]
+        ]
+        assert len(selections) == 1 and selections[0]["request_id"] == victim
+        selected = selections[0]
+        misses = [
+            e
+            for e in events
+            if e["event"] == "allocation_miss"
+            and scheduled["start_ns"] <= e["time_ns"] < selected["time_ns"]
+        ]
+        miss = misses[-1]
+        assert miss["required"] - miss["available"] == selected["shortfall"]
+        commit = reclaim["commit_ns"]
+        requester = miss["request_id"]
+        attempts = [
+            e
+            for e in events
+            if e["request_id"] == requester
+            and e["time_ns"] > commit
+            and e["event"] in ("allocation_done", "allocation_miss", "native_preempt")
+        ]
+        first = attempts[0]
+        done = next(e for e in attempts if e["event"] == "allocation_done")
+        outcome_events = [
+            e
+            for e in events
+            if commit < e["time_ns"] <= done["time_ns"]
+            and (
+                e["event"] in ("native_preempt", "reclaim_select", "reclaim_commit")
+                or (
+                    e["request_id"] == requester
+                    and e["event"] in ("allocation_miss", "allocation_done")
+                )
+            )
+        ]
+        native_preemptions = [
+            e for e in outcome_events if e["event"] == "native_preempt"
+        ]
+        retry_step = next(
+            s for s in schedules if s["start_ns"] <= first["time_ns"] <= s["end_ns"]
+        )
+        victim_next = next(
+            s for s in schedules if s["start_ns"] > commit and victim in s["requests"]
+        )
+        gpu_end = max(r["last_gpu_end_ns"] for r in reclaim["ranks"].values())
+        gpu_begin = min(r["first_gpu_start_ns"] for r in reclaim["ranks"].values())
+        before_done = [e for e in attempts if e["time_ns"] <= done["time_ns"]]
+        rows.append(
+            dict(
+                step=reclaim["step"],
+                requester=requester,
+                victim=victim,
+                miss_status=miss["request_status"],
+                miss=miss,
+                selection=selected,
+                source_e=reclaim["intent"]["source_e"],
+                keep=reclaim["intent"]["target_e"],
+                reserve_blocks=selected["goal_blocks"] - selected["shortfall"],
+                released_blocks=reclaim["released_blocks"],
+                released_covers_goal=reclaim["released_blocks"]
+                >= selected["goal_blocks"],
+                useful_released_blocks=min(
+                    reclaim["released_blocks"], selected["goal_blocks"]
+                ),
+                retry_step=retry_step["step"],
+                first_retry=first,
+                first_retry_success=first["event"] == "allocation_done",
+                allocation_success=done,
+                outcome_events=outcome_events,
+                retry_misses_before_success=sum(
+                    e["event"] == "allocation_miss" for e in before_done
+                ),
+                preemptions_before_success=len(native_preemptions),
+                victim_next_step=victim_next["step"],
+                timing_ms=dict(
+                    select_to_commit_inclusive=(commit - selected["time_ns"]) / 1e6,
+                    select_to_first_gpu_inclusive=(gpu_begin - selected["time_ns"])
+                    / 1e6,
+                    reclaim_gpu_span=(gpu_end - gpu_begin) / 1e6,
+                    last_gpu_to_commit=(commit - gpu_end) / 1e6,
+                    commit_to_first_retry=(first["time_ns"] - commit) / 1e6,
+                    commit_to_success=(done["time_ns"] - commit) / 1e6,
+                    commit_to_victim_schedule=(victim_next["start_ns"] - commit) / 1e6,
+                ),
+                ranks=reclaim["ranks"],
+            )
+        )
+
+    def timing_ranges(selected_rows):
+        return {
+            name: dict(
+                min=min(values), max=max(values), median=statistics.median(values)
+            )
+            for name in selected_rows[0]["timing_ms"]
+            for values in [[r["timing_ms"][name] for r in selected_rows]]
+        }
+
+    cost_groups = {}
+    for kind, selected_rows in (
+        ("zero_copy", [r for r in rows if r["selection"]["zero_copy"]]),
+        ("token_copy", [r for r in rows if not r["selection"]["zero_copy"]]),
+    ):
+        if not selected_rows:
+            continue
+        cost_groups[kind] = dict(
+            intents=len(selected_rows),
+            source_e_range=[
+                min(r["source_e"] for r in selected_rows),
+                max(r["source_e"] for r in selected_rows),
+            ],
+            keep_range=[
+                min(r["keep"] for r in selected_rows),
+                max(r["keep"] for r in selected_rows),
+            ],
+            first_retry_success=sum(r["first_retry_success"] for r in selected_rows),
+            timing_ranges_ms=timing_ranges(selected_rows),
+        )
+    result = dict(
+        source=str(run),
+        reclaims=rows,
+        counts=dict(
+            intents=len(rows),
+            first_retry_success=sum(r["first_retry_success"] for r in rows),
+            allocation_success_after_preemption=sum(
+                r["preemptions_before_success"] > 0 for r in rows
+            ),
+            released_covers_goal=sum(r["released_covers_goal"] for r in rows),
+            miss_status=dict(Counter(r["miss_status"] for r in rows)),
+            zero_copy=sum(r["selection"]["zero_copy"] for r in rows),
+            requester_is_victim=sum(r["requester"] == r["victim"] for r in rows),
+            released_blocks=sum(r["released_blocks"] for r in rows),
+            candidates=dict(Counter(r["selection"]["candidates"] for r in rows)),
+        ),
+        timing_ranges_ms=timing_ranges(rows),
+        observed_cost_groups=cost_groups,
+        clock_tolerance_ns=analysis["clock_tolerance_ns"],
+        limits=[
+            "SinkRecent diagnostic with profiler perturbation and six preemptions",
+            "select-to-commit includes normal forward; not incremental reclaim cost",
+            "GPU span contains launch gaps and TP waits, not just kernel busy time",
+            "unselected candidate costs and matched preemption counterfactual "
+            "are absent",
+            "allocation success after native preemption is a new recompute "
+            "admission, not reclaim retry success",
+            "C1/C2 NOT_RUN; no supported time-cost ordering or action gate",
+        ],
+    )
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(
+        json.dumps(
+            {k: v for k, v in result.items() if k not in ("reclaims",)}, indent=2
+        )
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--controller-output", type=Path)
+    parser.add_argument("--analysis", type=Path)
     args = parser.parse_args()
     run = args.run.resolve()
+    if args.controller_output:
+        if args.analysis is None:
+            parser.error("--controller-output requires --analysis")
+        controller_summary(
+            run, json.loads(args.analysis.read_text()), args.controller_output
+        )
+        return
     scheduler = read_events(run / "timeline-scheduler.jsonl")
     clients = read_events(run / "timeline-client.jsonl")
     kv = read_events(run / "kv-trace.jsonl")
@@ -344,6 +526,7 @@ def main():
             ranks[rank] = dict(
                 host_start_ns=event["start_ns"],
                 host_return_ns=event["end_ns"],
+                first_gpu_start_ns=min(e["start_ns"] for e in activity),
                 last_gpu_end_ns=gpu_end,
                 gpu_busy_ms=union_ns((e["start_ns"], e["end_ns"]) for e in activity)
                 / 1e6,
@@ -454,7 +637,9 @@ def main():
             "cumulative returned blocks are not unique pages or simultaneous capacity",
         ],
     )
-    (run / "ttft-analysis.json").write_text(json.dumps(result, indent=2) + "\n")
+    (args.output or run / "ttft-analysis.json").write_text(
+        json.dumps(result, indent=2) + "\n"
+    )
     print(
         json.dumps(
             {
