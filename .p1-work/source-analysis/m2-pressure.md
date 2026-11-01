@@ -1,5 +1,26 @@
 # M2 压力控制源码与状态
 
+## 2026-11-01 Revision：有界重试与已知 prefill 阶段
+
+`Scheduler.schedule` 在原生抢占/等待之前选候选，`_reclaim_retry` 使用同次
+`scheduled` 的 post-forward 进度、原 allocator 页数接口及真实 running 顺序，
+预测下一次截至 requester 的分配；`retry_pass` 先覆盖后方已知 running 分配，
+不可行再退回 requester。`retry_reclaim_candidates` 用
+`free + N - ceil((K + victim_next_q)/B) >= other_required + soft_reserve`
+求最大合法 K，保持请求绑定的 floor；不是预留未来容量。
+
+新显式 `prefill_fixed` 在 `_select_reclaim_candidate` 检查所有 unfinished 请求：
+`num_tokens - num_computed_tokens - scheduled_q - requester_cached > 1` 时用fixed，
+否则用retry_pass。waiting初始 `is_prefill_chunk=False` 不能作为decode证据；
+preempt后的已知output history也属于重算，最后已调度完的chunk不算积压。
+不复制请求状态或引入可调前瞻。trace的 `effective_budget_mode` 记录实际分支。
+
+K仍由既有fixed/retry求解，后续intent→全rank completion→canonical commit/free
+完全复用，ownership/row/E/hash边界不变。原retry首次成功也可能让后方prefill
+抢占重算，故离线审计新增实际prefill工作量，不将输入counter当成计算量。
+新正式三轮零timed抢占，但吞吐仍比fixed低约2%，15/24 SLO_FAIL；固定预算默认，
+详见 [Revision报告](../reports/engineering-revision-controller.md)。
+
 ## 2026-11-01 CB0 / CB1 与请求绑定增量
 
 当前 [Controller报告](../reports/engineering-next-controller.md) 保留预算正确性及

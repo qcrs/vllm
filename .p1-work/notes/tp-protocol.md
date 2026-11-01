@@ -94,3 +94,11 @@ prefill 的 pure GPU/通信归因仍需设备证据，不由 host 剩余量推�
 affinity/预热及3轮条件，不清 Triton 缓存、不扫 chunk 或将诊断数值当正式收益。
 `benchmark_kv_scoring.py --length-specialization-audit` 只观察进程 cache miss，
 不能用两次不同磁盘缓存状态的首调用时间计算优化百分比。
+
+## 2026-11-01 Revision：反向与阈值复核
+
+用户对正式−0.740%/16/24疑似回归提出复核，本轮只补一次相同协议反向B/A，
+每次完整预热+3轮，不修改内核或清磁盘缓存。反向dynamic E相对baseline+0.200%，
+两边18/24且24条token IDs一致；不能选其中一方向报告收益，也不足以宣称稳定回归。
+保留冷变体修正和原正向负结果，prefill/排队SLO缺口独立保留；具体范围及hash见
+[反向报告](../reports/engineering-revision-tp.md)。

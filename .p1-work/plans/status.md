@@ -1,5 +1,21 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-REVISION-NAV-BEGIN -->
+
+## 2026-11-01 CB1 / TP 退化复核：当前状态
+
+[本轮收尾](../reports/engineering-revision-closeout.md)已完成，代码提交`9af8339c25`。
+CB1发现首次重试成功掩盖的后方prefill抢占/重算放大，新增显式prefill_fixed；
+54项CPU、真实TP2控制链和有限正式A/B完成。正式三轮零timed抢占，但相对fixed
+吞吐−2.005%、SLO15/24对18/24，仍无Serving收益，fixed默认，不扩调参。
+TP仅补一次反向：dynamic E相对baseline+0.200%，两边18/24，未复现旧正向退化；
+保留冷变体修正，不宣称稳定Serving收益或零回归。prefill/排队TTFT缺口仍在。
+分项见[Controller](../reports/engineering-revision-controller.md)、
+[TP](../reports/engineering-revision-tp.md)。下方各轮结论按当时证据保留；
+未重跑DP/PL2、旧矩阵或质量样本，用户原有patch保留，未push。
+
+<!-- ENGINEERING-REVISION-NAV-END -->
+
 <!-- ENGINEERING-REFINEMENT-NAV-BEGIN -->
 
 ## 2026-11-01 重试预算与状态覆盖修正：当前状态

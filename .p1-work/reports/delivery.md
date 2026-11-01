@@ -1,5 +1,20 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-REVISION-NAV-BEGIN -->
+
+## 2026-11-01 CB1 / TP 疑似退化复核交付
+
+当前以[复核收尾](engineering-revision-closeout.md)为准。CB1补充实际prefill重算审计，
+实现显式prefill_fixed阶段预算，54项CPU与真实TP2/有限A/B通过运行验证；正式三轮
+零timed抢占，但吞吐仍较fixed低2.005%，15/24 SLO_FAIL，fixed保持默认。
+TP反向两边18/24、dynamic E名义+0.200%；未复现原正向−0.740%/16/24，
+保留消除多余E特化的修正，仍不声称稳定Serving收益，原负结果不改写。
+源码机制、复算证据与停止依据分别见[Controller](engineering-revision-controller.md)、
+[TP](engineering-revision-tp.md)。本轮5次GPU guard PASS，本地分阶段提交；
+未push、未改用户原有正文、未扩旧矩阵或85条质量样本。DP/PL2既有结论保留。
+
+<!-- ENGINEERING-REVISION-NAV-END -->
+
 <!-- ENGINEERING-REFINEMENT-NAV-BEGIN -->
 
 ## 2026-11-01 本轮修正交付
