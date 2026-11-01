@@ -115,7 +115,14 @@ def counters(metrics):
 
 
 async def workload(
-    origin, prompts, repeats, run, prefix_caching, full_warmup, arrivals
+    origin,
+    prompts,
+    repeats,
+    run,
+    prefix_caching,
+    full_warmup,
+    arrivals,
+    reclamation_counts=False,
 ):
     results = []
     limits = httpx.Limits(max_connections=16)
@@ -129,6 +136,18 @@ async def workload(
             else range(repeats)
         )
         for repeat in rounds:
+
+            async def read_reclamation_counts():
+                reply = await client.post(
+                    origin + "/collective_rpc",
+                    json={"method": "p1_reclamation_counts"},
+                )
+                reply.raise_for_status()
+                return reply.json()["results"]
+
+            counts_before = (
+                await read_reclamation_counts() if reclamation_counts else None
+            )
             if prefix_caching:
                 reply = await client.post(origin + "/reset_prefix_cache")
                 reply.raise_for_status()
@@ -177,6 +196,10 @@ async def workload(
                 summary["cached_prompt_tokens_by_request"] = cached
                 summary["cached_prompt_tokens"] = sum(cached)
             after = (await client.get(origin + "/metrics")).text
+            if reclamation_counts:
+                counts_after = await read_reclamation_counts()
+                summary["reclamation_counts_before"] = counts_before
+                summary["reclamation_counts_after"] = counts_after
             before_counts = counters(before)
             summary["counter_deltas"] = {
                 key: value - before_counts[key]
@@ -205,6 +228,7 @@ def main():
     parser.add_argument("--budget-mode", choices=["fixed", "demand"], default="fixed")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--reclamation-counts", action="store_true")
     parser.add_argument("--prefix-caching", action="store_true")
     parser.add_argument(
         "--graph-mode", choices=["eager", "full", "piecewise"], default="eager"
@@ -241,6 +265,16 @@ def main():
         port = probe.getsockname()[1]
     origin = f"http://127.0.0.1:{port}"
     env = dict(os.environ, VLLM_ENABLE_V1_MULTIPROCESSING="1")
+    if args.reclamation_counts:
+        scripts = Path(__file__).parent
+        shutil.copyfile(
+            scripts / "reclamation_counts.py", run / "reclamation_counts.py"
+        )
+        (run / "sitecustomize.py").write_text(
+            "import reclamation_counts\nreclamation_counts.install()\n"
+        )
+        env["PYTHONPATH"] = str(run) + os.pathsep + env["PYTHONPATH"]
+        env["VLLM_SERVER_DEV_MODE"] = "1"
     env.pop("VLLM_KV_TRACE_FILE", None)
     if args.prefix_caching:
         env["VLLM_SERVER_DEV_MODE"] = "1"
@@ -402,6 +436,7 @@ def main():
                     args.prefix_caching,
                     args.full_warmup or args.graph_mode != "eager",
                     arrivals,
+                    args.reclamation_counts,
                 )
             )
         finally:

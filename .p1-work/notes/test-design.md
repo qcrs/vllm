@@ -96,3 +96,10 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 - I/O：FP32 raw scores、eligible域population variance/mean、local distinct-head/GQA映射，输出FP32 layer contribution；沿原顺序和权重累加。
 - 防止的失败：非2幂head/group的padding参与MAX/mean、partial token tile越界、零方差分母变化、同分或相邻cutoff的计划变化，以及TP贡献计权错误。
 - 最低成本层级：扩展现有compaction suite的独立dense复数reference到group=3，再用受控raw scores隔离归约的partial tile/零方差/ties；真实TP2 collective reference检查所有rank计划，一条Qwen3-8B重复回收→continuation→free/rewrite/reuse验证真实路径。未改变completion/Graph协议，不复制旧故障注入矩阵；性能只在独立benchmark/Serving测量。
+
+## TP2a 有序层累计融合
+
+- 用途：在既有 normalization/GQA 归约中累加 FP32 层贡献，消除独立 add 和 layer_total。
+- I/O：raw score、eligible population variance/mean、distinct-head 权重与旧 total；输出同顺序 shared score/KeepPlan。
+- 风险：Torch alpha-add 与 FMA 舍入差异在 cutoff 改变排名，零方差/partial tile/padding 或 TP 权重出错。
+- 最低有效验证：既有独立 complex reference 与 near-cutoff suite、真实 TP2 SUM/plan、8B continuation/reuse；三个冻结形状的当前 T1 基线与候选 micro，只有完整链受益才反向及 Serving。

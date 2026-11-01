@@ -109,6 +109,33 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
 
     restore()
     row = tables.block_tables[0].gpu[0]
+    if args.launch_audit and source == 2051:
+        from collections import Counter
+
+        scorer.shared_scores(layers, row, logical, source, prefix, recent)
+        torch.accelerator.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            scorer.shared_scores(layers, row, logical, source, prefix, recent)
+            torch.accelerator.synchronize()
+        records.append(
+            dict(
+                part="launch_audit",
+                rank=rank,
+                shape=shape,
+                kernels=dict(
+                    Counter(
+                        e.name
+                        for e in profile.events()
+                        if e.device_type == torch.autograd.DeviceType.CUDA
+                    )
+                ),
+            )
+        )
     torch.accelerator.synchronize()
     dist.barrier()
     cold_start, cold_end = torch.cuda.Event(True), torch.cuda.Event(True)
@@ -264,6 +291,7 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--launch-audit", action="store_true")
     parser.add_argument("--stats", required=True)
     parser.add_argument("--lengths", nargs="+", type=int, default=[4096, 32768])
     parser.add_argument("--iterations", type=int, default=10)
@@ -344,7 +372,6 @@ def main():
                 "score_workspace_bytes": (
                     scorer.scores.numel()
                     + scorer.total.numel()
-                    + scorer.layer_total.numel()
                     + scorer.coefficients.numel()
                 )
                 * 4,

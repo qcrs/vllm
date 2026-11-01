@@ -245,6 +245,50 @@ def test_shared_frequency_reduction_preserves_ties_at_partial_tile_boundary(
     )
 
 
+@pytest.mark.parametrize("layers", [2, 36])
+def test_shared_frequency_accumulation_matches_torch_alpha_add(monkeypatch, layers):
+    """Ordered FP32 accumulation preserves cutoff plans, including close ties."""
+    from vllm.v1.worker.gpu.kv_scoring import (
+        TriAttentionScorer,
+        _normalize_reduce_scores,
+        protected_topk,
+    )
+
+    source, prefix, recent = 131, 3, 128
+    torch.manual_seed(11)
+    raw = torch.randn(layers, 9, source, device="cuda")
+    raw[:, :, 64:68] = raw[:, :, 64:65]
+    raw[:, :, 68] = torch.nextafter(raw[:, :, 64], raw[:, :, 64] + 1)
+    scorer = TriAttentionScorer(
+        torch.zeros(layers, 9, 3, 64, device="cuda"), 3, 1e6, source
+    )
+    expected = torch.zeros(source, device="cuda")
+    reduced = torch.empty_like(expected)
+    for layer in range(layers):
+        var, mean = torch.var_mean(raw[layer, :, prefix:recent], dim=1, correction=0)
+        _normalize_reduce_scores[(2,)](
+            raw[layer],
+            var,
+            mean,
+            reduced,
+            source,
+            source,
+            3,
+            3,
+            128,
+            enable_fp_fusion=False,
+        )
+        expected.add_(reduced, alpha=1 / layers)
+    monkeypatch.setattr(scorer, "prepare_phase", lambda _: None)
+    monkeypatch.setattr(scorer, "_score_layer", lambda c, r, e, layer: raw[layer])
+    actual = scorer.shared_scores([None] * layers, None, None, source, prefix, recent)
+    assert torch.equal(actual, expected)
+    assert torch.equal(
+        protected_topk(actual, 68, prefix, recent),
+        protected_topk(expected, 68, prefix, recent),
+    )
+
+
 @pytest.mark.parametrize("kv_heads", [1, 4])
 def test_tp_frequency_contributions_match_complete_unique_gqa_reference(kv_heads):
     from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk

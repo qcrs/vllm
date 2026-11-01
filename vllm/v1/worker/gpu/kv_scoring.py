@@ -84,6 +84,8 @@ def _normalize_reduce_scores(
     HEADS: tl.constexpr,
     GROUP: tl.constexpr,
     TILE: tl.constexpr,
+    WEIGHT: tl.constexpr = 1.0,
+    ACCUMULATE: tl.constexpr = False,
 ):
     member = tl.program_id(0) * TILE + tl.arange(0, TILE)
     head = tl.arange(0, triton.next_power_of_2(HEADS))
@@ -102,6 +104,9 @@ def _normalize_reduce_scores(
     normalized = tl.div_rn(value - mu[:, :, None], denominator[:, :, None])
     grouped = tl.max(tl.where(valid_head[:, :, None], normalized, -float("inf")), 1)
     result = tl.sum(tl.where(head[:, None] < HEADS, grouped, 0), 0) / HEADS
+    if ACCUMULATE:
+        previous = tl.load(reduced + member, member < E, 0)
+        result = tl.fma(result, tl.full((), WEIGHT, tl.float32), previous)
     tl.store(reduced + member, result, member < E)
 
 
@@ -167,7 +172,6 @@ class TriAttentionScorer:
             (stats.shape[1], max_len), dtype=torch.float32, device=stats.device
         )
         self.total = torch.empty(max_len, dtype=torch.float32, device=stats.device)
-        self.layer_total = torch.empty_like(self.total)
 
     @classmethod
     def from_file(cls, path, model_config, max_len, device, tp_size=1, tp_rank=0):
@@ -253,17 +257,15 @@ class TriAttentionScorer:
                 scores,
                 variance,
                 mean,
-                self.layer_total,
+                total,
                 source_len,
                 scores.stride(0),
                 self.kv_heads,
                 self.group,
                 128,
+                self.kv_heads / (self.global_kv_heads * len(layers)),
+                True,
                 enable_fp_fusion=False,
-            )
-            total.add_(
-                self.layer_total[:source_len],
-                alpha=self.kv_heads / (self.global_kv_heads * len(layers)),
             )
         return total
 
