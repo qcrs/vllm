@@ -60,6 +60,7 @@ from vllm.v1.kv_reclamation import (
     ReclaimRequest,
     ReclamationConfig,
     choose_reclaim_candidate,
+    demand_reclaim_candidates,
     sink_recent_ranges,
     whole_block_row,
 )
@@ -1306,7 +1307,17 @@ class Scheduler(SchedulerInterface):
         goal = self.kv_cache_manager.last_allocation_shortfall + min(
             config.reserve_cap, live_decode_count
         )
-        selected = choose_reclaim_candidate(candidates, goal)
+        shortfall = self.kv_cache_manager.last_allocation_shortfall
+        demand = (
+            demand_reclaim_candidates(
+                candidates, shortfall, goal, config, self.block_size, member_bytes
+            )
+            if config.budget_mode == "demand" or self.kv_cache_manager.trace is not None
+            else candidates
+        )
+        fixed_selected = choose_reclaim_candidate(candidates, goal)
+        demand_selected = choose_reclaim_candidate(demand, goal)
+        selected = demand_selected if config.budget_mode == "demand" else fixed_selected
         if self.kv_cache_manager.trace is not None:
             from dataclasses import asdict
 
@@ -1321,6 +1332,12 @@ class Scheduler(SchedulerInterface):
                 goal_blocks=goal,
                 budget=asdict(config),
                 candidates=[asdict(c) for c in candidates],
+                demand_candidates=[asdict(c) for c in demand],
+                fixed_selected=asdict(fixed_selected) if fixed_selected else None,
+                demand_selected=asdict(demand_selected) if demand_selected else None,
+                selection_rule="coverage/zero-copy/bytes-per-page/release/arrival/id",
+                shadow_skip_insufficient=bool(candidates)
+                and max(c.released_blocks for c in candidates) < shortfall,
                 selected=selected.request_id if selected else None,
             )
         if selected is None:

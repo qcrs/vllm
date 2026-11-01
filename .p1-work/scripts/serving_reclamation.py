@@ -202,6 +202,7 @@ def main():
     parser.add_argument("--pool-gib", type=float, required=True)
     parser.add_argument("--stats")
     parser.add_argument("--reserve", type=int, default=0)
+    parser.add_argument("--budget-mode", choices=["fixed", "demand"], default="fixed")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--prefix-caching", action="store_true")
@@ -221,6 +222,8 @@ def main():
         "vllm/v1/worker/gpu/kv_scoring.py",
         "vllm/v1/worker/gpu/kv_reclamation.py",
         "vllm/v1/worker/gpu/kv_compaction.py",
+        "vllm/v1/kv_reclamation.py",
+        "vllm/v1/core/kv_cache_manager.py",
         "vllm/v1/core/sched/scheduler.py",
     ]
     hashes = {}
@@ -311,6 +314,7 @@ def main():
                 "retention": 1.0 if args.policy == "noop" else 0.5,
                 "pressure": True,
                 "reserve_cap": args.reserve,
+                "budget_mode": args.budget_mode,
                 "stats_path": args.stats,
             }
         }

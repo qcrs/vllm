@@ -24,8 +24,13 @@ def candidate_summary(run, output):
     for event in events:
         if event["event"] != "reclaim_candidates":
             continue
+        active = (
+            event["demand_candidates"]
+            if event["budget"].get("budget_mode") == "demand"
+            else event["candidates"]
+        )
         selected = next(
-            (c for c in event["candidates"] if c["request_id"] == event["selected"]),
+            (c for c in active if c["request_id"] == event["selected"]),
             None,
         )
         row = dict(event)

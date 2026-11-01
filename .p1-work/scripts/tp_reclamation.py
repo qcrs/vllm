@@ -35,6 +35,7 @@ def main():
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--worker-cpus", nargs=2, type=int)
+    parser.add_argument("--demand-pages", type=int)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
     hook = Path(__file__).with_name("tp_worker_hooks.py")
@@ -170,11 +171,27 @@ def main():
             )
             if args.path == "token":
                 keep -= 1 if step == 16 else 2
+            if args.demand_pages is not None:
+                source = request.effective_kv_len + output.num_scheduled_tokens.get(
+                    request.request_id, 0
+                )
+                keep = min(
+                    source - 1,
+                    16
+                    * (
+                        len(manager.get_block_ids(request.request_id)[0])
+                        - args.demand_pages
+                    ),
+                )
             output.reclaim_request = scheduler.make_reclaim_request(
                 request, output, keep
             )
             intent = output.reclaim_request
-            if args.path == "token" and args.policy == "sink_recent":
+            if (
+                args.demand_pages is None
+                and args.path == "token"
+                and args.policy == "sink_recent"
+            ):
                 _, recent = sink_recent_ranges(
                     intent.source_effective_kv_len,
                     keep,
@@ -304,7 +321,11 @@ def main():
                     and left["row"] == right["row"]
                     and left["E"] == right["E"]
                 )
-                assert left["path"] == right["path"] == args.path
+                assert left["path"] == right["path"]
+                if args.demand_pages is None:
+                    assert left["path"] == args.path
+                else:
+                    assert len(events[-1]["released"]) == args.demand_pages
                 events[-1]["rank_results"] = [left, right]
                 executor.collective_rpc("p1_poison", args=(events[-1]["released"],))
             if step >= 17 and not engine.has_unfinished_requests():

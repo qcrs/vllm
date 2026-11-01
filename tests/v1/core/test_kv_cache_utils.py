@@ -64,6 +64,7 @@ from vllm.v1.kv_reclamation import (
     ReclaimResult,
     ReclamationConfig,
     choose_reclaim_candidate,
+    demand_reclaim_candidates,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -1607,6 +1608,55 @@ def test_reclamation_candidate_coverage_cost_and_stable_tie(goal, expected):
         ReclaimCandidate("tie", 128, 6, 30, False, 2),
     ]
     assert choose_reclaim_candidate(candidates, goal).request_id == expected
+
+
+@pytest.mark.parametrize(
+    "source,prefix,floor,shortfall,goal,expected",
+    [
+        (1024, 0, 512, 4, 4, 960),
+        (1025, 0, 512, 1, 1, 1024),
+        (1009, 64, 576, 4, 4, 960),
+        (1024, 64, 576, 28, 30, 576),  # Only D is feasible.
+        (1024, 0, 512, 40, 40, 512),  # Neither target: original floor.
+    ],
+)
+def test_reclamation_demand_maximizes_keep_within_floor(
+    source, prefix, floor, shortfall, goal, expected
+):
+    """Partial tails and soft reserve must not force K below the quality floor."""
+    row = tuple(range((source + 15) // 16))
+    candidate = ReclaimCandidate(
+        "A",
+        floor,
+        len(row) - (floor + 15) // 16,
+        100,
+        False,
+        1,
+        prefix,
+        source,
+        row,
+    )
+    result = demand_reclaim_candidates(
+        [candidate], shortfall, goal, ReclamationConfig(), 16, 256
+    )[0]
+    assert result.keep_tokens == expected
+    assert result.released_blocks == len(row) - (expected + 15) // 16
+    assert result.protected_prefix_tokens == prefix
+    assert result.keep_tokens >= floor
+
+
+def test_reclamation_demand_real_pool_releases_only_required_page(reclamation_owner):
+    manager, request, intent = reclamation_owner
+    row = tuple(intent.source_block_ids)
+    candidate = ReclaimCandidate("A", 32, 2, 100, False, 1, 0, 64, row)
+    selected = demand_reclaim_candidates(
+        [candidate], 1, 1, ReclamationConfig(), 16, 256
+    )[0]
+    intent = dataclasses.replace(intent, target_keep_tokens=selected.keep_tokens)
+    before = manager.block_pool.get_num_free_blocks()
+    manager.commit_reclamation(request, intent, ReclaimResult("A", 48, list(row[:3])))
+    assert manager.block_pool.get_num_free_blocks() == before + selected.released_blocks
+    assert request.effective_kv_len == 48
 
 
 def test_reclamation_reuses_released_pages_and_grows_from_effective_length(

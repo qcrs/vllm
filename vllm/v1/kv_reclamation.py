@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Physical KV reclamation contracts shared by scheduler and worker."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cmp_to_key
 from typing import TYPE_CHECKING
 
@@ -24,6 +24,7 @@ class ReclamationConfig:
     recent_tokens: int = 16
     min_keep_tokens: int = 128
     reserve_cap: int = 0
+    budget_mode: str = "fixed"
 
     @classmethod
     def from_vllm_config(cls, config: "VllmConfig") -> "ReclamationConfig | None":
@@ -35,6 +36,8 @@ class ReclamationConfig:
         if options is None:
             return None
         result = cls(**options)
+        if result.budget_mode not in ("fixed", "demand"):
+            raise ValueError("Unknown KV reclamation budget mode")
         if result.policy not in ("sink_recent", "random", "triattention"):
             raise ValueError("Unknown KV reclamation policy")
         if result.policy == "triattention" and result.stats_path is None:
@@ -114,6 +117,70 @@ class ReclaimCandidate:
     source_block_ids: tuple[int, ...] = ()
     logical_tokens: int = 0
     q: int = 0
+
+
+def retarget_reclaim_candidate(
+    candidate: ReclaimCandidate,
+    keep: int,
+    config: ReclamationConfig,
+    block_size: int,
+    member_bytes: int,
+) -> ReclaimCandidate:
+    prefix, recent = sink_recent_ranges(
+        candidate.source_effective_kv_len,
+        keep,
+        config.sink_tokens,
+        candidate.protected_prefix_tokens,
+    )
+    zero_copy = (
+        config.policy == "sink_recent"
+        and whole_block_row(
+            list(candidate.source_block_ids),
+            candidate.source_effective_kv_len,
+            keep,
+            prefix,
+            recent,
+            block_size,
+        )
+        is not None
+    )
+    return replace(
+        candidate,
+        keep_tokens=keep,
+        released_blocks=len(candidate.source_block_ids)
+        - (keep + block_size - 1) // block_size,
+        copy_bytes=0 if zero_copy else 2 * (keep - prefix) * member_bytes,
+        zero_copy=zero_copy,
+    )
+
+
+def demand_reclaim_candidates(
+    candidates: list[ReclaimCandidate],
+    shortfall: int,
+    goal: int,
+    config: ReclamationConfig,
+    block_size: int,
+    member_bytes: int,
+) -> list[ReclaimCandidate]:
+    """Maximize K at G, then D; retain fixed floors if neither is feasible."""
+    for target in dict.fromkeys((goal, shortfall)):
+        if target <= 0:
+            continue
+        covering = []
+        for candidate in candidates:
+            keep = min(
+                candidate.source_effective_kv_len - 1,
+                block_size * (len(candidate.source_block_ids) - target),
+            )
+            if keep >= candidate.keep_tokens:
+                covering.append(
+                    retarget_reclaim_candidate(
+                        candidate, keep, config, block_size, member_bytes
+                    )
+                )
+        if covering:
+            return covering
+    return candidates
 
 
 def choose_reclaim_candidate(

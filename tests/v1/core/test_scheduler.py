@@ -274,6 +274,19 @@ def test_pressure_running_miss_can_use_maintenance_without_fake_forward(
     assert a.num_preemptions == 0
 
 
+@pytest.mark.parametrize("q", [0, 1])
+def test_pressure_demand_uses_same_post_forward_snapshot(pressure_scheduler, q):
+    scheduler = pressure_scheduler(12, budget_mode="demand")
+    request = create_requests(1, num_tokens=63, req_ids=["A"])[0]
+    scheduler.add_request(request)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    scheduler.kv_cache_manager.last_allocation_shortfall = 1
+    _, candidate = scheduler._select_reclaim_candidate({"A": q})
+    assert candidate.source_effective_kv_len == 63 + q
+    assert candidate.keep_tokens == 48 and candidate.released_blocks == 1
+    assert candidate.q == q
+
+
 def test_pressure_zero_releasable_pages_uses_native_preemption(pressure_scheduler):
     scheduler = pressure_scheduler(3, retention=1)
     a = create_requests(1, num_tokens=32, req_ids=["A"])[0]
