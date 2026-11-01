@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import msgspec.msgpack
 import pytest
 import torch
 import zmq
@@ -316,7 +315,9 @@ def test_dplb_dense_coordinator_publishes_independent_latest_counts():
         output.connect(back_out)
         encoder = MsgpackEncoder()
 
-        def publish(rank, running, waiting, step):
+        def publish(rank, running, waiting, step, work=0, usage=0.0):
+            from vllm.v1.metrics.stats import DPLoadSnapshot
+
             output.send_multipart(
                 encoder.encode(
                     EngineCoreOutputs(
@@ -325,27 +326,47 @@ def test_dplb_dense_coordinator_publishes_independent_latest_counts():
                             num_running_reqs=running,
                             num_waiting_reqs=waiting,
                             step_counter=step,
+                            dp_load=DPLoadSnapshot(
+                                work, usage, step, step, time.monotonic_ns()
+                            ),
                         ),
                     )
                 )
             )
 
-        def receive(expected):
+        client = _make_dplb_client()
+        client.engine_ranks_managed = [0, 1]
+
+        def receive(expected, work):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 assert front.poll(1000)
-                counts, wave, running = msgspec.msgpack.decode(front.recv())
-                if counts == expected:
-                    assert (wave, running) == (0, False)
+                client._apply_load_stats(front.recv())
+                if (
+                    client.lb_engines == expected
+                    and [s.unfinished_tokens for s in client.lb_loads] == work
+                ):
+                    assert (client.current_wave, client.engines_running) == (0, False)
+                    for snapshot in client.lb_loads:
+                        assert (
+                            snapshot.generated_ns
+                            <= snapshot.coordinator_received_ns
+                            <= client.lb_stats_published_ns
+                            <= client.lb_stats_received_ns
+                        )
                     return
             pytest.fail(f"Coordinator did not publish {expected}")
 
-        publish(0, 2, 1, 7)
-        publish(1, 1, 0, 3)
-        publish(0, 3, 0, 8)
-        receive([[0, 3], [0, 1]])
+        publish(0, 2, 1, 7, 8192, 0.5)
+        publish(1, 1, 0, 3, 512, 0.2)
+        publish(0, 3, 0, 8, 4096, 0.4)
+        receive([[0, 3], [0, 1]], [4096, 512])
+        publish(1, 1, 0, 4, 128, 0.1)
+        receive([[0, 3], [0, 1]], [4096, 128])
         publish(0, 0, 0, 9)
-        receive([[0, 0], [0, 1]])
+        receive([[0, 0], [0, 1]], [0, 128])
+        publish(1, 0, 0, 5)
+        receive([[0, 0], [0, 0]], [0, 0])
     finally:
         for socket in sockets:
             socket.close(linger=0)

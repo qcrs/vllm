@@ -65,7 +65,7 @@ from vllm.v1.kv_reclamation import (
     whole_block_row,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
-from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.stats import DPLoadSnapshot, PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -2364,6 +2364,20 @@ class Scheduler(SchedulerInterface):
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
+
+    def get_dp_load_snapshot(self, sequence: int, generated_ns: int) -> DPLoadSnapshot:
+        unfinished = sum(
+            max(0, r.num_tokens - (r.num_computed_tokens - r.num_in_flight_tokens))
+            for r in self.requests.values()
+            if not r.is_finished()
+        )
+        return DPLoadSnapshot(
+            unfinished_tokens=unfinished,
+            kv_cache_usage=self.kv_cache_manager.usage,
+            sequence=sequence,
+            step=self.current_step,
+            generated_ns=generated_ns,
+        )
 
     def add_request(self, request: Request) -> None:
         if self.reclamation_config is not None and request.resumable:

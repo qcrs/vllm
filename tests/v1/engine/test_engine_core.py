@@ -24,6 +24,7 @@ from vllm.config import (
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.engine.core import (
     DPEngineCoreProc,
@@ -35,8 +36,9 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_reclamation import PolicyBinding, ReclamationConfig
+from vllm.v1.metrics.stats import DPLoadSnapshot
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from ...utils import create_new_process_for_each_test, multi_gpu_test
@@ -166,9 +168,16 @@ def test_dense_dp_busy_loop_publishes_queue_transitions_and_idle_zero():
     core = object.__new__(EngineCoreProc)
     core.publish_dp_lb_stats = True
     core.last_counts = (0, 0)
+    core.last_dp_load = (0, 0.0)
+    core.dp_load_sequence = core.dp_load_sampled_ns = 0
     core.output_queue = queue.Queue()
     state = SimpleNamespace(counts=(0, 0))
-    core.scheduler = SimpleNamespace(get_request_counts=lambda: state.counts)
+    core.scheduler = SimpleNamespace(
+        get_request_counts=lambda: state.counts,
+        get_dp_load_snapshot=lambda seq, now: DPLoadSnapshot(
+            unfinished_tokens=sum(state.counts), sequence=seq, generated_ns=now
+        ),
+    )
     running = iter([True, True, False])
     core._handle_shutdown = lambda: next(running)
     inputs = iter([(0, 2), (1, 0)])
@@ -187,6 +196,79 @@ def test_dense_dp_busy_loop_publishes_queue_transitions_and_idle_zero():
         stats = decoder.decode(MsgpackEncoder().encode(output)).scheduler_stats
         observed.append((stats.num_running_reqs, stats.num_waiting_reqs))
     assert observed == [(0, 2), (1, 0), (0, 0)]
+
+
+def test_dense_dp_known_work_keeps_inflight_and_preempted_history():
+    scheduler = object.__new__(Scheduler)
+    requests = [
+        Request(name, [1] * length, SamplingParams(max_tokens=10000), None)
+        for name, length in (
+            ("waiting", 1024),
+            ("chunk", 8192),
+            ("preempt", 512),
+            ("decode", 20),
+            ("done", 1024),
+        )
+    ]
+    waiting, chunk, preempted, decode, finished = requests
+    chunk.status = decode.status = RequestStatus.RUNNING
+    chunk.num_computed_tokens = chunk.num_in_flight_tokens = 512
+    preempted.status = RequestStatus.PREEMPTED
+    decode.append_output_token_ids([2, 3])
+    decode.num_computed_tokens = 21
+    finished.status = RequestStatus.FINISHED_ABORTED
+    scheduler.requests = {r.request_id: r for r in requests}
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.5)
+    scheduler.current_step = 7
+    snapshot = scheduler.get_dp_load_snapshot(2, 100)
+    assert snapshot == DPLoadSnapshot(9729, 0.5, 2, 7, 100)
+    chunk.num_in_flight_tokens = 0
+    assert scheduler.get_dp_load_snapshot(3, 101).unfinished_tokens == 9729 - 512
+
+
+def test_dense_dp_load_only_changes_coalesce_but_idle_zero_is_immediate():
+    core = object.__new__(EngineCoreProc)
+    core.publish_dp_lb_stats = True
+    core.last_counts, core.last_dp_load = (0, 0), (0, 0.0)
+    core.dp_load_sequence = core.dp_load_sampled_ns = 0
+    core.output_queue = queue.Queue()
+    state = SimpleNamespace(counts=(1, 0), work=8192, usage=0.5)
+    core.scheduler = SimpleNamespace(
+        get_request_counts=lambda: state.counts,
+        get_dp_load_snapshot=lambda seq, now: DPLoadSnapshot(
+            state.work, state.usage, seq, seq, now
+        ),
+    )
+    with patch("vllm.v1.engine.core.time.monotonic_ns") as clock:
+        clock.return_value = 1_000_000_000
+        core._maybe_publish_request_counts()
+        state.work = 7680
+        clock.return_value += 50_000_000
+        core._maybe_publish_request_counts()
+        assert core.output_queue.qsize() == 1
+        clock.return_value += 50_000_000
+        core._maybe_publish_request_counts()
+        clock.return_value += 100_000_000
+        core._maybe_publish_request_counts()
+        assert core.output_queue.qsize() == 2
+        state.usage = 0.6
+        core._maybe_publish_request_counts()
+        assert core.output_queue.qsize() == 2
+        clock.return_value += 100_000_000
+        core._maybe_publish_request_counts()
+        state.counts, state.work, state.usage = (0, 0), 0, 0.0
+        clock.return_value += 1
+        core._maybe_publish_request_counts()
+    snapshots = []
+    while not core.output_queue.empty():
+        _, output = core.output_queue.get_nowait()
+        output = MsgpackDecoder(EngineCoreOutputs).decode(
+            MsgpackEncoder().encode(output)
+        )
+        snapshots.append(output.scheduler_stats.dp_load)
+    assert [s.unfinished_tokens for s in snapshots] == [8192, 7680, 7680, 0]
+    assert [s.kv_cache_usage for s in snapshots] == [0.5, 0.5, 0.6, 0.0]
+    assert [s.sequence for s in snapshots] == [1, 2, 3, 4]
 
 
 def test_moe_dp_request_counts_keep_step_and_wave():

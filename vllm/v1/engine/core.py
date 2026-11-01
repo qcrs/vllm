@@ -1152,6 +1152,9 @@ class EngineCoreProc(EngineCore):
             # and "hybrid" LB modes.
             self.publish_dp_lb_stats = internal_dp_balancing
             self.last_counts = (0, 0)
+            self.last_dp_load = (0, 0.0)
+            self.dp_load_sequence = 0
+            self.dp_load_sampled_ns = 0
 
             self.addresses = addresses
             self.process_input_queue_block = True
@@ -1478,12 +1481,22 @@ class EngineCoreProc(EngineCore):
             return
 
         counts = self.scheduler.get_request_counts()
-        if counts != self.last_counts:
-            self.last_counts = counts
-            stats = SchedulerStats(
-                num_running_reqs=counts[0], num_waiting_reqs=counts[1]
-            )
-            self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+        now = time.monotonic_ns()
+        # Queue transitions (including idle zero) publish immediately. Coalesce
+        # token/usage-only changes to the coordinator's existing 100ms cadence.
+        if counts == self.last_counts and now - self.dp_load_sampled_ns < 100_000_000:
+            return
+        self.dp_load_sampled_ns = now
+        snapshot = self.scheduler.get_dp_load_snapshot(self.dp_load_sequence + 1, now)
+        load = (snapshot.unfinished_tokens, snapshot.kv_cache_usage)
+        if counts == self.last_counts and load == self.last_dp_load:
+            return
+        self.last_counts, self.last_dp_load = counts, load
+        self.dp_load_sequence = snapshot.sequence
+        stats = SchedulerStats(
+            num_running_reqs=counts[0], num_waiting_reqs=counts[1], dp_load=snapshot
+        )
+        self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""

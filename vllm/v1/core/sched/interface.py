@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.metrics.stats import SchedulerStats
+    from vllm.v1.metrics.stats import DPLoadSnapshot, SchedulerStats
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.structured_output import StructuredOutputManager
@@ -235,6 +235,13 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_dp_load_snapshot(
+        self, sequence: int, generated_ns: int
+    ) -> "DPLoadSnapshot":
+        """Snapshot known work without crediting in-flight forward progress."""
         raise NotImplementedError
 
     @abstractmethod

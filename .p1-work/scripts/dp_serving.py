@@ -169,7 +169,9 @@ def main():
     )
     parser.add_argument("--pool-gib", type=float, required=True)
     parser.add_argument(
-        "--scenario", choices=["native", "skewed", "uniform"], default="native"
+        "--scenario",
+        choices=["native", "skewed", "uniform", "w1", "w0"],
+        default="native",
     )
     parser.add_argument("--stats")
     parser.add_argument("--repeats", type=int, default=3)
@@ -194,6 +196,8 @@ def main():
         "vllm/v1/engine/coordinator.py",
         "vllm/v1/engine/core_client.py",
         "vllm/v1/core/sched/scheduler.py",
+        "vllm/v1/core/sched/interface.py",
+        "vllm/v1/metrics/stats.py",
     ):
         source = source_root / relative
         target = run / "source" / relative
@@ -293,8 +297,14 @@ def main():
         lengths[-2:] = [128, 256]
     elif args.scenario == "uniform":
         lengths = [4096] * 8
+    elif args.scenario == "w1":
+        lengths = [8192, 512] * 4
+    elif args.scenario == "w0":
+        lengths = [4096] * 8
     prompts = [(seed * (length // len(seed) + 1))[:length] for length in lengths]
     arrivals = [0, 0.3, 0.6, 0.9, 5, 5.3, 5.6, 5.9]
+    if args.scenario in ("w1", "w0"):
+        arrivals = [i * 0.05 for i in range(8)]
     (run / "prompts.json").write_text(json.dumps(prompts))
     (run / "protocol.json").write_text(
         json.dumps(

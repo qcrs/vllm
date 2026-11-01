@@ -6,6 +6,7 @@ import json
 import os
 import time
 from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -50,7 +51,7 @@ class P1DPScheduler(Scheduler):
             running=len(self.running),
             retry=self.reclaim_retry_pending,
             scheduled=output.num_scheduled_tokens,
-            intent=vars(output.reclaim_request) if output.reclaim_request else None,
+            intent=asdict(output.reclaim_request) if output.reclaim_request else None,
             requests={
                 rid: {
                     "L": r.num_computed_tokens,

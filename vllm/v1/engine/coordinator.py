@@ -5,6 +5,7 @@ import multiprocessing
 import multiprocessing.connection
 import time
 import weakref
+from dataclasses import replace
 
 import msgspec.msgpack
 import zmq
@@ -14,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import get_mp_context, set_process_title
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
+from vllm.v1.metrics.stats import DPLoadSnapshot
 from vllm.v1.serial_utils import MsgpackDecoder
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
@@ -140,6 +142,7 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
+        self.load: DPLoadSnapshot | None = None
 
 
 class DPCoordinatorProc:
@@ -276,7 +279,13 @@ class DPCoordinatorProc:
                         engine_req_counts_list = self._get_engine_counts()
                         stats_changed = False
 
-                    to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    to_publish = (
+                        engine_req_counts_list,
+                        current_wave,
+                        engines_running,
+                        [engine.load for engine in self.engines],
+                        time.monotonic_ns(),
+                    )
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
                     continue
@@ -406,6 +415,11 @@ class DPCoordinatorProc:
                                 )
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
+                        if scheduler_stats.dp_load is not None:
+                            self.engines[eng_index].load = replace(
+                                scheduler_stats.dp_load,
+                                coordinator_received_ns=time.monotonic_ns(),
+                            )
                         stats_changed = True
 
                     # Wave coordination: handle wave completion and start notifications
@@ -443,8 +457,17 @@ class DPCoordinatorProc:
                             self._send_start_wave(publish_back, wave, eng_index)
 
                 if wave_state_changed:
-                    message = (None, current_wave, engines_running)
-                    publish_front.send(msgspec.msgpack.encode(message))
+                    publish_front.send(
+                        msgspec.msgpack.encode(
+                            (
+                                None,
+                                current_wave,
+                                engines_running,
+                                [],
+                                time.monotonic_ns(),
+                            )
+                        )
+                    )
 
     @staticmethod
     def _send_start_wave(

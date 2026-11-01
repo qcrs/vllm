@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -56,6 +57,7 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.metrics.stats import DPLoadSnapshot
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -1224,6 +1226,9 @@ class DPAsyncMPClient(AsyncMPClient):
         # List of [waiting, running] pair per engine.
         # Used only by DPLBAsyncMPClient subclass.
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
+        self.lb_loads: list[DPLoadSnapshot | None] = [None for _ in self.core_engines]
+        self.lb_stats_published_ns = 0
+        self.lb_stats_received_ns = 0
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
 
@@ -1308,6 +1313,9 @@ class DPAsyncMPClient(AsyncMPClient):
                                 ]
                             else:
                                 self.lb_engines = self.lb_engines[:new_engine_count]
+                            self.lb_loads = (self.lb_loads + [None] * new_engine_count)[
+                                :new_engine_count
+                            ]
                             # Send scale up notification to coordinator
                             scale_msg = msgspec.msgpack.encode(
                                 ("SCALE_ELASTIC_EP", new_engine_count)
@@ -1337,24 +1345,29 @@ class DPAsyncMPClient(AsyncMPClient):
                         continue
 
                     # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
-                    self.current_wave = wave
-                    self.engines_running = running
-                    if counts is not None:
-                        # Running and waiting counts are global from the
-                        # Coordinator including all EngineCores. Slice to get
-                        # just the cores managed by this client.
-                        ranks = self.engine_ranks_managed
-                        count_slice = slice(ranks[0], ranks[-1] + 1)
-                        sliced_counts = counts[count_slice]
-                        self.lb_engines = sliced_counts
-                        logger.debug(
-                            "Received counts: %s (%s)", sliced_counts, count_slice
-                        )
+                    self._apply_load_stats(buf)
 
         resources.stats_update_task = asyncio.create_task(
             run_engine_stats_update_task()
         )
+
+    def _apply_load_stats(self, buf: bytes) -> None:
+        counts, wave, running, loads, published_ns = msgspec.msgpack.decode(
+            buf,
+            type=tuple[
+                list[list[int]] | None, int, bool, list[DPLoadSnapshot | None], int
+            ],
+        )
+        self.current_wave = wave
+        self.engines_running = running
+        if counts is not None:
+            ranks = self.engine_ranks_managed
+            count_slice = slice(ranks[0], ranks[-1] + 1)
+            self.lb_engines = counts[count_slice]
+            self.lb_loads = loads[count_slice]
+            self.lb_stats_published_ns = published_ns
+            self.lb_stats_received_ns = time.monotonic_ns()
+            logger.debug("Received counts: %s (%s)", self.lb_engines, count_slice)
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         self._ensure_stats_update_task()
@@ -1748,6 +1761,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # NOTE(yongji): Immediately stop sending requests to the removing engines.
         self.core_engines = self.core_engines[:new_data_parallel_size]
         self.lb_engines = self.lb_engines[:new_data_parallel_size]
+        self.lb_loads = self.lb_loads[:new_data_parallel_size]
         wait_future = self._eep_wait_for_setup_switch_complete()
 
         await asyncio.gather(*reconfig_futures)

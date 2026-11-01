@@ -116,3 +116,11 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 - I/O contract：已准备version通过extra_args选择，结构化utility准备/发布/退役；未知version、full回收、ACK失败/不一致及仍被引用的退役明确拒绝。
 - 主要失败：预算与scorer串版、preempt/slot复用串请求、某rank未准备提前发布、旧intent未完成提前卸载。
 - 最低有效层次：既有Scheduler/Pool/engine suites验证CPU状态/序列化/拒绝；复用tp_reclamation与worker hook，在8B TP1/TP2验证延迟prepare、混合策略、全层payload、continuation与free/reuse。
+
+## DP3 已知工作量快照
+
+- 用途：Scheduler产生去重unfinished工作量，经原Coordinator通道到实际Frontend shadow。
+- I/O：`num_tokens - (num_computed_tokens - num_in_flight_tokens)`与Pool usage；输出带engine/sequence/processed step/生成与接收时刻的快照，不预测max_tokens。
+- 风险：提前扣除在途、preempt重复/漏算、counts不变压住U更新、完成未归零、把状态年龄冒充网络延迟、改变affinity/F/tie语义。
+- 最低有效验证：现有engine/client suite用真实Request计算在途/重算/结束，受控clock验证100ms合并及立即归零，真实ZMQ验证独立副本快照与Frontend接收；再固定W1/W0各完整预热+两轮真实DP2 HTTP诊断，不改Router。
+- DP4进入判据预注册：不同请求、不同source sequence上重复出现相近C（差≤1）、U差至少512且两副本状态年龄≤250ms；还须结合实际排队/工作/忙闲判断，shadow分歧本身不是错选证据。

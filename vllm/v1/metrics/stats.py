@@ -183,6 +183,18 @@ class SchedulerIterationDetails:
 
 
 @dataclass
+class DPLoadSnapshot:
+    """Known unfinished work; timestamps are local monotonic nanoseconds."""
+
+    unfinished_tokens: int = 0
+    kv_cache_usage: float = 0.0
+    sequence: int = 0
+    step: int = 0
+    generated_ns: int = 0
+    coordinator_received_ns: int = 0
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -194,6 +206,7 @@ class SchedulerStats:
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0
+    dp_load: DPLoadSnapshot | None = None
 
     kv_cache_usage: float = 0.0
     iteration_details: SchedulerIterationDetails | None = None
