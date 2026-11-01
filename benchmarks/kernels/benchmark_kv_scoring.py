@@ -88,6 +88,12 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
     )
     worker.layers, worker.scorer = layers, scorer
     worker.compactor = StableKVCompactor(layers)
+    if args.grouped_probe:
+        from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer
+
+        scorer = GroupedTriAttentionScorer(stats, 8, 1e6, 9216, 2, rank, device)
+        scorer.initialize_groups(worker.compactor)
+        worker.scorer = scorer
     worker.tp_group = SimpleNamespace(
         world_size=2,
         rank_in_group=rank,
@@ -229,6 +235,11 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
             ("complete_reclaim", partial(worker.reclaim, intent, tables)),
         ]
         for name, launch in parts:
+            if args.grouped_probe and name in (
+                "raw_with_phase",
+                "normalization_reduction",
+            ):
+                continue
             if collective == "reduce_root" and name not in (
                 "score_collective",
                 "complete_plan",
@@ -292,6 +303,7 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-audit", action="store_true")
+    parser.add_argument("--grouped-probe", action="store_true")
     parser.add_argument("--stats", required=True)
     parser.add_argument("--lengths", nargs="+", type=int, default=[4096, 32768])
     parser.add_argument("--iterations", type=int, default=10)

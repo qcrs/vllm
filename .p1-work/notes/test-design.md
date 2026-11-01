@@ -103,3 +103,9 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 - I/O：raw score、eligible population variance/mean、distinct-head 权重与旧 total；输出同顺序 shared score/KeepPlan。
 - 风险：Torch alpha-add 与 FMA 舍入差异在 cutoff 改变排名，零方差/partial tile/padding 或 TP 权重出错。
 - 最低有效验证：既有独立 complex reference 与 near-cutoff suite、真实 TP2 SUM/plan、8B continuation/reuse；三个冻结形状的当前 T1 基线与候选 micro，只有完整链受益才反向及 Serving。
+
+## TP2b 四层探针
+
+用途是批量 raw/eligible population variance/有序累计；I/O仍为相同shared score/KeepPlan。
+风险是跨层stride、统计域、GQA和舍入改变排名；先复用独立复数reference、零方差与真实TP2完整heads测试，
+再比较冻结三形状计划hash与完整链。probe不把逐层normalization隔离计时冒充分组阶段。

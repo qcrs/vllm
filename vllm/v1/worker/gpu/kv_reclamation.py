@@ -18,7 +18,7 @@ from vllm.v1.kv_reclamation import (
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
-from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
+from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer, protected_topk
 
 
 class KVReclamationWorker:
@@ -39,7 +39,7 @@ class KVReclamationWorker:
             (), dtype=torch.int32, device=req_states.device
         )
         self.scorer = (
-            TriAttentionScorer.from_file(
+            GroupedTriAttentionScorer.from_file(
                 config.stats_path,
                 model_config,
                 model_config.max_model_len,
@@ -66,6 +66,8 @@ class KVReclamationWorker:
         if len({cache.data_ptr() for cache in self.layers}) != len(self.layers):
             raise ValueError("KV-sharing layers are not supported by reclamation")
         self.compactor = StableKVCompactor(self.layers)
+        if self.scorer is not None:
+            self.scorer.initialize_groups(self.compactor)
 
     def add_request(self, index: int, computed: int) -> None:
         self.effective_kv_len_np[index] = computed

@@ -152,13 +152,17 @@ def dense_frequency_reference(kv, stats, logical_next, theta):
     return torch.stack(outputs)
 
 
+@pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("statistics_heads", [2, 6, 8])
-def test_paged_shared_frequency_scores_use_logical_time_and_gqa(statistics_heads):
+def test_paged_shared_frequency_scores_use_logical_time_and_gqa(
+    statistics_heads, grouped
+):
     from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
 
     generator = torch.Generator().manual_seed(91)
     cpu_layers, layers = [], []
-    for _ in range(2):
+    num_layers = 5 if grouped else 2
+    for _ in range(num_layers):
         cpu = torch.empty_strided((7, 2, 16, 256), (16513, 512, 1024, 2))
         cpu.copy_(torch.randn(cpu.shape, generator=generator))
         gpu = torch.empty_strided(
@@ -170,12 +174,20 @@ def test_paged_shared_frequency_scores_use_logical_time_and_gqa(statistics_heads
     row, source, logical_next = [6, 1, 4, 0, 5, 2], 95, 18123
     row_gpu = torch.tensor(row, dtype=torch.int32, device="cuda")
     logical_gpu = torch.tensor([logical_next], dtype=torch.int32, device="cuda")
-    stats = torch.randn((2, statistics_heads, 3, 64), generator=generator) * 0.2
+    stats = (
+        torch.randn((num_layers, statistics_heads, 3, 64), generator=generator) * 0.2
+    )
     stats[:, :, 2] = (stats[:, :, 0].square() + stats[:, :, 1].square()).sqrt() + 0.3
     scorer = TriAttentionScorer(stats.cuda(), 2, 1e6, 128)
+    if grouped:
+        from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
+        from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer
+
+        scorer = GroupedTriAttentionScorer(stats.cuda(), 2, 1e6, 128)
+        scorer.initialize_groups(StableKVCompactor(layers))
     expected = []
     prefix, recent, keep = 3, 88, 41
-    for layer in range(2):
+    for layer in range(num_layers):
         dense, _ = scalar_retained_kv([cpu_layers[layer]], row, list(range(source)))
         raw = dense_frequency_reference(dense[0], stats[layer], logical_next, 1e6)
         actual = scorer.score_layer(layers[layer], row_gpu, logical_gpu, source, layer)
@@ -200,12 +212,19 @@ def test_paged_shared_frequency_scores_use_logical_time_and_gqa(statistics_heads
     assert actual_plan.tolist() == expected_plan
 
 
-def test_shared_frequency_zero_variance_and_stable_protection():
+@pytest.mark.parametrize("grouped", [False, True])
+def test_shared_frequency_zero_variance_and_stable_protection(grouped):
     from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
 
     cache = torch.ones((2, 2, 16, 256), dtype=torch.bfloat16, device="cuda")
     stats = torch.ones((1, 8, 3, 64), device="cuda")
     scorer = TriAttentionScorer(stats, 2, 1e6, 32)
+    if grouped:
+        from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
+        from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer
+
+        scorer = GroupedTriAttentionScorer(stats, 2, 1e6, 32)
+        scorer.initialize_groups(StableKVCompactor([cache]))
     scores = scorer.shared_scores(
         [cache],
         torch.tensor([1], dtype=torch.int32, device="cuda"),
@@ -245,8 +264,11 @@ def test_shared_frequency_reduction_preserves_ties_at_partial_tile_boundary(
     )
 
 
+@pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("layers", [2, 36])
-def test_shared_frequency_accumulation_matches_torch_alpha_add(monkeypatch, layers):
+def test_shared_frequency_accumulation_matches_torch_alpha_add(
+    monkeypatch, layers, grouped
+):
     """Ordered FP32 accumulation preserves cutoff plans, including close ties."""
     from vllm.v1.worker.gpu.kv_scoring import (
         TriAttentionScorer,
@@ -282,7 +304,32 @@ def test_shared_frequency_accumulation_matches_torch_alpha_add(monkeypatch, laye
     monkeypatch.setattr(scorer, "prepare_phase", lambda _: None)
     monkeypatch.setattr(scorer, "_score_layer", lambda c, r, e, layer: raw[layer])
     actual = scorer.shared_scores([None] * layers, None, None, source, prefix, recent)
-    assert torch.equal(actual, expected)
+    if grouped:
+        from vllm.v1.worker.gpu.kv_scoring import _grouped_normalize
+
+        actual.zero_()
+        for first in range(0, layers, 4):
+            group_raw = raw[first : first + 4]
+            var, mean = torch.var_mean(
+                group_raw[:, :, prefix:recent], dim=2, correction=0
+            )
+            _grouped_normalize[(2,)](
+                group_raw,
+                var,
+                mean,
+                actual,
+                source,
+                source,
+                3,
+                3,
+                group_raw.shape[0],
+                1 / layers,
+                enable_fp_fusion=False,
+            )
+    if grouped:
+        torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-6)
+    else:
+        assert torch.equal(actual, expected)
     assert torch.equal(
         protected_topk(actual, 68, prefix, recent),
         protected_topk(expected, 68, prefix, recent),

@@ -274,3 +274,158 @@ class TriAttentionScorer:
             layers, row, logical_length, source_len, prefix, recent
         )
         return protected_topk(scores, keep, prefix, recent)
+
+
+@triton.jit
+def _grouped_raw(
+    pointers,
+    strides,
+    row,
+    stats,
+    coefficients,
+    scores,
+    E,
+    FIRST: tl.constexpr,
+    LAYERS: tl.constexpr,
+    STRIDE: tl.constexpr,
+    STATS_STRIDE: tl.constexpr,
+    F: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEADS: tl.constexpr,
+    B: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    head = tl.program_id(0)
+    local_layer = tl.program_id(2)
+    layer = FIRST + local_layer
+    cache = tl.load(pointers + layer).to(tl.pointer_type(tl.bfloat16))
+    sb = tl.load(strides + layer * 4)
+    sh = tl.load(strides + layer * 4 + 1)
+    st = tl.load(strides + layer * 4 + 2)
+    sc = tl.load(strides + layer * 4 + 3)
+    member = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    frequency = tl.arange(0, triton.next_power_of_2(F))
+    page = tl.load(row + member // B, member < E, 0).to(tl.int64)
+    address = page[:, None] * sb + head * sh + (member[:, None] % B) * st
+    mask = (member[:, None] < E) & (frequency[None, :] < F)
+    real = tl.load(cache + address + frequency[None, :] * sc, mask, 0).to(tl.float32)
+    imag = tl.load(cache + address + (frequency[None, :] + F) * sc, mask, 0).to(
+        tl.float32
+    )
+    magnitude = tl.sqrt(real * real + imag * imag + 1.0e-8)
+    cosine = tl.load(coefficients + frequency, frequency < F, 0)
+    sine = tl.load(coefficients + F + frequency, frequency < F, 0)
+    for query in tl.static_range(GROUP):
+        query_head = head * GROUP + query
+        base = stats + layer * STATS_STRIDE + query_head * 3 * F
+        qr = tl.load(base + frequency, frequency < F, 0)
+        qi = tl.load(base + F + frequency, frequency < F, 0)
+        qa = tl.load(base + 2 * F + frequency, frequency < F, 0)
+        mu_abs = tl.sqrt(qr * qr + qi * qi + 1.0e-8)
+        prod_real = qr[None, :] * real + qi[None, :] * imag
+        prod_imag = qi[None, :] * real - qr[None, :] * imag
+        score = tl.sum(
+            prod_real * cosine[None, :]
+            - prod_imag * sine[None, :]
+            + (qa - mu_abs)[None, :] * magnitude,
+            1,
+        )
+        tl.store(
+            scores + (local_layer * HEADS * GROUP + query_head) * STRIDE + member,
+            score,
+            member < E,
+        )
+
+
+@triton.jit
+def _grouped_normalize(
+    scores,
+    variance,
+    mean,
+    total,
+    E,
+    STRIDE: tl.constexpr,
+    HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    LAYERS: tl.constexpr,
+    WEIGHT: tl.constexpr,
+):
+    for layer in tl.static_range(LAYERS):
+        _normalize_reduce_scores(
+            scores + layer * HEADS * GROUP * STRIDE,
+            variance + layer * HEADS * GROUP,
+            mean + layer * HEADS * GROUP,
+            total,
+            E,
+            STRIDE,
+            HEADS,
+            GROUP,
+            128,
+            WEIGHT,
+            True,
+        )
+
+
+class GroupedTriAttentionScorer(TriAttentionScorer):
+    def initialize_groups(self, compactor):
+        self.compactor = compactor
+        self.group_scores = torch.empty(
+            (4, self.stats.shape[1], self.total.numel()),
+            device=self.total.device,
+            dtype=torch.float32,
+        )
+        self.group_variance = torch.empty(
+            (4, self.stats.shape[1]),
+            device=self.total.device,
+        )
+        self.group_mean = torch.empty_like(self.group_variance)
+
+    def shared_scores(self, layers, row, logical_length, source_len, prefix, recent):
+        total = self.total[:source_len]
+        total.zero_()
+        if prefix == recent or not self.scoring_owner:
+            return total
+        self.prepare_phase(logical_length)
+        for first in range(0, len(layers), 4):
+            count = min(4, len(layers) - first)
+            scores = self.group_scores[:count, :, :source_len]
+            _grouped_raw[(self.kv_heads, triton.cdiv(source_len, 16), count)](
+                self.compactor.layer_ptrs,
+                self.compactor.strides,
+                row,
+                self.stats,
+                self.coefficients,
+                scores,
+                source_len,
+                first,
+                count,
+                self.total.numel(),
+                self.stats.stride(0),
+                self.stats.shape[3],
+                self.group,
+                self.kv_heads,
+                layers[0].shape[2],
+                16,
+                enable_fp_fusion=False,
+            )
+            torch.ops.aten.var_mean.correction_out(
+                scores[:, :, prefix:recent],
+                [2],
+                correction=0,
+                out0=self.group_variance[:count],
+                out1=self.group_mean[:count],
+            )
+            _grouped_normalize[(triton.cdiv(source_len, 128),)](
+                scores,
+                self.group_variance,
+                self.group_mean,
+                total,
+                source_len,
+                self.total.numel(),
+                self.kv_heads,
+                self.group,
+                count,
+                self.kv_heads / (self.global_kv_heads * len(layers)),
+                enable_fp_fusion=False,
+            )
+        return total

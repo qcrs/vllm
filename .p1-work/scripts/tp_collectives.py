@@ -69,6 +69,16 @@ def worker(rank, run):
                 for v in cpu
             ]
             scorer = TriAttentionScorer(stats, kv_heads, 1e6, 64, 2, rank, device)
+            if os.environ.get("P1_GROUPED_PROBE"):
+                from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
+                from vllm.v1.worker.gpu.kv_scoring import (
+                    GroupedTriAttentionScorer,
+                )
+
+                scorer = GroupedTriAttentionScorer(
+                    stats, kv_heads, 1e6, 64, 2, rank, device
+                )
+                scorer.initialize_groups(StableKVCompactor(local))
             scores = scorer.shared_scores(local, row, clock, source, prefix, recent)
             before = scores.clone()
             dist.all_reduce(scores)
