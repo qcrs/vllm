@@ -34,6 +34,80 @@ def raw_scores(scorer, layers, row, logical, length):
 
 
 @torch.inference_mode()
+def audit_length_specialization(args, run):
+    """Record cache misses across an E alignment change in the same scorer."""
+    from triton import knobs
+
+    from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer
+
+    stats = torch.load(args.stats, weights_only=True, map_location="cuda")["stats"]
+    torch.manual_seed(11)
+    layers = [
+        torch.randn(261, 16, 4, 256, device="cuda", dtype=torch.bfloat16).transpose(
+            1, 2
+        )
+        for _ in range(36)
+    ]
+    row = torch.randperm(261, device="cuda", dtype=torch.int32)
+    logical = torch.tensor([8315], device="cuda", dtype=torch.int32)
+    scorer = GroupedTriAttentionScorer(stats, 8, 1e6, 9216, 2, 0, torch.device("cuda"))
+    scorer.initialize_groups(StableKVCompactor(layers))
+    misses, records = [], []
+    previous = knobs.runtime.jit_cache_hook
+
+    def observe(**kwargs):
+        name = kwargs["fn"].name
+        if name in ("_grouped_raw", "_grouped_normalize"):
+            misses.append(json.loads(kwargs["compile"]["specialization_data"]))
+        if previous is not None:
+            return previous(**kwargs)
+        return None
+
+    knobs.runtime.jit_cache_hook = observe
+    try:
+        for length in (4159, 4160, 4161, 4159):
+            before = len(misses)
+            torch.accelerator.synchronize()
+            start = time.perf_counter_ns()
+            scores = scorer.shared_scores(layers, row, logical, length, 16, length - 16)
+            torch.accelerator.synchronize()
+            elapsed = (time.perf_counter_ns() - start) / 1e6
+            records.append(
+                dict(
+                    E=length,
+                    wall_complete_ms=elapsed,
+                    cache_misses=misses[before:],
+                    finite=bool(torch.isfinite(scores).all()),
+                    score_sha256=hashlib.sha256(
+                        scores.cpu().numpy().tobytes()
+                    ).hexdigest(),
+                    plan_sha256=hashlib.sha256(
+                        protected_topk(scores, length // 2, 16, length - 16)
+                        .cpu()
+                        .numpy()
+                        .tobytes()
+                    ).hexdigest(),
+                )
+            )
+    finally:
+        knobs.runtime.jit_cache_hook = previous
+    result = dict(
+        scope="process cache misses may load the existing disk cache", records=records
+    )
+    (run / "length-specialization.json").write_text(json.dumps(result, indent=2))
+    for record in records:
+        print(
+            json.dumps(
+                dict(
+                    E=record["E"],
+                    misses=len(record["cache_misses"]),
+                    wall_ms=record["wall_complete_ms"],
+                )
+            )
+        )
+
+
+@torch.inference_mode()
 def runtime_worker(rank, args, run):
     os.sched_setaffinity(0, {args.worker_cpus[rank]})
     torch.accelerator.set_device_index(rank)
@@ -318,6 +392,7 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--launch-audit", action="store_true")
+    parser.add_argument("--length-specialization-audit", action="store_true")
     parser.add_argument("--grouped-probe", action="store_true")
     parser.add_argument("--stats", required=True)
     parser.add_argument("--lengths", nargs="+", type=int, default=[4096, 32768])
@@ -327,6 +402,14 @@ def main():
     parser.add_argument("--worker-cpus", nargs=2, type=int, default=[20, 21])
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
+    if args.length_specialization_audit:
+        source_root = Path(__file__).resolve().parents[2]
+        for name in ("kv_scoring", "kv_compaction"):
+            shutil.copyfile(
+                source_root / f"vllm/v1/worker/gpu/{name}.py", run / f"{name}.py"
+            )
+        audit_length_specialization(args, run)
+        return
     if args.runtime_shapes:
         shutil.copyfile(args.runtime_shapes, run / "runtime-shapes.json")
         source_root = Path(__file__).resolve().parents[2]

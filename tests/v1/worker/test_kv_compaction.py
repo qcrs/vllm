@@ -154,8 +154,9 @@ def dense_frequency_reference(kv, stats, logical_next, theta):
 
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("statistics_heads", [2, 6, 8])
+@pytest.mark.parametrize("source", [95, 96])
 def test_paged_shared_frequency_scores_use_logical_time_and_gqa(
-    statistics_heads, grouped
+    statistics_heads, grouped, source
 ):
     from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
 
@@ -171,7 +172,7 @@ def test_paged_shared_frequency_scores_use_logical_time_and_gqa(
         gpu.copy_(cpu)
         cpu_layers.append(gpu.cpu().float())
         layers.append(gpu)
-    row, source, logical_next = [6, 1, 4, 0, 5, 2], 95, 18123
+    row, logical_next = [6, 1, 4, 0, 5, 2], 18123
     row_gpu = torch.tensor(row, dtype=torch.int32, device="cuda")
     logical_gpu = torch.tensor([logical_next], dtype=torch.int32, device="cuda")
     stats = (
@@ -186,7 +187,7 @@ def test_paged_shared_frequency_scores_use_logical_time_and_gqa(
         scorer = GroupedTriAttentionScorer(stats.cuda(), 2, 1e6, 128)
         scorer.initialize_groups(StableKVCompactor(layers))
     expected = []
-    prefix, recent, keep = 3, 88, 41
+    prefix, recent, keep = 3, source - 7, 41
     for layer in range(num_layers):
         dense, _ = scalar_retained_kv([cpu_layers[layer]], row, list(range(source)))
         raw = dense_frequency_reference(dense[0], stats[layer], logical_next, 1e6)

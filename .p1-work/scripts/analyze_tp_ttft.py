@@ -4,6 +4,7 @@
 
 import argparse
 import bisect
+import hashlib
 import json
 import sqlite3
 import statistics
@@ -310,6 +311,193 @@ def controller_summary(run, analysis, output):
     )
 
 
+def request_partitions(run, scheduler, clients, steps, completes):
+    """Partition TTFT using same-host timestamps, without GPU attribution."""
+
+    def occupying_work(a, b):
+        groups = defaultdict(list)
+        for step in steps:
+            kind = (
+                "maintenance"
+                if step["q"] == 0 and step["reclaim"]
+                else "prefill_step"
+                if step["prefill"]
+                else "decode_or_empty_step"
+            )
+            groups[kind].append((step["start_ns"], step["end_ns"]))
+        return {k: overlap_ns(a, b, v) / 1e6 for k, v in groups.items()}
+
+    requests = []
+    raw_requests = json.loads((run / "requests-0.json").read_text())
+    for raw in raw_requests:
+        rid = raw["request"]
+        client = {e["event"]: e for e in clients if e["request"] == rid}
+        response_id = client["client_first_token"]["response_id"]
+        candidates = [
+            e
+            for e in scheduler
+            if e["event"] == "enqueue"
+            and re.fullmatch(
+                re.escape(response_id) + r"-0-[0-9a-f]{8}", e["request_id"]
+            )
+        ]
+        assert len(candidates) == 1, (rid, candidates)
+        enqueue = candidates[0]
+        engine_id = enqueue["request_id"]
+        output = next(e for e in completes.values() if engine_id in e["output_counts"])
+        chunks = [
+            s
+            for s in steps
+            if engine_id in s["requests"]
+            and s["step"] <= output["step"]
+            and s["requests"][engine_id]["logical_start"] < raw["prompt_tokens"]
+        ]
+        assert chunks and chunks[-1]["step"] == output["step"]
+        start = client["client_start"]["time_ns"]
+        first_token = client["client_first_token"]["time_ns"]
+        first_schedule, last_complete = chunks[0]["start_ns"], output["end_ns"]
+        step_wall = sum(s["end_ns"] - s["start_ns"] for s in chunks)
+        gaps = [(a["end_ns"], b["start_ns"]) for a, b in zip(chunks, chunks[1:])]
+        restarts, previous = [], 0
+        chunk_details = []
+        for chunk in chunks:
+            state = chunk["requests"][engine_id]
+            if state["logical_start"] < previous:
+                restarts.append(chunk["step"])
+            previous = state["logical_start"] + state["q"]
+            chunk_details.append(
+                dict(
+                    step=chunk["step"],
+                    logical_start=state["logical_start"],
+                    q=state["q"],
+                    complete_ns=chunk["end_ns"],
+                )
+            )
+        parts = dict(
+            ingress=(enqueue["time_ns"] - start) / 1e6,
+            initial_queue=(first_schedule - enqueue["time_ns"]) / 1e6,
+            own_prefill_steps=step_wall / 1e6,
+            between_chunks=(last_complete - first_schedule - step_wall) / 1e6,
+            output_delivery=(first_token - last_complete) / 1e6,
+        )
+        ttft = (first_token - start) / 1e6
+        assert abs(sum(parts.values()) - ttft) < 0.001
+        assert abs(ttft / 1e3 - raw["ttft_s"]) < 0.005
+        requests.append(
+            dict(
+                request=rid,
+                engine_id=engine_id,
+                prompt_tokens=raw["prompt_tokens"],
+                ttft_ms=ttft,
+                parts_ms=parts,
+                initial_queue_occupancy_ms=occupying_work(
+                    enqueue["time_ns"], first_schedule
+                ),
+                between_chunk_occupancy_ms={
+                    k: sum(occupying_work(a, b).get(k, 0) for a, b in gaps)
+                    for k in ("maintenance", "prefill_step", "decode_or_empty_step")
+                },
+                chunks=chunk_details,
+                recompute_starts=restarts,
+                prompt_tokens_computed=sum(
+                    min(s["q"], raw["prompt_tokens"] - s["logical_start"])
+                    for s in chunk_details
+                ),
+            )
+        )
+
+    return requests
+
+
+def host_summary(run, output):
+    """Audit one low-perturbation round without an Nsight/CUDA database."""
+    scheduler = read_events(run / "timeline-scheduler.jsonl")
+    clients = read_events(run / "timeline-client.jsonl")
+    window = json.loads((run / "serving.json").read_text())[0]
+    begin, end = window["start_monotonic_ns"], window["end_monotonic_ns"]
+    schedules = {e["step"]: e for e in scheduler if e["event"] == "schedule"}
+    completes = {e["step"]: e for e in scheduler if e["event"] == "complete"}
+    assert schedules.keys() == completes.keys()
+    steps = [
+        dict(
+            scheduled,
+            end_ns=completes[step]["end_ns"],
+            q=sum(r["q"] for r in scheduled["requests"].values()),
+            prefill=any(
+                r["logical_start"] < r["prompt_tokens"]
+                for r in scheduled["requests"].values()
+            ),
+        )
+        for step, scheduled in schedules.items()
+        if begin <= scheduled["start_ns"] < end
+    ]
+    requests = request_partitions(run, scheduler, clients, steps, completes)
+    selected = {s["step"] for s in steps if s["prefill"]}
+    ranks = {}
+    for rank in (0, 1):
+        events = read_events(run / f"timeline-rank-{rank}.jsonl")
+        phases = defaultdict(list)
+        for event in events:
+            if event["step"] in selected:
+                phases[event["event"]].append(event)
+        ranks[rank] = {
+            phase: dict(
+                calls=len(events),
+                wall_ms=sum(e["end_ns"] - e["start_ns"] for e in events) / 1e6,
+                thread_ms=sum(e["thread_ns"] for e in events) / 1e6,
+            )
+            for phase, events in phases.items()
+        }
+    kv = read_events(run / "kv-trace.jsonl")
+    result = dict(
+        scope="host inclusive spans; nested phases and TP ranks are not additive",
+        guard=json.loads((run / "result.json").read_text()),
+        window=window,
+        requests=requests,
+        prefill_steps=len(selected),
+        prefill_step_wall_ms=sum(
+            s["end_ns"] - s["start_ns"] for s in steps if s["prefill"]
+        )
+        / 1e6,
+        timed_reclaims=sum(s["reclaim"] is not None for s in steps),
+        timed_preemptions=sum(
+            e["event"] == "native_preempt" and begin <= e["time_ns"] < end for e in kv
+        ),
+        host_prefill_phases=ranks,
+        steps=steps,
+        artifact_sha256={
+            name: hashlib.sha256((run / name).read_bytes()).hexdigest()
+            for name in (
+                "protocol.json",
+                "result.json",
+                "serving.json",
+                "requests-0.json",
+                "timeline-scheduler.jsonl",
+                "timeline-client.jsonl",
+                "timeline-rank-0.jsonl",
+                "timeline-rank-1.jsonl",
+                "kv-trace.jsonl",
+                "profile_tp_ttft.py",
+                "tp_ttft_hooks.py",
+            )
+        },
+    )
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(
+        json.dumps(
+            {
+                k: result[k]
+                for k in (
+                    "prefill_steps",
+                    "prefill_step_wall_ms",
+                    "timed_reclaims",
+                    "timed_preemptions",
+                )
+            }
+        )
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run", type=Path)
@@ -317,8 +505,12 @@ def main():
     parser.add_argument("--controller-output", type=Path)
     parser.add_argument("--candidate-output", type=Path)
     parser.add_argument("--analysis", type=Path)
+    parser.add_argument("--host-output", type=Path)
     args = parser.parse_args()
     run = args.run.resolve()
+    if args.host_output:
+        host_summary(run, args.host_output)
+        return
     if args.candidate_output:
         candidate_summary(run, args.candidate_output)
         return
@@ -511,97 +703,7 @@ def main():
         steps.append(item)
     step_map = {s["step"]: s for s in steps}
 
-    def occupying_work(a, b):
-        groups = defaultdict(list)
-        for step in steps:
-            kind = (
-                "maintenance"
-                if step["q"] == 0 and step["reclaim"]
-                else "prefill_step"
-                if step["prefill"]
-                else "decode_or_empty_step"
-            )
-            groups[kind].append((step["start_ns"], step["end_ns"]))
-        return {k: overlap_ns(a, b, v) / 1e6 for k, v in groups.items()}
-
-    requests = []
-    raw_requests = json.loads((run / "requests-0.json").read_text())
-    for raw in raw_requests:
-        rid = raw["request"]
-        client = {e["event"]: e for e in clients if e["request"] == rid}
-        response_id = client["client_first_token"]["response_id"]
-        candidates = [
-            e
-            for e in scheduler
-            if e["event"] == "enqueue"
-            and re.fullmatch(
-                re.escape(response_id) + r"-0-[0-9a-f]{8}", e["request_id"]
-            )
-        ]
-        assert len(candidates) == 1, (rid, candidates)
-        enqueue = candidates[0]
-        engine_id = enqueue["request_id"]
-        output = next(e for e in completes.values() if engine_id in e["output_counts"])
-        chunks = [
-            s
-            for s in steps
-            if engine_id in s["requests"]
-            and s["step"] <= output["step"]
-            and s["requests"][engine_id]["logical_start"] < raw["prompt_tokens"]
-        ]
-        assert chunks and chunks[-1]["step"] == output["step"]
-        start = client["client_start"]["time_ns"]
-        first_token = client["client_first_token"]["time_ns"]
-        first_schedule, last_complete = chunks[0]["start_ns"], output["end_ns"]
-        step_wall = sum(s["end_ns"] - s["start_ns"] for s in chunks)
-        gaps = [(a["end_ns"], b["start_ns"]) for a, b in zip(chunks, chunks[1:])]
-        restarts, previous = [], 0
-        chunk_details = []
-        for chunk in chunks:
-            state = chunk["requests"][engine_id]
-            if state["logical_start"] < previous:
-                restarts.append(chunk["step"])
-            previous = state["logical_start"] + state["q"]
-            chunk_details.append(
-                dict(
-                    step=chunk["step"],
-                    logical_start=state["logical_start"],
-                    q=state["q"],
-                    complete_ns=chunk["end_ns"],
-                )
-            )
-        parts = dict(
-            ingress=(enqueue["time_ns"] - start) / 1e6,
-            initial_queue=(first_schedule - enqueue["time_ns"]) / 1e6,
-            own_prefill_steps=step_wall / 1e6,
-            between_chunks=(last_complete - first_schedule - step_wall) / 1e6,
-            output_delivery=(first_token - last_complete) / 1e6,
-        )
-        ttft = (first_token - start) / 1e6
-        assert abs(sum(parts.values()) - ttft) < 0.001
-        assert abs(ttft / 1e3 - raw["ttft_s"]) < 0.005
-        requests.append(
-            dict(
-                request=rid,
-                engine_id=engine_id,
-                prompt_tokens=raw["prompt_tokens"],
-                ttft_ms=ttft,
-                parts_ms=parts,
-                initial_queue_occupancy_ms=occupying_work(
-                    enqueue["time_ns"], first_schedule
-                ),
-                between_chunk_occupancy_ms={
-                    k: sum(occupying_work(a, b).get(k, 0) for a, b in gaps)
-                    for k in ("maintenance", "prefill_step", "decode_or_empty_step")
-                },
-                chunks=chunk_details,
-                recompute_starts=restarts,
-                prompt_tokens_computed=sum(
-                    min(s["q"], raw["prompt_tokens"] - s["logical_start"])
-                    for s in chunk_details
-                ),
-            )
-        )
+    requests = request_partitions(run, scheduler, clients, steps, completes)
 
     reclaims = []
     for step, scheduled in timed.items():

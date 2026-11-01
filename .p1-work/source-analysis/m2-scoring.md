@@ -63,3 +63,23 @@ continuation/free/reuse与证据限制见 [工程TP报告](../reports/engineerin
 完成事件顺序继承M1。Scheduler仍是唯一canonical owner；scorer只产KeepPlan，不free。
 M2 candidate成本对非SinkRecent使用保守kept-token copy估计，不能假定任意评分集合
 具备SinkRecent的连续zero-copy结构。实际性能与质量由各自实验报告给出。
+
+## 2026-11-01 当前分组实现与长度特化修正
+
+上述 `layer_total` 是 T1 历史实现。当前 TP2a 在 normalization 内按原 FP32 顺序
+alpha-add；TP2b 用四层组复用 raw/variance/mean workspace，36层仍按9组依次
+累计；详细数值和历史 micro 见 [下一阶段TP](../reports/engineering-next-tp.md)。
+
+`_grouped_raw` / `_grouped_normalize` 的 E 是 mask bound，未声明 constexpr，但
+Triton 默认仍按标量整除性分派版本。一次完整预热只触发非16对齐 E，timed
+E4160 则出现9个 raw（FIRST 为0..32）及1个 normalize 的新特化。成对缓存 TTIR
+除 `%E` 的 `tt.divisibility=16` 属性外逐字一致；10个文件的生成时间落在由同机
+wall/monotonic offset 估算的3.46秒 reclaim 窗口内，不将整个窗口当纯编译时间。
+本轮只将这两个入口声明为 `do_not_specialize=["E"]`。
+数据指针、stride、head/group/layer 常量与既有 FP32 运算不变，不枚举所有长度
+预热，也不取消指针对齐或扩大 Runtime 支持域。
+
+行为验证扩展原独立 complex reference 的 E95/96；benchmark 增加同一 scorer 的
+E4159→4160→4161→4159 进程 cache-miss 审计。cache miss 可能从既有磁盘缓存
+加载，不能一律称重新编译或作为冷编译提速百分比。真实 Serving 结果与 host
+时间线的非可加口径见 [本轮TP报告](../reports/engineering-refinement-tp.md)。

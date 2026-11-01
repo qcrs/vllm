@@ -16,14 +16,14 @@ from pathlib import Path
 def main():
     run = Path(os.environ["P1_RUN_DIR"])
     scripts = Path(__file__).parent
+    for name in (
+        "profile_tp_ttft.py",
+        "tp_ttft_hooks.py",
+        "serving_reclamation.py",
+        "worker_affinity.py",
+    ):
+        shutil.copyfile(scripts / name, run / name)
     if "--nsys-child" not in sys.argv:
-        for name in (
-            "profile_tp_ttft.py",
-            "tp_ttft_hooks.py",
-            "serving_reclamation.py",
-            "worker_affinity.py",
-        ):
-            shutil.copyfile(scripts / name, run / name)
         subprocess.run(
             [
                 "/opt/nvidia/nsight-systems/2024.7.1/bin/nsys",

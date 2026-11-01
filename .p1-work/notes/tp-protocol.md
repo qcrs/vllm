@@ -79,3 +79,18 @@ long/full、batch1024、.75GiB/rank、seqs8、完整负载预热后3轮，正向
 参数、hash、复算和结果见 [工程TP报告](../reports/engineering-tp-scoring.md)。首组A
 缺dirty scorer即时快照，只能引用事后恢复来源；反向A/B与micro保存实际源码。
 最后benchmark设备API/workspace统计收尾未重跑GPU，实测harness以原归档为准。
+
+## 2026-11-01 Refinement：TTFT 与动态长度
+
+用 `profile_tp_ttft.py --nsys-child` 可仅采同主机 host 时间戳；helper 即使绕过
+Nsight 也归档。`analyze_tp_ttft.py --host-output` 划分入口、初始排队、own prefill
+step、段间等待与输出送达，校验总和及原请求 TTFT；inclusive step 含其他请求和
+maintenance，host 调用含提交/等待，nested phase 与两个 TP rank 不能相加。
+prefill 的 pure GPU/通信归因仍需设备证据，不由 host 剩余量推断。
+
+一次 host-only 零抢占轨迹发现 E4160 触发分组评分的长度对齐特化，故只取消两
+个 grouped kernel 的 E 特化。先独立参考/同 scorer E 跨对齐 cache audit，随后
+原8B TP2 continuation/free/reuse；有限正式 A/B 保留原 long/full/pool/batch/
+affinity/预热及3轮条件，不清 Triton 缓存、不扫 chunk 或将诊断数值当正式收益。
+`benchmark_kv_scoring.py --length-specialization-audit` 只观察进程 cache miss，
+不能用两次不同磁盘缓存状态的首调用时间计算优化百分比。

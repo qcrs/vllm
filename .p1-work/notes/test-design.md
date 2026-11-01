@@ -1,5 +1,12 @@
 # P1 v8 测试设计
 
+## Refinement：TP 动态长度与冷路径
+
+- 用途：分组评分在物理 E 跨页对齐状态变化时复用同一动态 kernel，避免为不参与地址对齐的长度重编译。
+- I/O：相同层、row、logical L、eligible 域，改变动态 E；shared scores/KeepPlan 保持原数值契约。
+- 风险：取消特化后 partial tile/页边界掩码错误，或只消除数值特化却仍为16对齐生成新版本。
+- 最低有效验证：扩展现有独立 complex reference 为 E=95/96，另在同一 scorer 顺序调用跨对齐 E，通过 Triton cache hook 确认第二次不新增 grouped 进程缓存变体；真实8B TP2 continuation/free/reuse验证执行链。冷路径诊断与正式 A/B 分开，不将 host inclusive span 当纯 GPU 时间。
+
 ## Refinement：DP4 未确认 ADD 工作量
 
 - 用途：仅补计已派发但未被 Engine 快照覆盖的 prompt，维持原 C+U/batch。

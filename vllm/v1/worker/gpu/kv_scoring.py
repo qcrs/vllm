@@ -283,7 +283,7 @@ class TriAttentionScorer:
         return protected_topk(scores, keep, prefix, recent)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["E"])
 def _grouped_raw(
     pointers,
     strides,
@@ -344,7 +344,7 @@ def _grouped_raw(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["E"])
 def _grouped_normalize(
     scores,
     variance,
