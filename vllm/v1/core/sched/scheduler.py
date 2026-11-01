@@ -593,7 +593,7 @@ class Scheduler(SchedulerInterface):
 
                     if allow_reclamation:
                         reclaim_candidate = self._select_reclaim_candidate(
-                            num_scheduled_tokens
+                            num_scheduled_tokens, request
                         )
                         if reclaim_candidate is not None:
                             break
@@ -982,7 +982,7 @@ class Scheduler(SchedulerInterface):
 
                     if allow_reclamation:
                         reclaim_candidate = self._select_reclaim_candidate(
-                            num_scheduled_tokens
+                            num_scheduled_tokens, request
                         )
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -1238,7 +1238,7 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     def _select_reclaim_candidate(
-        self, scheduled: dict[str, int]
+        self, scheduled: dict[str, int], requester: Request | None = None
     ) -> tuple[Request, ReclaimCandidate] | None:
         config = self.reclamation_config
         assert config is not None
@@ -1297,12 +1297,32 @@ class Scheduler(SchedulerInterface):
                     zero_copy,
                     request.arrival_time,
                     protected_prefix,
+                    source_len,
+                    tuple(b.block_id for b in blocks),
+                    request.num_computed_tokens + q,
+                    q,
                 )
             )
         goal = self.kv_cache_manager.last_allocation_shortfall + min(
             config.reserve_cap, live_decode_count
         )
         selected = choose_reclaim_candidate(candidates, goal)
+        if self.kv_cache_manager.trace is not None:
+            from dataclasses import asdict
+
+            required, available = self.kv_cache_manager.last_allocation_capacity
+            self.kv_cache_manager.trace.record(
+                "reclaim_candidates",
+                requester=requester.request_id if requester else None,
+                miss_status=requester.status.name if requester else None,
+                required=required,
+                available=available,
+                shortfall=self.kv_cache_manager.last_allocation_shortfall,
+                goal_blocks=goal,
+                budget=asdict(config),
+                candidates=[asdict(c) for c in candidates],
+                selected=selected.request_id if selected else None,
+            )
         if selected is None:
             return None
         request = self.requests[selected.request_id]

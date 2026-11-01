@@ -1,5 +1,12 @@
 # P1 v8 测试设计
 
+## CB0/CB1 缺口预算
+
+- 用途：同一候选快照产生固定预算或满足硬缺口/软 reserve 的最大合法 K。
+- I/O：source E/row/q/P、原分配器 D 与配置底线；输出合法 K、预计释放页及 exact zero-copy。
+- 风险：partial tail 或共享前缀导致页数错误、降低 K_floor、将 reserve 当硬缺口、未完成 forward 冒充已完成、预测与 commit/free 不一致。
+- 最低有效验证：现有 KV/Scheduler suite 的参数化预算与真实 Pool 行为，再用既有 TP2 helper 验证 q=0/1、payload/continuation/free/reuse；一次无 NSYS 的 trace 关联全部合法候选与首次 retry，正式 fixed/demand 各三轮。
+
 ## R1 resumable请求入口
 
 - 模块用途：在reclamation支持域之外拒绝保留KV的streaming生命周期。

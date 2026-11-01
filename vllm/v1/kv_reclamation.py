@@ -110,6 +110,10 @@ class ReclaimCandidate:
     zero_copy: bool
     arrival_time: float
     protected_prefix_tokens: int = 0
+    source_effective_kv_len: int = 0
+    source_block_ids: tuple[int, ...] = ()
+    logical_tokens: int = 0
+    q: int = 0
 
 
 def choose_reclaim_candidate(

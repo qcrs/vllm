@@ -17,6 +17,69 @@ def read_events(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def candidate_summary(run, output):
+    """Audit host-only decisions without requiring a profiler database."""
+    events = read_events(run / "kv-trace.jsonl")
+    decisions = []
+    for event in events:
+        if event["event"] != "reclaim_candidates":
+            continue
+        selected = next(
+            (c for c in event["candidates"] if c["request_id"] == event["selected"]),
+            None,
+        )
+        row = dict(event)
+        row["hard_covered"] = any(
+            c["released_blocks"] >= event["shortfall"] for c in event["candidates"]
+        )
+        if selected is not None:
+            commit = next(
+                (
+                    e
+                    for e in events
+                    if e["event"] == "reclaim_commit"
+                    and e["request_id"] == event["selected"]
+                    and e["time_ns"] > event["time_ns"]
+                ),
+                None,
+            )
+            assert commit is not None, event
+            assert commit["released_blocks"] == selected["released_blocks"]
+            attempts = [
+                e
+                for e in events
+                if e.get("request_id") == event["requester"]
+                and e["time_ns"] > commit["time_ns"]
+                and e["event"]
+                in ("allocation_done", "allocation_miss", "native_preempt")
+            ]
+            row.update(commit=commit, first_retry=attempts[0] if attempts else None)
+            row["first_retry_success"] = bool(
+                attempts and attempts[0]["event"] == "allocation_done"
+            )
+            row["subsequent_admission"] = next(
+                (e for e in attempts if e["event"] == "allocation_done"), None
+            )
+            row["preemptions_before_admission"] = [
+                e
+                for e in events
+                if e["event"] == "native_preempt"
+                and commit["time_ns"]
+                < e["time_ns"]
+                < (row["subsequent_admission"] or {"time_ns": float("inf")})["time_ns"]
+            ]
+        decisions.append(row)
+    result = dict(
+        decisions=decisions,
+        count=len(decisions),
+        insufficient=sum(not d["hard_covered"] for d in decisions),
+        first_retry_success=sum(d.get("first_retry_success", False) for d in decisions),
+        timing="host monotonic; no GPU incremental cost claim",
+    )
+    output.write_text(json.dumps(result, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k != "decisions"}))
+
+
 def union_ns(intervals):
     end, total = 0, 0
     for start, finish in sorted(intervals):
@@ -64,7 +127,7 @@ def controller_summary(run, analysis, output):
         attempts = [
             e
             for e in events
-            if e["request_id"] == requester
+            if e.get("request_id") == requester
             and e["time_ns"] > commit
             and e["event"] in ("allocation_done", "allocation_miss", "native_preempt")
         ]
@@ -77,7 +140,7 @@ def controller_summary(run, analysis, output):
             and (
                 e["event"] in ("native_preempt", "reclaim_select", "reclaim_commit")
                 or (
-                    e["request_id"] == requester
+                    e.get("request_id") == requester
                     and e["event"] in ("allocation_miss", "allocation_done")
                 )
             )
@@ -207,9 +270,13 @@ def main():
     parser.add_argument("run", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--controller-output", type=Path)
+    parser.add_argument("--candidate-output", type=Path)
     parser.add_argument("--analysis", type=Path)
     args = parser.parse_args()
     run = args.run.resolve()
+    if args.candidate_output:
+        candidate_summary(run, args.candidate_output)
+        return
     if args.controller_output:
         if args.analysis is None:
             parser.error("--controller-output requires --analysis")

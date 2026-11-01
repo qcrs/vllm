@@ -21,10 +21,20 @@ class KVCacheTrace:
     def __init__(self, path: str):
         self.stream = open(path, "a", buffering=1)  # noqa: SIM115 (scheduler lifetime)
         self.include_ids = os.environ.get("VLLM_KV_TRACE_IDS", "0") == "1"
+        self.sequence = 0
 
     def record(self, event: str, **fields) -> None:
+        self.sequence += 1
         self.stream.write(
-            json.dumps({"event": event, "time_ns": time.monotonic_ns(), **fields})
+            json.dumps(
+                {
+                    "event": event,
+                    "time_ns": time.monotonic_ns(),
+                    "pid": os.getpid(),
+                    "sequence": self.sequence,
+                    **fields,
+                }
+            )
             + "\n"
         )
 
