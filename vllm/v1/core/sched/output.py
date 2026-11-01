@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from vllm.v1.kv_reclamation import ReclaimRequest
+from vllm.v1.kv_reclamation import PolicyBinding, ReclaimRequest
 
 if TYPE_CHECKING:
     import numpy as np
@@ -46,6 +46,7 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    policy_binding: PolicyBinding | None = None
 
     @classmethod
     def from_request(
@@ -66,6 +67,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            policy_binding=request.policy_binding,
         )
 
     def __repr__(self) -> str:

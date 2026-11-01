@@ -3,6 +3,7 @@
 """TriAttention frequency scores from packed paged K_rot and a shared plan."""
 
 import hashlib
+import io
 from pathlib import Path
 
 import torch
@@ -145,6 +146,7 @@ class TriAttentionScorer:
     ):
         # [layer, statistics_head, real/imag/abs, frequency].
         self.global_kv_heads = kv_heads
+        self.calibration_sha256: str | None = None
         self.group = stats.shape[1] // kv_heads
         self.kv_heads = max(1, kv_heads // tp_size)
         replicas = max(1, tp_size // kv_heads)
@@ -175,7 +177,10 @@ class TriAttentionScorer:
 
     @classmethod
     def from_file(cls, path, model_config, max_len, device, tp_size=1, tp_rank=0):
-        payload = torch.load(path, map_location="cpu", weights_only=True)
+        artifact = Path(path).read_bytes()
+        payload = torch.load(
+            io.BytesIO(artifact), map_location="cpu", weights_only=True
+        )
         metadata, stats = payload["metadata"], payload["stats"]
         hf = model_config.hf_text_config
         rope = hf.rope_parameters
@@ -201,7 +206,7 @@ class TriAttentionScorer:
         shape = (hf.num_hidden_layers, hf.num_attention_heads, 3, hf.head_dim // 2)
         if stats.shape != shape or not torch.isfinite(stats).all():
             raise ValueError("Frequency stats require all model layers/query heads")
-        return cls(
+        scorer = cls(
             stats,
             hf.num_key_value_heads,
             rope["rope_theta"],
@@ -210,6 +215,8 @@ class TriAttentionScorer:
             tp_rank,
             device,
         )
+        scorer.calibration_sha256 = hashlib.sha256(artifact).hexdigest()
+        return scorer
 
     def score_layer(self, cache, row, logical_length, source_len, layer):
         self.prepare_phase(logical_length)

@@ -79,6 +79,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.kv_reclamation import ReclamationConfig, validate_policy_acks
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -227,6 +228,20 @@ class EngineCore:
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
+
+        self.reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
+        self.reclamation_policies = {}
+        self.default_reclamation_version = 0
+        if self.reclamation_config is not None:
+            acknowledgements = self.model_executor.collective_rpc(
+                "get_reclamation_policy", args=(0,)
+            )
+            self.reclamation_policies[0] = validate_policy_acks(
+                0,
+                self.reclamation_config,
+                acknowledgements,
+                vllm_config.parallel_config.tensor_parallel_size,
+            )
 
         self._idle_state_callbacks: list[Callable] = []
 
@@ -468,6 +483,18 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
+        if self.reclamation_config is not None:
+            options = (
+                request.sampling_params.extra_args or {}
+                if request.sampling_params is not None
+                else {}
+            )
+            version = options.get(
+                "kv_reclamation_version", self.default_reclamation_version
+            )
+            if type(version) is not int or version not in self.reclamation_policies:
+                raise ValueError("Unknown or unprepared KV reclamation version")
+            request.policy_binding = self.reclamation_policies[version]
         self.scheduler.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs

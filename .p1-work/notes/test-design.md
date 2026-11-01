@@ -109,3 +109,10 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 用途是批量 raw/eligible population variance/有序累计；I/O仍为相同shared score/KeepPlan。
 风险是跨层stride、统计域、GQA和舍入改变排名；先复用独立复数reference、零方差与真实TP2完整heads测试，
 再比较冻结三形状计划hash与完整链。probe不把逐层normalization隔离计时冒充分组阶段。
+
+## PL0/PL1 与 PL2 验证设计（2026-11-01）
+
+- 模块用途：在 ADD 边界 pin 不可变策略，Controller/Worker/intent/commit 同版；更新先全rank准备再发布，引用清空和设备完成后退役。
+- I/O contract：已准备version通过extra_args选择，结构化utility准备/发布/退役；未知version、full回收、ACK失败/不一致及仍被引用的退役明确拒绝。
+- 主要失败：预算与scorer串版、preempt/slot复用串请求、某rank未准备提前发布、旧intent未完成提前卸载。
+- 最低有效层次：既有Scheduler/Pool/engine suites验证CPU状态/序列化/拒绝；复用tp_reclamation与worker hook，在8B TP1/TP2验证延迟prepare、混合策略、全层payload、continuation与free/reuse。

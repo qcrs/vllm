@@ -26,6 +26,20 @@ class ReclamationConfig:
     reserve_cap: int = 0
     budget_mode: str = "fixed"
 
+    def __post_init__(self) -> None:
+        if self.budget_mode not in ("fixed", "demand"):
+            raise ValueError("Unknown KV reclamation budget mode")
+        if self.policy not in ("full", "sink_recent", "random", "triattention"):
+            raise ValueError("Unknown KV reclamation policy")
+        if self.policy == "triattention" and self.stats_path is None:
+            raise ValueError("TriAttention requires calibrated frequency stats")
+        if not 0 < self.retention <= 1:
+            raise ValueError("KV reclamation retention must be in (0, 1]")
+        if min(self.sink_tokens, self.recent_tokens, self.reserve_cap) < 0:
+            raise ValueError("KV reclamation protection/reserve must be nonnegative")
+        if self.min_keep_tokens < self.sink_tokens + self.recent_tokens:
+            raise ValueError("min_keep_tokens must cover sink and recent protection")
+
     @classmethod
     def from_vllm_config(cls, config: "VllmConfig") -> "ReclamationConfig | None":
         options = (
@@ -36,18 +50,6 @@ class ReclamationConfig:
         if options is None:
             return None
         result = cls(**options)
-        if result.budget_mode not in ("fixed", "demand"):
-            raise ValueError("Unknown KV reclamation budget mode")
-        if result.policy not in ("sink_recent", "random", "triattention"):
-            raise ValueError("Unknown KV reclamation policy")
-        if result.policy == "triattention" and result.stats_path is None:
-            raise ValueError("TriAttention requires calibrated frequency stats")
-        if not 0 < result.retention <= 1:
-            raise ValueError("KV reclamation retention must be in (0, 1]")
-        if min(result.sink_tokens, result.recent_tokens, result.reserve_cap) < 0:
-            raise ValueError("KV reclamation protection/reserve must be nonnegative")
-        if result.min_keep_tokens < result.sink_tokens + result.recent_tokens:
-            raise ValueError("min_keep_tokens must cover sink and recent protection")
         parallel = config.parallel_config
         if (
             not envs.VLLM_USE_V2_MODEL_RUNNER
@@ -89,12 +91,43 @@ class ReclamationConfig:
 
 
 @dataclass(frozen=True)
+class PolicyBinding:
+    version: int
+    config: ReclamationConfig
+    calibration_sha256: str | None = None
+
+
+def validate_policy_acks(
+    version: int,
+    config: ReclamationConfig,
+    acknowledgements: list[dict],
+    tp_size: int,
+) -> PolicyBinding:
+    """A prepared version is usable only after every TP rank agrees."""
+    if len(acknowledgements) != tp_size or {
+        ack["rank"] for ack in acknowledgements
+    } != set(range(tp_size)):
+        raise ValueError("KV policy preparation requires every TP rank")
+    binding = acknowledgements[0]["binding"]
+    if (
+        binding.version != version
+        or binding.config != config
+        or any(ack["binding"] != binding for ack in acknowledgements)
+        or config.policy == "triattention"
+        and not binding.calibration_sha256
+    ):
+        raise ValueError("KV policy preparation ACKs disagree")
+    return binding
+
+
+@dataclass(frozen=True)
 class ReclaimRequest:
     request_id: str
     source_effective_kv_len: int
     source_block_ids: list[int]
     target_keep_tokens: int
     protected_prefix_tokens: int = 0
+    policy_binding: PolicyBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +135,7 @@ class ReclaimResult:
     request_id: str
     new_effective_kv_len: int
     retained_block_ids: list[int]
+    policy_binding: PolicyBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +151,7 @@ class ReclaimCandidate:
     source_block_ids: tuple[int, ...] = ()
     logical_tokens: int = 0
     q: int = 0
+    policy_binding: PolicyBinding | None = None
 
 
 def retarget_reclaim_candidate(
@@ -175,7 +210,13 @@ def demand_reclaim_candidates(
             if keep >= candidate.keep_tokens:
                 covering.append(
                     retarget_reclaim_candidate(
-                        candidate, keep, config, block_size, member_bytes
+                        candidate,
+                        keep,
+                        candidate.policy_binding.config
+                        if candidate.policy_binding is not None
+                        else config,
+                        block_size,
+                        member_bytes,
                     )
                 )
         if covering:

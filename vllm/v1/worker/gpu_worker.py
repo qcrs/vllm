@@ -926,6 +926,12 @@ class Worker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    def get_reclamation_policy(self, version: int) -> dict:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+        assert isinstance(self.model_runner, GPUModelRunner)
+        return self.model_runner.reclamation.policy_ack(version)
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

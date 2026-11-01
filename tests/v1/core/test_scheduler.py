@@ -36,7 +36,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.kv_reclamation import ReclaimResult, ReclamationConfig
+from vllm.v1.kv_reclamation import PolicyBinding, ReclaimResult, ReclamationConfig
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -61,7 +61,7 @@ def pressure_scheduler(tmp_path, monkeypatch):
         enable_reclamation=True,
         **kwargs,
     ):
-        return create_scheduler(
+        scheduler = create_scheduler(
             model=str(model_path),
             num_blocks=num_blocks,
             max_num_batched_tokens=256,
@@ -80,6 +80,15 @@ def pressure_scheduler(tmp_path, monkeypatch):
                 else None
             ),
         )
+        original_add = scheduler.add_request
+
+        def add(request):
+            if enable_reclamation and request.policy_binding is None:
+                request.policy_binding = PolicyBinding(0, scheduler.reclamation_config)
+            original_add(request)
+
+        scheduler.add_request = add
+        return scheduler
 
     return create
 
@@ -101,6 +110,7 @@ def complete_pressure_step(scheduler, output):
             intent.request_id,
             intent.target_keep_tokens,
             intent.source_block_ids[: (intent.target_keep_tokens + 15) // 16],
+            intent.policy_binding,
         )
     scheduler.update_from_output(
         output,
@@ -285,6 +295,39 @@ def test_pressure_demand_uses_same_post_forward_snapshot(pressure_scheduler, q):
     assert candidate.source_effective_kv_len == 63 + q
     assert candidate.keep_tokens == 48 and candidate.released_blocks == 1
     assert candidate.q == q
+
+
+def test_pressure_policy_binding_controls_budget_and_survives_preemption(
+    pressure_scheduler,
+):
+    from dataclasses import replace
+
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    scheduler = pressure_scheduler(12, budget_mode="demand")
+    request = create_requests(num_requests=1, num_tokens=64)[0]
+    config = replace(scheduler.reclamation_config, policy="full")
+    request.policy_binding = PolicyBinding(1, config)
+    scheduler.add_request(request)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    assert scheduler._select_reclaim_candidate({}) is None
+    with pytest.raises(ValueError, match="Full KV"):
+        scheduler.make_reclaim_request(request, SchedulerOutput.make_empty(), 32)
+    request.policy_binding = PolicyBinding(
+        2, replace(config, policy="random", retention=0.75)
+    )
+    _, candidate = scheduler._select_reclaim_candidate({})
+    assert candidate.keep_tokens == 48 and not candidate.zero_copy
+    assert candidate.policy_binding == request.policy_binding
+    assert (
+        MsgpackDecoder(PolicyBinding).decode(
+            MsgpackEncoder().encode(request.policy_binding)
+        )
+        == request.policy_binding
+    )
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0)
+    assert request.policy_binding.version == 2
 
 
 def test_pressure_zero_releasable_pages_uses_native_preemption(pressure_scheduler):

@@ -587,6 +587,7 @@ class KVCacheManager:
         block_size = manager.block_size
         assert ids == intent.source_block_ids
         assert result.request_id == request.request_id == intent.request_id
+        assert request.policy_binding == intent.policy_binding == result.policy_binding
         assert result.new_effective_kv_len == intent.target_keep_tokens
         assert len(retained) == cdiv(result.new_effective_kv_len, block_size)
         assert len(retained_set) == len(retained)

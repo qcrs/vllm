@@ -9,6 +9,7 @@ import torch
 
 from vllm.distributed import get_tp_group
 from vllm.v1.kv_reclamation import (
+    PolicyBinding,
     ReclaimRequest,
     ReclaimResult,
     ReclamationConfig,
@@ -18,7 +19,7 @@ from vllm.v1.kv_reclamation import (
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
-from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer, protected_topk
+from vllm.v1.worker.gpu.kv_retention_policy import POLICY_FACTORIES, RetentionPolicy
 
 
 class KVReclamationWorker:
@@ -26,6 +27,11 @@ class KVReclamationWorker:
         self, config: ReclamationConfig, req_states, input_buffers, model_config
     ):
         self.config = config
+        self.model_config = model_config
+        self.policies: dict[int, tuple[PolicyBinding, RetentionPolicy | None]] = {}
+        self.slot_bindings: list[PolicyBinding | None] = [
+            None
+        ] * req_states.max_num_reqs
         self.req_states = req_states
         self.effective_kv_len = StagedWriteTensor(
             req_states.max_num_reqs, dtype=torch.int32, device=req_states.device
@@ -38,19 +44,6 @@ class KVReclamationWorker:
         self.completion_token = torch.zeros(
             (), dtype=torch.int32, device=req_states.device
         )
-        self.scorer = (
-            GroupedTriAttentionScorer.from_file(
-                config.stats_path,
-                model_config,
-                model_config.max_model_len,
-                req_states.device,
-                self.tp_group.world_size,
-                self.tp_group.rank_in_group,
-            )
-            if config.policy == "triattention"
-            else None
-        )
-        self.generator = torch.Generator(device=req_states.device).manual_seed(0)
 
     def initialize_cache(self, cache_config, layers, attn_layers) -> None:
         self.config.validate_cache(cache_config)
@@ -66,13 +59,45 @@ class KVReclamationWorker:
         if len({cache.data_ptr() for cache in self.layers}) != len(self.layers):
             raise ValueError("KV-sharing layers are not supported by reclamation")
         self.compactor = StableKVCompactor(self.layers)
-        if self.scorer is not None:
-            self.scorer.initialize_groups(self.compactor)
+        self.initialize_policy(0, self.config)
 
-    def add_request(self, index: int, computed: int) -> None:
+    def initialize_policy(self, version: int, config: ReclamationConfig) -> dict:
+        policy = (
+            POLICY_FACTORIES[config.policy](
+                config,
+                self.model_config,
+                self.req_states.device,
+                self.tp_group,
+                self.compactor,
+            )
+            if config.policy != "full"
+            else None
+        )
+        fingerprint = (
+            policy.scorer.calibration_sha256
+            if policy is not None and policy.scorer is not None
+            else None
+        )
+        self.policies[version] = (PolicyBinding(version, config, fingerprint), policy)
+        return self.policy_ack(version)
+
+    def policy_ack(self, version: int) -> dict:
+        return {
+            "rank": self.tp_group.rank_in_group,
+            "binding": self.policies[version][0],
+        }
+
+    def add_request(
+        self, index: int, computed: int, binding: PolicyBinding | None
+    ) -> None:
+        assert binding is not None and self.policies[binding.version][0] == binding
+        self.slot_bindings[index] = binding
         self.effective_kv_len_np[index] = computed
         self.effective_kv_len.stage_write_elem(index, computed)
         self.effective_kv_len.apply_write()
+
+    def remove_request(self, index: int) -> None:
+        self.slot_bindings[index] = None
 
     def prepare_attn(self, batch: InputBatch) -> InputBatch:
         upper = np.zeros(batch.num_reqs_after_padding, dtype=np.int32)
@@ -96,15 +121,20 @@ class KVReclamationWorker:
 
     def reclaim(self, intent: ReclaimRequest, block_tables) -> ReclaimResult:
         idx = self.req_states.req_id_to_index[intent.request_id]
+        binding = intent.policy_binding
+        assert binding is not None and binding == self.slot_bindings[idx]
+        prepared, policy = self.policies[binding.version]
+        assert prepared == binding and policy is not None
+        config = binding.config
         assert self.effective_kv_len_np[idx] == intent.source_effective_kv_len
         prefix, recent = sink_recent_ranges(
             intent.source_effective_kv_len,
             intent.target_keep_tokens,
-            self.config.sink_tokens,
+            config.sink_tokens,
             intent.protected_prefix_tokens,
         )
         row = None
-        if self.config.policy == "sink_recent":
+        if config.policy == "sink_recent":
             row = whole_block_row(
                 intent.source_block_ids,
                 intent.source_effective_kv_len,
@@ -115,51 +145,36 @@ class KVReclamationWorker:
             )
         if row is None:
             source = intent.source_effective_kv_len
-            if self.config.policy == "sink_recent":
-                keep = torch.cat(
-                    (
-                        torch.arange(
-                            prefix, dtype=torch.int32, device=self.req_states.device
-                        ),
-                        torch.arange(
-                            recent,
-                            source,
-                            dtype=torch.int32,
-                            device=self.req_states.device,
-                        ),
+            if config.policy != "sink_recent":
+                recent = max(prefix, source - config.recent_tokens)
+            scores = None
+            if policy.local_scores is not None and (
+                policy.sum_scores or self.tp_group.rank_in_group == 0
+            ):
+                scores = policy.local_scores(
+                    self.layers,
+                    block_tables.block_tables[0].gpu[idx],
+                    self.req_states.num_computed_tokens.gpu[idx : idx + 1],
+                    source,
+                    prefix,
+                    recent,
+                )
+                if policy.sum_scores and self.tp_group.world_size > 1:
+                    torch.distributed.all_reduce(
+                        scores, group=self.tp_group.device_group
                     )
+            if self.tp_group.rank_in_group == 0:
+                keep = policy.root_plan(
+                    scores, source, intent.target_keep_tokens, prefix, recent
                 )
             else:
-                recent = max(prefix, source - self.config.recent_tokens)
-                if self.scorer is not None:
-                    scores = self.scorer.shared_scores(
-                        self.layers,
-                        block_tables.block_tables[0].gpu[idx],
-                        self.req_states.num_computed_tokens.gpu[idx : idx + 1],
-                        source,
-                        prefix,
-                        recent,
-                    )
-                    if self.tp_group.world_size > 1:
-                        torch.distributed.all_reduce(
-                            scores, group=self.tp_group.device_group
-                        )
-                elif self.tp_group.rank_in_group == 0:
-                    scores = torch.rand(
-                        source, device=self.req_states.device, generator=self.generator
-                    )
-                if self.tp_group.rank_in_group == 0:
-                    keep = protected_topk(
-                        scores, intent.target_keep_tokens, prefix, recent
-                    )
-                else:
-                    keep = torch.empty(
-                        intent.target_keep_tokens,
-                        dtype=torch.int32,
-                        device=self.req_states.device,
-                    )
-                if self.tp_group.world_size > 1:
-                    self.tp_group.broadcast(keep, src=0)
+                keep = torch.empty(
+                    intent.target_keep_tokens,
+                    dtype=torch.int32,
+                    device=self.req_states.device,
+                )
+            if self.tp_group.world_size > 1:
+                self.tp_group.broadcast(keep, src=0)
             self.compactor.compact(block_tables.block_tables[0].gpu[idx], keep)
             b = block_tables.block_sizes[0]
             row = intent.source_block_ids[: (intent.target_keep_tokens + b - 1) // b]
@@ -174,4 +189,4 @@ class KVReclamationWorker:
             torch.distributed.all_reduce(
                 self.completion_token, group=self.tp_group.device_group
             )
-        return ReclaimResult(intent.request_id, intent.target_keep_tokens, row)
+        return ReclaimResult(intent.request_id, intent.target_keep_tokens, row, binding)

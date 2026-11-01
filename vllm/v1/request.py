@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.kv_reclamation import PolicyBinding
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -168,6 +169,7 @@ class Request:
         self.num_computed_tokens = 0
         # Settled retained KV members; logical progress is independent.
         self.effective_kv_len = 0
+        self.policy_binding: PolicyBinding | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

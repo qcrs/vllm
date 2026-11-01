@@ -782,6 +782,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.reclamation is not None:
+            self.reclamation.remove_request(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -835,7 +837,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.reclamation is not None:
                 self.reclamation.add_request(
-                    req_index, new_req_data.num_computed_tokens
+                    req_index,
+                    new_req_data.num_computed_tokens,
+                    new_req_data.policy_binding,
                 )
 
             if self.encoder_cache is not None:

@@ -86,14 +86,29 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
         device=device,
         num_computed_tokens=SimpleNamespace(gpu=logical),
     )
-    worker.layers, worker.scorer = layers, scorer
+    worker.layers = layers
     worker.compactor = StableKVCompactor(layers)
     if args.grouped_probe:
         from vllm.v1.worker.gpu.kv_scoring import GroupedTriAttentionScorer
 
         scorer = GroupedTriAttentionScorer(stats, 8, 1e6, 9216, 2, rank, device)
         scorer.initialize_groups(worker.compactor)
-        worker.scorer = scorer
+    from vllm.v1.kv_reclamation import PolicyBinding
+    from vllm.v1.worker.gpu.kv_retention_policy import RetentionPolicy
+
+    binding = PolicyBinding(0, worker.config)
+    worker.policies = {
+        0: (
+            binding,
+            RetentionPolicy(
+                scorer.shared_scores,
+                True,
+                lambda scores, source, k, p, r: protected_topk(scores, k, p, r),
+                scorer=scorer,
+            ),
+        )
+    }
+    worker.slot_bindings = [binding]
     worker.tp_group = SimpleNamespace(
         world_size=2,
         rank_in_group=rank,
@@ -104,7 +119,7 @@ def benchmark_runtime_shape(rank, args, device, stats, shape):
     worker.completion_token = torch.zeros((), dtype=torch.int32, device=device)
     worker.effective_kv_len_np = np.array([source], dtype=np.int32)
     worker.effective_kv_len = StagedWriteTensor(1, torch.int32, device)
-    intent = ReclaimRequest("benchmark", source, row_ids, keep, prefix)
+    intent = ReclaimRequest("benchmark", source, row_ids, keep, prefix, binding)
 
     def restore():
         for value, original in zip(layers, saved):

@@ -65,7 +65,9 @@ class P1TPWorker:
             "number": 0,
         }
         views = worker.layers
-        assert len(views) == 36 and all(v.shape[1] == 4 for v in views)
+        assert len(views) == 36 and all(
+            v.shape[1] == 8 // get_tp_group().world_size for v in views
+        )
         context = self.vllm_config.compilation_config.static_forward_context
         attention = next(
             layer
@@ -116,7 +118,7 @@ class P1TPWorker:
             prefix, recent = sink_recent_ranges(
                 intent.source_effective_kv_len,
                 intent.target_keep_tokens,
-                worker.config.sink_tokens,
+                intent.policy_binding.config.sink_tokens,
                 intent.protected_prefix_tokens,
             )
             state["pending"] = {

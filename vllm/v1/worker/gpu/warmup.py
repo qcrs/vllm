@@ -95,6 +95,11 @@ def run_mixed_prefill_decode_warmup(
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=decode_token_ids,
+            policy_binding=(
+                model_runner.reclamation.policies[0][0]
+                if model_runner.reclamation is not None
+                else None
+            ),
         ),
     ]
     decode_prefill_output.num_scheduled_tokens = {
@@ -125,6 +130,11 @@ def run_mixed_prefill_decode_warmup(
             num_computed_tokens=0,
             lora_request=None,
             prefill_token_ids=prefill_token_ids,
+            policy_binding=(
+                model_runner.reclamation.policies[0][0]
+                if model_runner.reclamation is not None
+                else None
+            ),
         ),
     ]
     mixed_output.num_scheduled_tokens = {
@@ -255,6 +265,9 @@ def warmup_kernels(
     ]
 
     prefill_output = SchedulerOutput.make_empty()
+    if model_runner.reclamation is not None:
+        for request in new_reqs:
+            request.policy_binding = model_runner.reclamation.policies[0][0]
     prefill_output.scheduled_new_reqs = new_reqs
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs

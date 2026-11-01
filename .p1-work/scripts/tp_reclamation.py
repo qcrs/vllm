@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from transformers import AutoTokenizer
@@ -248,7 +249,7 @@ def main():
                     "step": step,
                     "q": output.num_scheduled_tokens.get(intent.request_id, 0),
                     "batch_tokens": output.total_num_scheduled_tokens,
-                    "intent": vars(intent),
+                    "intent": asdict(intent),
                     "row": row,
                     "released": released,
                     "local_done_ns": [int(p.read_text()) for p in markers],

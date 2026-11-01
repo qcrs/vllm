@@ -1259,6 +1259,11 @@ class Scheduler(SchedulerInterface):
             q = scheduled.get(request.request_id, 0)
             if q not in (0, 1):
                 continue
+            binding = request.policy_binding
+            assert binding is not None
+            request_config = binding.config
+            if request_config.policy == "full":
+                continue
             blocks = manager.req_to_blocks[request.request_id]
             if any(b.ref_cnt < 1 or b.is_null for b in blocks):
                 continue
@@ -1268,17 +1273,18 @@ class Scheduler(SchedulerInterface):
             )
             source_len = request.effective_kv_len + q
             keep = protected_prefix + max(
-                config.min_keep_tokens,
-                config.recent_tokens + max(0, config.sink_tokens - protected_prefix),
-                int(config.retention * (source_len - protected_prefix)),
+                request_config.min_keep_tokens,
+                request_config.recent_tokens
+                + max(0, request_config.sink_tokens - protected_prefix),
+                int(request_config.retention * (source_len - protected_prefix)),
             )
             released = len(blocks) - (keep + self.block_size - 1) // self.block_size
             if not 0 < keep < source_len or released <= 0:
                 continue
             prefix, recent = sink_recent_ranges(
-                source_len, keep, config.sink_tokens, protected_prefix
+                source_len, keep, request_config.sink_tokens, protected_prefix
             )
-            zero_copy = config.policy == "sink_recent" and (
+            zero_copy = request_config.policy == "sink_recent" and (
                 whole_block_row(
                     [b.block_id for b in blocks],
                     source_len,
@@ -1302,6 +1308,7 @@ class Scheduler(SchedulerInterface):
                     tuple(b.block_id for b in blocks),
                     request.num_computed_tokens + q,
                     q,
+                    binding,
                 )
             )
         goal = self.kv_cache_manager.last_allocation_shortfall + min(
@@ -1368,6 +1375,10 @@ class Scheduler(SchedulerInterface):
     ) -> ReclaimRequest:
         """Deindex the private suffix and describe post-forward reclamation."""
         assert self.reclamation_config is not None
+        binding = request.policy_binding
+        assert binding is not None
+        if binding.config.policy == "full":
+            raise ValueError("Full KV requests cannot be reclaimed")
         q = scheduler_output.num_scheduled_tokens.get(request.request_id, 0)
         assert request.status == RequestStatus.RUNNING and q in (0, 1)
         assert (
@@ -1404,6 +1415,7 @@ class Scheduler(SchedulerInterface):
             row,
             keep_tokens,
             protected_prefix_tokens,
+            binding,
         )
 
     def _build_kv_connector_meta(
