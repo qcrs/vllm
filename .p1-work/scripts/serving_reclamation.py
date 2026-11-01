@@ -225,7 +225,11 @@ def main():
     parser.add_argument("--pool-gib", type=float, required=True)
     parser.add_argument("--stats")
     parser.add_argument("--reserve", type=int, default=0)
-    parser.add_argument("--budget-mode", choices=["fixed", "demand"], default="fixed")
+    parser.add_argument(
+        "--budget-mode",
+        choices=["fixed", "demand", "retry", "retry_pass"],
+        default="fixed",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--reclamation-counts", action="store_true")

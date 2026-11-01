@@ -297,6 +297,96 @@ def test_pressure_demand_uses_same_post_forward_snapshot(pressure_scheduler, q):
     assert candidate.q == q
 
 
+@pytest.mark.parametrize(
+    "budget_mode,keep,preemptions", [("demand", 32, 1), ("retry", 31, 0)]
+)
+def test_pressure_retry_accounts_for_earlier_victim_tail(
+    pressure_scheduler, budget_mode, keep, preemptions
+):
+    """Same release count, but one tail slot prevents the first retry miss."""
+    scheduler = pressure_scheduler(7, budget_mode=budget_mode, retention=0.25)
+    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+    scheduler.add_request(b)
+    output = scheduler.schedule()
+    assert output.reclaim_request.request_id == "A"
+    assert output.reclaim_request.target_keep_tokens == keep
+    complete_pressure_step(scheduler, output)
+    free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    retry = scheduler.schedule()
+    assert retry.reclaim_request is None
+    # B is waiting: lack of space must never become an eager preemption.
+    assert a.num_preemptions == b.num_preemptions == 0
+    assert (b.status == RequestStatus.WAITING) == bool(preemptions)
+    if not preemptions:
+        assert retry.num_scheduled_tokens == {"A": 1, "B": 64}
+        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free - 4
+
+
+def test_pressure_retry_requester_can_be_the_victim(pressure_scheduler):
+    scheduler = pressure_scheduler(3, budget_mode="retry")
+    a = create_requests(1, num_tokens=32, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    output = scheduler.schedule()
+    assert output.reclaim_request.target_keep_tokens == 16
+    assert output.total_num_scheduled_tokens == 0
+    complete_pressure_step(scheduler, output)
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens == {"A": 1}
+    assert a.num_preemptions == 0
+
+
+def test_pressure_retry_preserves_running_requester_without_preemption(
+    pressure_scheduler,
+):
+    scheduler = pressure_scheduler(7, budget_mode="retry", retention=0.25)
+    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
+    b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
+    for request in (a, b):
+        scheduler.add_request(request)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"A": 1}
+    assert output.reclaim_request.request_id == "A"
+    assert output.reclaim_request.target_keep_tokens == 47
+    complete_pressure_step(scheduler, output)
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens == {"A": 1, "B": 1}
+    assert a.num_preemptions == b.num_preemptions == 0
+
+
+@pytest.mark.parametrize(
+    "mode,keep,preemptions", [("retry", 48, 1), ("retry_pass", 31, 0)]
+)
+def test_pressure_retry_pass_covers_following_prefill(
+    pressure_scheduler, mode, keep, preemptions
+):
+    """A's retry must leave capacity for B later in the same bounded pass."""
+    scheduler = pressure_scheduler(7, budget_mode=mode, retention=0.25)
+    scheduler.max_num_scheduled_tokens = 96
+    a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+    b = create_requests(1, num_tokens=128, req_ids=["B"])[0]
+    for request in (a, b):
+        scheduler.add_request(request)
+    initial = scheduler.schedule()
+    assert initial.num_scheduled_tokens == {"A": 64, "B": 32}
+    complete_pressure_step(scheduler, initial)
+    scheduler.max_num_scheduled_tokens = 33
+    output = scheduler.schedule()
+    assert output.total_num_scheduled_tokens == 0
+    assert output.reclaim_request.target_keep_tokens == keep
+    complete_pressure_step(scheduler, output)
+    retry = scheduler.schedule()
+    assert retry.reclaim_request is None
+    assert b.num_preemptions == preemptions
+    assert retry.num_scheduled_tokens == (
+        {"A": 1} if preemptions else {"A": 1, "B": 32}
+    )
+
+
 def test_pressure_policy_binding_controls_budget_and_survives_preemption(
     pressure_scheduler,
 ):

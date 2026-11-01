@@ -1,5 +1,14 @@
 # P1 v8 测试设计
 
+## Refinement：首次 retry 容量预算
+
+- 用途：将回收后下一次同步调度中、截至 requester 的分配纳入最大合法 K。
+- I/O：Scheduler 同次 running 顺序、post-forward E/q、原 allocator 页需求、free；输出满足预测重试的最大 K，软 reserve 不压低原 retention/保护底线。
+- 风险：victim 尾页恰满后抢走一页、victim 在 requester 后却被多收费、requester 自身被回收、q=0/1、前方 prefill 改变 token budget、APC 再查询引入副作用。
+- 最低有效验证：纯预算用枚举 K 的独立容量 oracle；现有 Scheduler/真实 Pool 验证 running/waiting 首次重试、页增长与下限退回；TP2 helper 验证新尾槽 K 的实际 payload/continuation/free/reuse，再按固定正式配置验证。
+- 预测只覆盖已知的一次同步 pass，不锁定未来新到达或 EOS；无法在该 pass 排到 requester 时保留 fixed floor/原单次重试，不声称预留容量。
+- 有限前瞻：`retry_pass` 将同一 token budget 内 requester 后面的已知 running 分配作为软目标；全部覆盖不可行则退回 requester 前缀。真实 Pool 验证前方 decode 自救后不挤掉后方 prefill；纯预算 oracle 验证软目标不越过 floor，不加入未知到达或完整未来生命周期。
+
 ## CB0/CB1 缺口预算
 
 - 用途：同一候选快照产生固定预算或满足硬缺口/软 reserve 的最大合法 K。

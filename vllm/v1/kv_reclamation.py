@@ -27,7 +27,7 @@ class ReclamationConfig:
     budget_mode: str = "fixed"
 
     def __post_init__(self) -> None:
-        if self.budget_mode not in ("fixed", "demand"):
+        if self.budget_mode not in ("fixed", "demand", "retry", "retry_pass"):
             raise ValueError("Unknown KV reclamation budget mode")
         if self.policy not in ("full", "sink_recent", "random", "triattention"):
             raise ValueError("Unknown KV reclamation policy")
@@ -152,6 +152,75 @@ class ReclaimCandidate:
     logical_tokens: int = 0
     q: int = 0
     policy_binding: PolicyBinding | None = None
+
+
+@dataclass(frozen=True)
+class ReclaimAllocation:
+    request_id: str
+    num_tokens: int
+    required_blocks: int
+
+
+@dataclass(frozen=True)
+class ReclaimRetry:
+    free_blocks: int
+    allocations: tuple[ReclaimAllocation, ...]
+    following_allocations: tuple[ReclaimAllocation, ...] = ()
+
+
+def retry_reclaim_candidates(
+    candidates: list[ReclaimCandidate],
+    retry: ReclaimRetry,
+    reserve: int,
+    config: ReclamationConfig,
+    block_size: int,
+    member_bytes: int,
+) -> list[ReclaimCandidate]:
+    """Maximize K for the retry, optionally covering its known remaining pass.
+
+    For a victim visited before (or at) the requester, release minus its next
+    allocation is N - ceil((K + q_next) / B). A victim visited later has q_next=0.
+    The full pass is a soft target, subordinate to the retention floor. This
+    includes tail slack without reserving an unconditional extra page.
+    """
+    targets = [retry.allocations]
+    if config.budget_mode == "retry_pass" and retry.following_allocations:
+        targets.insert(0, retry.allocations + retry.following_allocations)
+    for allocations in targets:
+        total = sum(a.required_blocks for a in allocations)
+        by_id = {a.request_id: a for a in allocations}
+        for headroom in dict.fromkeys((reserve, 0)):
+            covering = []
+            for candidate in candidates:
+                allocation = by_id.get(candidate.request_id)
+                other = total - (allocation.required_blocks if allocation else 0)
+                keep = min(
+                    candidate.source_effective_kv_len - 1,
+                    block_size * (len(candidate.source_block_ids) - 1),
+                    block_size
+                    * (
+                        retry.free_blocks
+                        + len(candidate.source_block_ids)
+                        - other
+                        - headroom
+                    )
+                    - (allocation.num_tokens if allocation else 0),
+                )
+                if keep >= candidate.keep_tokens:
+                    covering.append(
+                        retarget_reclaim_candidate(
+                            candidate,
+                            keep,
+                            candidate.policy_binding.config
+                            if candidate.policy_binding is not None
+                            else config,
+                            block_size,
+                            member_bytes,
+                        )
+                    )
+            if covering:
+                return covering
+    return candidates
 
 
 def retarget_reclaim_candidate(

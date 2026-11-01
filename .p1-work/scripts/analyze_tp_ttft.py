@@ -24,11 +24,15 @@ def candidate_summary(run, output):
     for event in events:
         if event["event"] != "reclaim_candidates":
             continue
-        active = (
-            event["demand_candidates"]
-            if event["budget"].get("budget_mode") == "demand"
-            else event["candidates"]
-        )
+        mode = event["budget"].get("budget_mode", "fixed")
+        active = event[
+            {
+                "fixed": "candidates",
+                "demand": "demand_candidates",
+                "retry": "retry_candidates",
+                "retry_pass": "retry_candidates",
+            }[mode]
+        ]
         selected = next(
             (c for c in active if c["request_id"] == event["selected"]),
             None,
@@ -38,6 +42,36 @@ def candidate_summary(run, output):
             c["released_blocks"] >= event["shortfall"] for c in event["candidates"]
         )
         if selected is not None:
+            forecast = event.get("retry_forecast")
+            if forecast is not None:
+                for name, allocations in (
+                    ("retry", forecast["allocations"]),
+                    (
+                        "pass",
+                        forecast["allocations"]
+                        + forecast.get("following_allocations", []),
+                    ),
+                ):
+                    victim = next(
+                        (
+                            a
+                            for a in allocations
+                            if a["request_id"] == selected["request_id"]
+                        ),
+                        None,
+                    )
+                    other = sum(a["required_blocks"] for a in allocations) - (
+                        victim["required_blocks"] if victim else 0
+                    )
+                    keep = selected["keep_tokens"]
+                    next_tokens = victim["num_tokens"] if victim else 0
+                    growth = (keep + next_tokens + 15) // 16 - (keep + 15) // 16
+                    row[f"predicted_{name}_slack"] = (
+                        forecast["free_blocks"]
+                        + selected["released_blocks"]
+                        - other
+                        - growth
+                    )
             commit = next(
                 (
                     e
@@ -79,6 +113,12 @@ def candidate_summary(run, output):
         count=len(decisions),
         insufficient=sum(not d["hard_covered"] for d in decisions),
         first_retry_success=sum(d.get("first_retry_success", False) for d in decisions),
+        predicted_retry_covered=sum(
+            d.get("predicted_retry_slack", -1) >= 0 for d in decisions
+        ),
+        predicted_pass_covered=sum(
+            d.get("predicted_pass_slack", -1) >= 0 for d in decisions
+        ),
         timing="host monotonic; no GPU incremental cost claim",
     )
     output.write_text(json.dumps(result, indent=2))

@@ -59,12 +59,15 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.kv_reclamation import (
+    ReclaimAllocation,
     ReclaimCandidate,
     ReclaimRequest,
     ReclaimResult,
+    ReclaimRetry,
     ReclamationConfig,
     choose_reclaim_candidate,
     demand_reclaim_candidates,
+    retry_reclaim_candidates,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -1643,6 +1646,61 @@ def test_reclamation_demand_maximizes_keep_within_floor(
     assert result.released_blocks == len(row) - (expected + 15) // 16
     assert result.protected_prefix_tokens == prefix
     assert result.keep_tokens >= floor
+
+
+@pytest.mark.parametrize("victim_tokens", [0, 1, 17])
+@pytest.mark.parametrize(
+    "free,required,floor,reserve", [(40, 64, 2051, 0), (0, 129, 2051, 3)]
+)
+def test_reclamation_retry_maximal_keep_matches_capacity_oracle(
+    victim_tokens, free, required, floor, reserve
+):
+    """Enumerate all legal K, including floor and soft-reserve failure."""
+    candidate = ReclaimCandidate(
+        "A", floor, 128, 100, False, 0, 16, 4103, tuple(range(257))
+    )
+    allocations = [ReclaimAllocation("B", 1024, required)]
+    if victim_tokens:
+        allocations.insert(0, ReclaimAllocation("A", victim_tokens, 1))
+    result = retry_reclaim_candidates(
+        [candidate],
+        ReclaimRetry(free, tuple(allocations)),
+        reserve,
+        ReclamationConfig(),
+        16,
+        256,
+    )[0]
+    expected = floor
+    for headroom in dict.fromkeys((reserve, 0)):
+        feasible = []
+        for keep in range(floor, 4103):
+            retained_pages = (keep + 15) // 16
+            victim_growth = (keep + victim_tokens + 15) // 16 - retained_pages
+            if free + 257 - retained_pages >= required + victim_growth + headroom:
+                feasible.append(keep)
+        if feasible:
+            expected = max(feasible)
+            break
+    assert result.keep_tokens == expected
+
+
+@pytest.mark.parametrize("following_required", [2, 4])
+def test_reclamation_retry_pass_soft_target_preserves_floor(following_required):
+    candidate = ReclaimCandidate("A", 16, 3, 0, False, 0, 0, 64, (1, 2, 3, 4))
+    result = retry_reclaim_candidates(
+        [candidate],
+        ReclaimRetry(
+            0,
+            (ReclaimAllocation("A", 1, 1),),
+            (ReclaimAllocation("B", 32, following_required),),
+        ),
+        0,
+        ReclamationConfig(budget_mode="retry_pass"),
+        16,
+        256,
+    )[0]
+    # Four following pages cannot fit at K_floor; preserve requester feasibility.
+    assert result.keep_tokens == (31 if following_required == 2 else 48)
 
 
 def test_reclamation_demand_real_pool_releases_only_required_page(reclamation_owner):

@@ -16,7 +16,13 @@ from transformers import AutoTokenizer
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import CompilationConfig, CompilationMode
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_reclamation import sink_recent_ranges
+from vllm.v1.kv_reclamation import (
+    ReclaimAllocation,
+    ReclaimCandidate,
+    ReclaimRetry,
+    retry_reclaim_candidates,
+    sink_recent_ranges,
+)
 
 
 def main():
@@ -39,7 +45,10 @@ def main():
     parser.add_argument("--policy-updates", action="store_true")
     parser.add_argument("--worker-cpus", nargs="+", type=int)
     parser.add_argument("--demand-pages", type=int)
+    parser.add_argument("--retry-tail", action="store_true")
     args = parser.parse_args()
+    if args.retry_tail and args.demand_pages is None:
+        parser.error("--retry-tail requires --demand-pages")
     if args.worker_cpus:
         assert len(args.worker_cpus) == args.tp
     run = Path(os.environ["P1_RUN_DIR"])
@@ -208,6 +217,36 @@ def main():
                         - args.demand_pages
                     ),
                 )
+                if args.retry_tail:
+                    row = tuple(manager.get_block_ids(request.request_id)[0])
+                    candidate = ReclaimCandidate(
+                        request.request_id,
+                        32,
+                        len(row) - 2,
+                        0,
+                        False,
+                        0,
+                        source_effective_kv_len=source,
+                        source_block_ids=row,
+                        policy_binding=request.policy_binding,
+                    )
+                    retry = ReclaimRetry(
+                        0,
+                        (
+                            ReclaimAllocation(request.request_id, 1, 0),
+                            ReclaimAllocation(
+                                "requester", 16 * args.demand_pages, args.demand_pages
+                            ),
+                        ),
+                    )
+                    keep = retry_reclaim_candidates(
+                        [candidate],
+                        retry,
+                        0,
+                        scheduler.reclamation_config,
+                        16,
+                        1,
+                    )[0].keep_tokens
             output.reclaim_request = scheduler.make_reclaim_request(
                 request, output, keep
             )

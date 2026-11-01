@@ -56,11 +56,14 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_reclamation import (
+    ReclaimAllocation,
     ReclaimCandidate,
     ReclaimRequest,
+    ReclaimRetry,
     ReclamationConfig,
     choose_reclaim_candidate,
     demand_reclaim_candidates,
+    retry_reclaim_candidates,
     sink_recent_ranges,
     whole_block_row,
 )
@@ -983,7 +986,10 @@ class Scheduler(SchedulerInterface):
 
                     if allow_reclamation:
                         reclaim_candidate = self._select_reclaim_candidate(
-                            num_scheduled_tokens, request
+                            num_scheduled_tokens,
+                            request,
+                            new_computed_blocks=new_computed_blocks,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
                         )
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -1238,8 +1244,84 @@ class Scheduler(SchedulerInterface):
             self.reclaim_retry_pending = True
         return scheduler_output
 
+    def _reclaim_retry(
+        self,
+        scheduled: dict[str, int],
+        requester: Request,
+        new_computed_blocks: KVCacheBlocks | None,
+        num_new_computed_tokens: int,
+    ) -> ReclaimRetry | None:
+        """Project continuing requests through one synchronous retry pass.
+
+        This is not a capacity reservation: EOS, abort, or new admissions can
+        change the next pass. Cached-block lookup and Pool state stay untouched.
+        """
+        manager = self.kv_cache_manager.coordinator.single_type_managers[0]
+        allocations: list[ReclaimAllocation] = []
+        following: list[ReclaimAllocation] = []
+        reached_requester = False
+        budget = self.max_num_scheduled_tokens
+        requests = self.running
+        if requester.status != RequestStatus.RUNNING:
+            requests = [*requests, requester]
+        for request in requests:
+            if request.has_encoder_inputs:
+                return None
+            q = scheduled.get(request.request_id, 0)
+            cached = num_new_computed_tokens if request is requester else 0
+            computed = request.num_computed_tokens + q + cached
+            tokens = max(1, request.num_tokens - computed)
+            threshold = self.scheduler_config.long_prefill_token_threshold
+            if threshold > 0:
+                tokens = min(tokens, threshold)
+            tokens = min(tokens, budget)
+            if request.status == RequestStatus.RUNNING:
+                tokens = min(
+                    tokens,
+                    self.max_model_len - computed - self.num_sampled_tokens_per_step,
+                )
+            if tokens <= 0:
+                if request is requester:
+                    return None
+                continue
+            physical = request.effective_kv_len + q + cached
+            blocks = (
+                new_computed_blocks.blocks[0]
+                if request is requester and new_computed_blocks is not None
+                else ()
+            )
+            required = manager.get_num_blocks_to_allocate(
+                request.request_id,
+                physical + tokens,
+                blocks,
+                physical,
+                physical,
+                physical + tokens,
+            )
+            if request is requester and request.status != RequestStatus.RUNNING:
+                required += self.kv_cache_manager.watermark_blocks
+            target = following if reached_requester else allocations
+            target.append(ReclaimAllocation(request.request_id, tokens, required))
+            if request is requester:
+                reached_requester = True
+            budget -= tokens
+            if budget == 0:
+                break
+        if not reached_requester:
+            return None
+        return ReclaimRetry(
+            self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            tuple(allocations),
+            tuple(following),
+        )
+
     def _select_reclaim_candidate(
-        self, scheduled: dict[str, int], requester: Request | None = None
+        self,
+        scheduled: dict[str, int],
+        requester: Request | None = None,
+        *,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        num_new_computed_tokens: int = 0,
     ) -> tuple[Request, ReclaimCandidate] | None:
         config = self.reclamation_config
         assert config is not None
@@ -1324,7 +1406,36 @@ class Scheduler(SchedulerInterface):
         )
         fixed_selected = choose_reclaim_candidate(candidates, goal)
         demand_selected = choose_reclaim_candidate(demand, goal)
-        selected = demand_selected if config.budget_mode == "demand" else fixed_selected
+        retry = (
+            self._reclaim_retry(
+                scheduled, requester, new_computed_blocks, num_new_computed_tokens
+            )
+            if requester is not None
+            and (
+                config.budget_mode in ("retry", "retry_pass")
+                or self.kv_cache_manager.trace is not None
+            )
+            else None
+        )
+        retry_candidates = (
+            retry_reclaim_candidates(
+                candidates,
+                retry,
+                goal - shortfall,
+                config,
+                self.block_size,
+                member_bytes,
+            )
+            if retry is not None
+            else candidates
+        )
+        retry_selected = choose_reclaim_candidate(retry_candidates, goal)
+        selected = {
+            "fixed": fixed_selected,
+            "demand": demand_selected,
+            "retry": retry_selected,
+            "retry_pass": retry_selected,
+        }[config.budget_mode]
         if self.kv_cache_manager.trace is not None:
             from dataclasses import asdict
 
@@ -1340,6 +1451,8 @@ class Scheduler(SchedulerInterface):
                 budget=asdict(config),
                 candidates=[asdict(c) for c in candidates],
                 demand_candidates=[asdict(c) for c in demand],
+                retry_forecast=asdict(retry) if retry is not None else None,
+                retry_candidates=[asdict(c) for c in retry_candidates],
                 fixed_selected=asdict(fixed_selected) if fixed_selected else None,
                 demand_selected=asdict(demand_selected) if demand_selected else None,
                 selection_rule="coverage/zero-copy/bytes-per-page/release/arrival/id",
