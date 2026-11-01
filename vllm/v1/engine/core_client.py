@@ -3,7 +3,6 @@
 import asyncio
 import contextlib
 import queue
-import sys
 import time
 import uuid
 import weakref
@@ -1404,6 +1403,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         client_index: int = 0,
     ):
         self.client_count = client_count
+        additional = vllm_config.additional_config
+        mode = (
+            additional.get("dp_load_balancing", "requests")
+            if isinstance(additional, dict)
+            else "requests"
+        )
+        if mode not in ("requests", "known_work"):
+            raise ValueError("dp_load_balancing must be requests or known_work")
+        if mode == "known_work" and vllm_config.model_config.is_moe:
+            raise ValueError("known_work load balancing requires dense DP")
+        self.known_work_batch_size: int | None = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+            if mode == "known_work"
+            else None
+        )
 
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
@@ -1434,16 +1448,23 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
             local_inflight = Counter(self.reqs_in_flight.values())
-            min_score = sys.maxsize
+            min_score = float("inf")
             eng_index = 0
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
                 waiting, running = current_counts[idx]
-                score = max(
+                score: float = max(
                     waiting * 4 + running, local_inflight[self.core_engines[idx]]
                 )
+                if self.known_work_batch_size is not None:
+                    load = self.lb_loads[idx]
+                    score += (
+                        load.unfinished_tokens / self.known_work_batch_size
+                        if load is not None
+                        else 0.0
+                    )
                 if score < min_score:
                     min_score = score
                     eng_index = idx

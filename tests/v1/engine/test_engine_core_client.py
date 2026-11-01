@@ -202,18 +202,21 @@ def _make_pooling_request(
     )
 
 
-def _make_dplb_client():
+def _make_dplb_client(known_work=False):
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
     client.reqs_in_flight = {}
     client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
     client.lb_engines = [[0, 0], [0, 0], [0, 0]]
+    client.lb_loads = [None, None, None]
+    client.known_work_batch_size = 512 if known_work else None
     client.eng_start_index = 0
     return client
 
 
-def test_dplb_late_interaction_sticky_routing():
-    client = _make_dplb_client()
+@pytest.mark.parametrize("known_work", [False, True])
+def test_dplb_late_interaction_sticky_routing(known_work):
+    client = _make_dplb_client(known_work)
 
     query_key = "rerank-abc-query-0"
     query_request = _make_pooling_request(
@@ -242,8 +245,11 @@ def test_dplb_non_late_interaction_still_uses_lb():
     assert client.lb_engines[1][0] == 1
 
 
-def test_dplb_snapshot_cannot_erase_local_inflight_and_completion_releases_it():
-    client = _make_dplb_client()
+@pytest.mark.parametrize("known_work", [False, True])
+def test_dplb_snapshot_cannot_erase_local_inflight_and_completion_releases_it(
+    known_work,
+):
+    client = _make_dplb_client(known_work)
     client.reqs_in_flight = {f"old-{i}": client.core_engines[0] for i in range(3)}
     client.lb_engines = [[0, 0], [0, 2], [1, 0]]
     request = make_request(SamplingParams(max_tokens=1))
@@ -261,8 +267,9 @@ def test_dplb_snapshot_cannot_erase_local_inflight_and_completion_releases_it():
     )
 
 
-def test_dplb_explicit_rank_and_abort_keep_affinity():
-    client = _make_dplb_client()
+@pytest.mark.parametrize("known_work", [False, True])
+def test_dplb_explicit_rank_and_abort_keep_affinity(known_work):
+    client = _make_dplb_client(known_work)
     client.resources = SimpleNamespace(engine_dead=False)
     client._abort_requests = AsyncMock()
     client.lb_engines = [[0, 0], [20, 20], [0, 0]]
@@ -273,6 +280,34 @@ def test_dplb_explicit_rank_and_abort_keep_affinity():
     client._abort_requests.assert_awaited_once_with(
         [request.request_id], client.core_engines[1]
     )
+
+
+@pytest.mark.parametrize("known_work, expected", [(False, 0), (True, 1)])
+def test_dplb_known_work_distinguishes_equal_counts(known_work, expected):
+    from vllm.v1.metrics.stats import DPLoadSnapshot
+
+    client = _make_dplb_client(known_work)
+    client.lb_engines = [[0, 1], [0, 1], [1, 0]]
+    client.lb_loads = [DPLoadSnapshot(8192), DPLoadSnapshot(1), None]
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1))
+    )
+    assert chosen == client.core_engines[expected]
+    assert client.lb_engines[expected][0] == 1
+
+
+def test_dplb_known_work_ties_still_rotate():
+    client = _make_dplb_client(known_work=True)
+    chosen = []
+    for _ in range(3):
+        client.lb_engines = [[0, 0], [0, 0], [0, 0]]
+        client.reqs_in_flight.clear()
+        chosen.append(
+            client.get_core_engine_for_request(
+                make_request(SamplingParams(max_tokens=1))
+            )
+        )
+    assert chosen == client.core_engines
 
 
 def test_dplb_reclamation_updates_are_rejected_before_broadcast():

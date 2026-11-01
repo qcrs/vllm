@@ -177,6 +177,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--load-diagnostic", action="store_true")
+    parser.add_argument(
+        "--routing", choices=["requests", "known_work"], default="requests"
+    )
+    parser.add_argument("--work-counters", action="store_true")
     tuning_arguments(parser)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
@@ -264,27 +268,20 @@ def main():
         "--cudagraph-metrics",
     ]
     configure_worker_cpus(args, command, env, run)
+    additional = {"dp_load_balancing": args.routing}
     if args.policy != "full":
-        command.extend(
-            [
-                "--additional-config",
-                json.dumps(
-                    {
-                        "kv_reclamation": {
-                            "policy": "sink_recent"
-                            if args.policy == "noop"
-                            else args.policy,
-                            "retention": 1.0 if args.policy == "noop" else 0.5,
-                            "pressure": True,
-                            "reserve_cap": 0,
-                            "stats_path": args.stats,
-                        }
-                    }
-                ),
-            ]
-        )
+        additional["kv_reclamation"] = {
+            "policy": "sink_recent" if args.policy == "noop" else args.policy,
+            "retention": 1.0 if args.policy == "noop" else 0.5,
+            "pressure": True,
+            "reserve_cap": 0,
+            "stats_path": args.stats,
+        }
+    command.extend(["--additional-config", json.dumps(additional)])
     if args.trace:
         command.extend(["--scheduler-cls", "dp_hooks.P1DPScheduler"])
+    elif args.work_counters:
+        command.extend(["--scheduler-cls", "dp_hooks.P1DPWorkScheduler"])
     tokenizer = AutoTokenizer.from_pretrained(
         "/data/models/Qwen3-8B", local_files_only=True
     )
@@ -322,7 +319,7 @@ def main():
                     hashlib.sha256(json.dumps(p).encode()).hexdigest() for p in prompts
                 ],
                 "routing": (
-                    "native algorithm, one observation per ADD; "
+                    f"{args.routing}, one observation per ADD; "
                     "fixed rank only for skewed case"
                 ),
             },

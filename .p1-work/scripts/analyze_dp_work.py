@@ -9,6 +9,8 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from dp_serving import aggregate
+from summarize_dp_serving import preemptions
 
 
 def read(path):
@@ -195,11 +197,222 @@ def analyze(run):
     )
 
 
+def analyze_formal(run):
+    """Audit only the explicitly supplied fixed W1/W0 run, including warmup."""
+    protocol, guard = read(run / "protocol.json"), read(run / "result.json")
+    args = protocol["args"]
+    assert guard["status"] == "PASS" and not guard["limit_triggered"]
+    assert guard["peak_project_nvml_bytes"] < 44 * 2**30
+    assert args["scenario"] in ("w1", "w0") and args["repeats"] == 3
+    assert not args["trace"] and not args["load_diagnostic"] and args["work_counters"]
+    assert args["pool_gib"] == 4 and args["policy"] == "sink_recent"
+    assert args["max_num_batched_tokens"] == 512 and args["worker_cpus"] == [20, 21]
+    lengths = [8192, 512] * 4 if args["scenario"] == "w1" else [4096] * 8
+    assert protocol["prompt_tokens"] == lengths
+    assert protocol["arrivals_s"] == [i * 0.05 for i in range(8)]
+    assert protocol["prompt_sha256"] == [
+        hashlib.sha256(json.dumps(p).encode()).hexdigest()
+        for p in read(run / "prompts.json")
+    ]
+    routes = events(run / "routing.jsonl")
+    work = [events(run / f"replica-{rank}/work.jsonl") for rank in range(2)]
+    assert len(routes) == sum(map(len, work)) == 33
+    assert len({r["request"] for r in routes}) == 33
+    for route in routes:
+        assert route["explicit"] is None
+        scores = [max(4 * w + r, f) for (w, r), f in zip(route["counts"], route["F"])]
+        if args["routing"] == "known_work":
+            assert route["batch"] == 512
+            scores = [
+                c + (s["unfinished_tokens"] / 512 if s else 0)
+                for c, s in zip(scores, route["snapshots"])
+            ]
+        else:
+            assert route["batch"] is None
+        order = [(route["scan_start"] + i) % 2 for i in range(2)]
+        assert route["replica"] == min(order, key=lambda rank: scores[rank])
+    rounds, pooled, outputs = [], [], {}
+    for row in [read(run / "warmup-summary.json"), *read(run / "serving.json")]:
+        items = read(run / f"requests-{row['repeat']}.json")
+        assert [r["prompt_tokens"] for r in items] == lengths
+        assert row["aggregate"] == aggregate(items, row["elapsed_s"])
+        actual = [Counter(), Counter()]
+        observations = []
+        for item in items:
+            assert len(item["token_ids"]) == item["usage"]["completion_tokens"] == 128
+            route = next(
+                r for r in routes if r["external"] == f"cmpl-{item['request']}-0"
+            )
+            rank = item["replica"]
+            assert route["replica"] == rank
+            recorded = [w for w in work[rank] if w["request"] == route["request"]]
+            assert len(recorded) == 1
+            record = recorded[0]
+            assert record["prompt_tokens"] == item["prompt_tokens"]
+            assert record["scheduled_tokens"] == (
+                item["prompt_tokens"] + 127 + record["recomputed_tokens"]
+            )
+            actual[rank].update(
+                {
+                    k: record[k]
+                    for k in ("scheduled_tokens", "prefill_tokens", "recomputed_tokens")
+                }
+            )
+            observations.append(
+                dict(
+                    request=item["request"],
+                    replica=rank,
+                    C=[
+                        max(4 * w + r, f)
+                        for (w, r), f in zip(route["counts"], route["F"])
+                    ],
+                    U=[
+                        s["unfinished_tokens"] if s else None
+                        for s in route["snapshots"]
+                    ],
+                    age_ms=[
+                        (route["used_ns"] - s["generated_ns"]) / 1e6 if s else None
+                        for s in route["snapshots"]
+                    ],
+                    ttft_s=item["ttft_s"],
+                    tpot_s=item["tpot_s"],
+                )
+            )
+            outputs[item["request"]] = item["token_ids"]
+        for rank in range(2):
+            reported_prompt = sum(
+                v
+                for k, v in row["counter_deltas"].items()
+                if k.startswith("vllm:prompt_tokens_total{") and f'engine="{rank}"' in k
+            )
+            if actual[rank]["recomputed_tokens"] == 0:
+                assert reported_prompt == actual[rank]["prefill_tokens"]
+        rounds.append(
+            dict(
+                summary=row,
+                work=actual,
+                preemptions=preemptions(row),
+                routes=observations,
+            )
+        )
+        if row["repeat"] != "warmup":
+            pooled.extend(items)
+    elapsed = sum(r["summary"]["elapsed_s"] for r in rounds[1:])
+    combined = aggregate(pooled, elapsed)
+    combined.pop("active_span_s")
+    costs = read(run / "routing-costs.json")["wrapper_including_write_ns"]
+    assert len(costs) == 33
+    paths = (
+        [
+            run / name
+            for name in (
+                "protocol.json",
+                "prompts.json",
+                "result.json",
+                "routing.jsonl",
+                "routing-costs.json",
+                "serving.json",
+                "warmup-summary.json",
+                "dp-source-hashes.json",
+                "dp_hooks.py",
+                "dp_server.py",
+                "source/.p1-work/scripts/dp_serving.py",
+            )
+        ]
+        + list(run.glob("requests-*.json"))
+        + list(run.glob("replica-*/work.jsonl"))
+    )
+    return dict(
+        run=str(run),
+        guard=guard,
+        protocol=protocol,
+        rounds=rounds,
+        aggregate=combined,
+        max_ttft_s=max(r["ttft_s"] for r in pooled),
+        max_tpot_s=max(r["tpot_s"] for r in pooled),
+        routing_cpu_us=distribution([r["route_cpu_ns"] / 1e3 for r in routes]),
+        observation_cpu_us=distribution([c / 1e3 for c in costs]),
+        outputs=outputs,
+        source_hashes=read(run / "dp-source-hashes.json"),
+        artifact_sha256={
+            str(p.relative_to(run)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in paths
+        },
+    )
+
+
+def compare_formal(runs):
+    pairs = {}
+    for run in runs:
+        args = run["protocol"]["args"]
+        key = (args["scenario"], "reverse" in Path(run["run"]).name)
+        pair = pairs.setdefault(key, {})
+        assert args["routing"] not in pair
+        pair[args["routing"]] = run
+    comparisons = []
+    for (scenario, reverse), pair in pairs.items():
+        if len(pair) != 2:
+            continue
+        a, b = pair["requests"], pair["known_work"]
+        assert a["source_hashes"] == b["source_hashes"]
+        assert a["protocol"]["prompt_sha256"] == b["protocol"]["prompt_sha256"]
+        ca, cb = (dict(r["protocol"]["args"]) for r in (a, b))
+        ca.pop("routing")
+        cb.pop("routing")
+        assert ca == cb
+        for helper in (
+            "source/.p1-work/scripts/dp_serving.py",
+            "dp_hooks.py",
+            "dp_server.py",
+        ):
+            assert a["artifact_sha256"][helper] == b["artifact_sha256"][helper]
+        comparisons.append(
+            dict(
+                scenario=scenario,
+                reverse=reverse,
+                A=a["run"],
+                B=b["run"],
+                throughput_change_percent=100
+                * (
+                    b["aggregate"]["output_tokens_per_s"]
+                    / a["aggregate"]["output_tokens_per_s"]
+                    - 1
+                ),
+                goodput_change_percent=100
+                * (
+                    b["aggregate"]["slo_goodput_requests_per_s"]
+                    / a["aggregate"]["slo_goodput_requests_per_s"]
+                    - 1
+                ),
+                rounds_throughput={
+                    r["protocol"]["args"]["routing"]: [
+                        v["summary"]["aggregate"]["output_tokens_per_s"]
+                        for v in r["rounds"][1:]
+                    ]
+                    for r in (a, b)
+                },
+                identical_timed_outputs=sum(
+                    a["outputs"][rid] == b["outputs"][rid]
+                    for rid in a["outputs"]
+                    if "warmup" not in rid
+                ),
+            )
+        )
+    return comparisons
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("runs", type=Path, nargs="+")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--formal", action="store_true")
     args = parser.parse_args()
+    if args.formal:
+        runs = [analyze_formal(run) for run in args.runs]
+        result = dict(runs=runs, comparisons=compare_formal(runs))
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result["comparisons"], indent=2))
+        return
     result = [analyze(run) for run in args.runs]
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     for item in result:

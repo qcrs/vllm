@@ -86,3 +86,98 @@ replica0 U=4、以decode为主；两个请求约2411/2405ms后首次schedule，T
 因此条件成立，进入一次显式 `S=C+U/batch` 的 DP4 实现与 W1/W0 A/B。
 不修改pool/负载找正结果，不引入usage惩罚、迁移或跨池借页。正式结果随后按独立
 源码状态和关闭trace/load-diagnostic的测量记录，不用本节诊断数据代替。
+
+## DP4 实现与有限正式对照
+
+`DPLBAsyncMPClient`读取additional_config的`dp_load_balancing`：默认`requests`
+仍使用C，显式`known_work`使用`S=C+U/max_num_batched_tokens`，缺快照的U为0。
+非法模式和MoE使用known_work均明确报错。只影响新请求选择；显式rank、sticky、
+本地F下界、乐观waiting、轮转tie以及abort/finished affinity保持原语义。
+没有增加过期预测、usage惩罚或活跃请求迁移，也没有修改DP策略版本的支持范围。
+
+CPU路由回归16 passed / 33 deselected，覆盖两模式的sticky、F与完成释放、
+显式rank和abort、相同counts不同U及缺快照轮转。pre-commit及manual mypy-3.12
+通过，初次静态失败日志也在
+[CPU归档](../experiments/Engineering-Next-DP-Formal/cpu-validation)。
+
+两边均沿上节W1/W0固定输入、硬件和Runtime配置，完整负载warmup后3轮×8。
+`--work-counters`只在CPU统计实际scheduled/prefill/recomputed token，每请求完成
+写一次；ADD各写一次route快照。两边使用相同wrapper，不启用trace/load-diagnostic、
+payload检查、逐步同步或NSYS。复算检查三轮全部128输出、公式/轮转、工作恒等式、
+Prometheus交叉核对、源码/间接helper与输入hash一致；不是拿旧native结果作A。
+
+| 场景/顺序 | 模式与原始归档 | 三轮output tok/s | timed SLO | warmup tok/s；SLO |
+| --- | --- | --- | --- | --- |
+| W1正向A | [requests](../experiments/Engineering-Next-DP-Formal/20261101-112848-requests-w1) | 176.561 / 175.590 / 175.447 | 18/24，FAIL | 175.516；6/8 |
+| W1正向B | [known_work](../experiments/Engineering-Next-DP-Formal/20261101-113054-known-work-w1) | 209.874 / 209.064 / 209.326 | 21/24，FAIL | 208.711；7/8 |
+| W0正向A | [requests](../experiments/Engineering-Next-DP-Formal/20261101-113322-requests-w0) | 280.558 / 279.765 / 278.723 | 24/24 | 278.734；8/8 |
+| W0正向B | [known_work](../experiments/Engineering-Next-DP-Formal/20261101-113455-known-work-w0) | 276.120 / 274.649 / 275.159 | 24/24 | 274.789；8/8 |
+| W1反向B | [known_work](../experiments/Engineering-Next-DP-Formal/20261101-113639-known-work-w1-reverse) | 213.184 / 210.882 / 253.729 | 22/24，FAIL | 258.249；8/8 |
+| W1反向A | [requests](../experiments/Engineering-Next-DP-Formal/20261101-113933-requests-w1-reverse) | 216.297 / 215.662 / 215.832 | 21/24，FAIL | 178.644；6/8 |
+
+以下聚合使用全部24条timed请求和三轮elapsed之和；分位不平均，小样本P99只描述
+本次请求，warmup不参与聚合。
+
+| 场景/顺序/模式 | output tok/s；goodput req/s | TTFT P50/P99/max，秒 | TPOT P50/P99/max，ms |
+| --- | --- | --- | --- |
+| W1正向A | 175.864；1.03046 | .4754 / 3.4391 / 3.4396 | 15.865 / 32.901 / 32.904 |
+| W1正向B | 209.421；1.43159 | .8375 / 2.5205 / 2.5217 | 18.437 / 27.638 / 27.643 |
+| W0正向A | 279.680；2.18500 | .8843 / 1.3798 / 1.3826 | 18.938 / 22.782 / 22.813 |
+| W0正向B | 275.308；2.15084 | .8588 / 1.4656 / 1.4809 | 18.890 / 22.830 / 22.855 |
+| W1反向B | 224.316；1.60643 | .8796 / 2.4667 / 2.4768 | 18.485 / 27.366 / 27.453 |
+| W1反向A | 215.930；1.47608 | .8708 / 2.4730 / 2.4731 | 21.462 / 26.807 / 26.816 |
+
+W1正向吞吐+19.081%、goodput+38.928%，同时TTFT/TPOT P50变差；反向聚合
+仅+3.884%/+8.831%，B前两轮均慢于A，第三轮显著更快。A两次启动的聚合吞吐
+从175.864到215.930，且下表真实路由/工作分配改变。**不满足稳定超出重复波动的
+Serving收益判据**，不能只用正向或反向第三轮写提速。W0吞吐/goodput均-1.563%，
+两边24/24 SLO，落在既定≤5%退化预算；没有正向收益，不补W0反向，不继续扫参。
+
+### 实际工作、状态年龄与测量成本
+
+| run | warmup prefill，replica0/1 | 三轮timed prefill，replica0/1 |
+| --- | --- | --- |
+| W1正向A | 2048 / 32768 | 每轮2048 / 32768 |
+| W1正向B | 9728 / 25088 | 每轮9728 / 25088 |
+| W0正向A/B | 16384 / 16384 | 两模式每轮均16384 / 16384 |
+| W1反向B | 17408 / 17408 | 9728 / 25088；9728 / 25088；17920 / 16896 |
+| W1反向A | 2048 / 32768 | 每轮10240 / 24576 |
+
+全部六run的warmup与timed实际重算和Prom抢占均为0。每请求实际scheduled=
+prompt+127+recomputed，既统计decode又核对prefill counter；不将prompt counter
+单独当作重算证据。正式回收和首次retry次数未采集，明确为UNKNOWN，不复制诊断值。
+W1正向A各轮route为`[1,0,1,0,1,0,1,0]`，反向A为
+`[1,0,1,0,1,0,0,0]`；反向B第三轮也改变route。这是异步反馈下的实际行为，
+不是固定6/2实验，也不能由工作更均匀推导稳定用户收益。
+
+| run | timed快照年龄P50/P95/max，ms | 两副本均≤250ms的ADD | 路由CPU P50/P95，µs | 观测wrapper含写盘P50/P95，µs |
+| --- | --- | --- | --- | --- |
+| W1正向A | 105.36 / 3705.18 / 3750.98 | 15/24 | 25.61 / 29.40 | 235.24 / 1394.58 |
+| W1正向B | 101.64 / 2018.78 / 2066.07 | 15/24 | 27.52 / 29.87 | 232.30 / 261.41 |
+| W0正向A | 71.15 / 126.21 / 148.43 | 24/24 | 24.86 / 26.29 | 234.45 / 358.30 |
+| W0正向B | 108.12 / 207.94 / 260.02 | 22/24 | 26.43 / 28.68 | 229.06 / 330.01 |
+| W1反向B | 103.05 / 1931.10 / 2020.57 | 17/24 | 27.52 / 29.03 | 239.47 / 258.54 |
+| W1反向A | 78.48 / 2849.82 / 3625.16 | 15/24 | 25.83 / 29.78 | 237.84 / 325.21 |
+
+年龄包含完成后idle快照，不能视为网络耗时；DP4本身没有250ms过期剔除规则。
+CPU成本覆盖每run全部33次ADD（小预热1、完整warmup8、timed24），是同配置
+观测下的分布，不宣称无观测时精确开销。逐请求C/U/source sequence及生成、接收、
+使用时间保留在`routing.jsonl`，各轮route/工作和ITL分位在复算JSON中。
+
+三对全部24条timed输出token IDs分别一致；不证明有损质量保持。六次guard均
+PASS/exit0、无资源触发，NVML项目合计峰：W0两次42,828,038,144 bytes，W1反向B
+42,832,232,448 bytes，其余W1均42,830,135,296 bytes，低于44GiB停止阈值。
+每run的两个Worker主线程affinity均为CPU20/21；不声称全部helper线程绑定。
+
+### 复算与最终判断
+
+完整可执行argv、exit、输入/源码/helper/派生结果hash见
+[DP4分析manifest](../experiments/Engineering-Next-DP-Formal/dp4-analysis-manifest.json)。
+[最终复算](../experiments/Engineering-Next-DP-Formal/dp4-final-analysis.json)由
+`analyze_dp_work.py --formal <上述六个run> --output <目标JSON>`产生；只读明确传入
+的run，不重启GPU或扫描旧矩阵。首次四run的复算和反向结果均保留，未覆盖原始样本。
+
+DP3为IMPLEMENTED/CORRECTNESS_PASS；DP4门槛成立后已实施并完成有限A/B，
+正确性PASS，性能PARTIAL、W1 SLO_FAIL。保留显式实验模式，requests仍默认；
+停止扩大实验，不宣称SERVING_BENEFIT。旧D1无可分辨收益、旧DP/TP/M2/Prefix
+FAIL/PARTIAL和85条质量样本冻结保持原义。

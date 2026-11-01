@@ -26,6 +26,51 @@ def directory(config):
     return path
 
 
+class P1DPWorkScheduler(Scheduler):
+    """CPU work counters; one record per completed request, no payload hooks."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._p1_work = {}
+        self._p1_work_stream = (directory(self.vllm_config) / "work.jsonl").open(
+            "a", buffering=1
+        )
+
+    def schedule(self, *args, **kwargs):
+        output = super().schedule(*args, **kwargs)
+        for rid, q in output.num_scheduled_tokens.items():
+            request = self.requests[rid]
+            end = request.num_computed_tokens
+            start = end - q
+            record = self._p1_work.setdefault(
+                rid,
+                dict(
+                    request=rid,
+                    prompt_tokens=request.num_prompt_tokens,
+                    scheduled_tokens=0,
+                    prefill_tokens=0,
+                    recomputed_tokens=0,
+                    high_water=0,
+                ),
+            )
+            record["scheduled_tokens"] += q
+            record["prefill_tokens"] += min(end, request.num_prompt_tokens) - min(
+                start, request.num_prompt_tokens
+            )
+            record["recomputed_tokens"] += max(
+                0, min(end, record["high_water"]) - start
+            )
+            record["high_water"] = max(record["high_water"], end)
+        return output
+
+    def update_from_output(self, *args, **kwargs):
+        output = super().update_from_output(*args, **kwargs)
+        for rid in self._p1_work.keys() - self.requests.keys():
+            record = self._p1_work.pop(rid)
+            self._p1_work_stream.write(json.dumps(record) + "\n")
+        return output
+
+
 class P1DPScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -120,7 +120,13 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 ## DP3 已知工作量快照
 
 - 用途：Scheduler产生去重unfinished工作量，经原Coordinator通道到实际Frontend shadow。
-- I/O：`num_tokens - (num_computed_tokens - num_in_flight_tokens)`与Pool usage；输出带engine/sequence/processed step/生成与接收时刻的快照，不预测max_tokens。
+- I/O：`num_tokens - (num_computed_tokens - num_in_flight_tokens)`与Pool usage；输出带engine/sequence/current_step/生成与接收时刻的快照，不预测max_tokens。
 - 风险：提前扣除在途、preempt重复/漏算、counts不变压住U更新、完成未归零、把状态年龄冒充网络延迟、改变affinity/F/tie语义。
 - 最低有效验证：现有engine/client suite用真实Request计算在途/重算/结束，受控clock验证100ms合并及立即归零，真实ZMQ验证独立副本快照与Frontend接收；再固定W1/W0各完整预热+两轮真实DP2 HTTP诊断，不改Router。
 - DP4进入判据预注册：不同请求、不同source sequence上重复出现相近C（差≤1）、U差至少512且两副本状态年龄≤250ms；还须结合实际排队/工作/忙闲判断，shadow分歧本身不是错选证据。
+
+## DP4 显式工作量路由
+
+- 用途与I/O：仅在dense internal DP新ADD上，用已收到的U及固定batch计算`S=C+U/batch`；默认requests保留D1。
+- 风险：U代替F下界、改变sticky/显式rank/abort、相同分数失去轮转、把未知输出当工作量、路由更均匀冒充性能收益。
+- 最低有效验证：在现有client suite扩展两模式行为与tie，复用affinity/F用例；W1/W0各完整预热+3轮A/B，关闭trace/load-diagnostic，仅每完成请求写CPU工作汇总、每ADD写路由快照，正收益再一次反向。

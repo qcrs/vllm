@@ -7,6 +7,8 @@ import json
 import os
 import runpy
 import time
+from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
 from vllm.v1.engine.core_client import DPLBAsyncMPClient
@@ -26,6 +28,11 @@ def main():
     def route(self, request):
         start = time.perf_counter_ns()
         counts = [list(c) for c in self.lb_engines]
+        local = Counter(self.reqs_in_flight.values())
+        inflight = [local[e] for e in self.core_engines]
+        snapshots = [asdict(s) if s else None for s in self.lb_loads]
+        scan_start = self.eng_start_index
+        used_ns = time.monotonic_ns()
         before = time.perf_counter_ns()
         chosen = original(self, request)
         selected = time.perf_counter_ns()
@@ -37,6 +44,13 @@ def main():
                     "replica": self.core_engines.index(chosen),
                     "explicit": request.data_parallel_rank,
                     "counts": counts,
+                    "F": inflight,
+                    "snapshots": snapshots,
+                    "scan_start": scan_start,
+                    "batch": self.known_work_batch_size,
+                    "used_ns": used_ns,
+                    "published_ns": self.lb_stats_published_ns,
+                    "received_ns": self.lb_stats_received_ns,
                     "route_cpu_ns": selected - before,
                     "time_ns": time.monotonic_ns(),
                 }
