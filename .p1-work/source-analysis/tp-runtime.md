@@ -1,5 +1,38 @@
 # TP：head ownership 与 all-rank 发布边界
 
+## 2026-11-01 请求策略绑定与 PL2 安全更新
+
+`EngineCore`拥有默认version、单调next version和已发布的host binding表；处理ADD时
+从SamplingParams.extra_args的 `kv_reclamation_version`或当前默认绑定不可变
+`PolicyBinding(version,config,calibration_sha256)`。该值经NewRequestData进入
+Worker slot，并由Scheduler创建intent；预算和执行因此使用同一config。
+Random只在TP root消耗请求RNG，Tri校准bytes实际读取一次并hash，不按请求复制。
+公共compactor、row/E、score SUM、root plan广播、全rank completion仍由Runtime管理。
+
+`EngineCore.update_reclamation_policy`在串行utility边界调用executor的
+`prepare_reclamation_policy`。每rank的 `KVReclamationWorker.prepare_policy`
+创建独立版本adapter/stats/有限workspace，预热score/selection并同步设备后ACK；
+EngineCore核对所有rank/version/config/artifact SHA一致后才发布默认。
+旧请求、preempt请求和在途intent继续pin旧版。prepare不写KV、不消耗Random请求RNG。
+失败不发布，version不复用；未发布的失败准备资源随engine关闭释放，不宣称事务回滚。
+
+`post_step`在实际输出等待与Scheduler commit/free之后调用
+`_retire_unused_reclamation_policies`。非默认且canonical requests无引用的版本
+才通过 `retire_reclamation_policies` 发往全rank；Worker设备全部stream完成后删除
+版本资源，EngineCore核对retire ACK后删除host binding。finished slot的binding
+不持有GPU资源，slot remove清理该值。prepare同步不代替每次回收completion，
+也不恢复旧请求已删KV。释放allocated bytes不等于CUDA缓存立即归还系统。
+
+支持单engine TP1/TP2；只更新policy/stats_path/retention/sink/recent/min_keep，
+pressure/budget_mode/reserve不能在线混改。DPLB和带Coordinator的EngineCoreProc
+明确拒绝更新，避免dense重写DP size=1后误广播。调用使用既有结构化utility，
+无HTTP管理端点。[策略报告](../reports/engineering-next-policy.md)记录CPU失败ACK、
+真实TP2延迟rank准备/旧intent、TP1混合三策略/full及退役markers；
+[复算脚本](../scripts/analyze_policy_updates.py)检查全rank prepare→publish及
+local-done→commit ACK→retire顺序。冷开销带诊断同步，不当作Serving收益。
+
+## 原 TP 执行与完成协议
+
 ## 已核对的 pinned 调用链
 
 `Qwen3Attention` / `QKVParallelLinear` 对 Hkv>=TP 使用连续 head shard，

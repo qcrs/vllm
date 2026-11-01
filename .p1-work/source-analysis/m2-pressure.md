@@ -1,5 +1,32 @@
 # M2 压力控制源码与状态
 
+## 2026-11-01 CB0 / CB1 与请求绑定增量
+
+当前 [Controller报告](../reports/engineering-next-controller.md) 保留预算正确性及
+Serving负收益；下文为原M2历史。`Scheduler._select_reclaim_candidate`一次扫描
+构造合法候选快照，决策和显式trace消费同一份E/L/N/q/P/row/K/释放页/复制字节。
+allocator的required/available/shortfall来自同次allocation；没有GPU回读或重复Pool扫描。
+正式trace-off不写逐候选JSON。离线 `analyze_tp_ttft.py --candidate-output` 关联
+intent→commit/release→首次retry与后续native动作，不将preempt后admission算retry成功。
+
+`demand_reclaim_candidates` / `retarget_reclaim_candidate`在CPU上以fixed结果作为
+K_floor，显式 `budget_mode=demand`依次求G和D对应最大合法K：
+`min(E-1,B*(N-T))`，且K≥K_floor、实际可释放≥T；无单候选覆盖D保持原最大释放行为。
+exact whole-block检查只在该K进行，不降低K换零拷贝。fixed仍默认；G的reserve是
+软目标，D是当前硬缺口，均不能保证下一轮decode/admission状态不变。
+320次新demand候选覆盖D，故CB2门控STOPPED/NOT_RUN。大量后续retry miss说明
+覆盖当次D不等于后续成功；未通过临时reserve修补掩盖负结果。
+
+PL0/PL1后 `EngineCore.add_request` 绑定host不可变 `PolicyBinding`；Scheduler
+预算/保护区/zero-copy从请求绑定读取，`ReclaimRequest`和`ReclaimResult`传同一版本。
+Worker slot只持有binding值，policy/stats/workspace按engine-local版本共享，full
+请求不成为victim。preempt/recompute保版；全rank完成、source row/E身份及canonical
+commit/free不变。retention为当前E域单次保留下限，不是历史累计质量保证。
+PL2更新/资源退役边界见 [TP记录](tp-runtime.md) 和
+[策略报告](../reports/engineering-next-policy.md)。
+
+## 原 M2 阶段记录
+
 本页保留压力控制提交 `d0b3ca3e91` 的阶段假设；`5f9f96d9d0` 补入评测导航。
 下文“全私有页”和“仅SinkRecent”描述该阶段，不是最终支持契约。最终调用链以
 [`Scheduler._select_reclaim_candidate` / `make_reclaim_request`](../../vllm/v1/core/sched/scheduler.py)

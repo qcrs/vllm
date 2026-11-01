@@ -1,5 +1,31 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-NEXT-X0-NAV-BEGIN -->
+
+## 2026-11-01 prompt3实施完成：当前交付
+
+当前结论以 [下一阶段工程收尾](engineering-next-closeout.md) 为准；
+从B0推进至X0，完成Controller缺口预算、TP两项评分增量、逐请求策略绑定、
+真实PL2安全更新与dense DP工作量反馈/显式路由。CB2缺进入证据而停止；
+TP2b、DP4均按门槛实施，已给有限对照和停止结论。
+
+正确性：受影响CPU、真实Qwen3-8B TP1/TP2及DP2控制链通过；PL2有全rank准备、
+旧请求/intent保版和安全退役证据，限定单engine。micro：TP2a/TP2b完整回收分别
+相对前增量缩短约8.5–13%/40–52%，仅三个真实形状、合成KV。Serving：CB1 demand
+明显负收益；TP无稳定收益、SLO_FAIL；DP4正反向变化不稳定，PARTIAL、W1 SLO_FAIL。
+
+详细报告：[Controller](engineering-next-controller.md)、[TP](engineering-next-tp.md)、
+[Policy](engineering-next-policy.md)、[DP](engineering-next-dp.md)。最终提交、命令/hash、
+41次guard及4次失败审计见收尾归档；85条质量样本冻结，旧FAIL/PARTIAL不改写。
+分阶段本地提交已完成，未push或创建上游PR，原用户待提交正文保留。
+
+以下为本轮实施前的导航和历史交付，按对应日期及配置理解。
+
+<details>
+<summary>prompt3实施前的计划及历史记录（原文保留）</summary>
+
+<!-- ENGINEERING-NEXT-X0-HISTORY -->
+
 ## 2026-11-01工程深化交付
 
 本轮完成dense DP负载闭环修复和一项TP评分归约融合，相关正确性与真实Runtime
@@ -107,5 +133,7 @@ reports保存实验事实与历史负结果，notes保存协议，source-analysi
 本次必要CPU回归28项通过，未执行GPU continuation；先前扩大选择时的上游fixture/
 async插件失败及适用静态检查均在 [closeout-fixes](closeout-fixes.md) 单独记录。
 旧154项、GPU轨迹、microbenchmark和完整profile仍按原报告范围使用，不并入本轮测试数。
+
+</details>
 
 </details>

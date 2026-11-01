@@ -1,5 +1,34 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-NEXT-X0-NAV-BEGIN -->
+
+## 2026-11-01 prompt3实施完成：当前状态
+
+本轮按 [prompt3](../prompts/prompt3.md) 完成必做阶段和条件判断。
+总体证据、提交与限制见 [下一阶段收尾](../reports/engineering-next-closeout.md)。
+
+| 范围 | 当前结果与未决项 |
+| --- | --- |
+| B0、CB0/CB1 | 已实施并验证预算/真实生命周期；CB1 demand Serving 0/24、468次timed抢占，保留实验选项及负结果 |
+| CB2 | STOPPED / NOT_RUN；新demand轨迹无重复“无单候选覆盖D”进入证据 |
+| TP2a / TP2b | 正确性PASS；完整reclaim micro分别相对前增量约8.5–13% / 40–52%缩短；Serving无稳定收益，grouped正反向均17/24 SLO_FAIL |
+| PL0/PL1 / PL2 | 三策略/full逐请求绑定及单engine TP1/TP2安全更新、资源退役已验证；DP更新明确拒绝 |
+| DP3 / DP4 | 工作量控制链与显式known_work路由已实施；6次有限A/B后Serving PARTIAL、W1 SLO_FAIL，requests仍默认 |
+| X0 | 组合CPU 56 passed / 227 deselected；静态/复算/归档与分阶段本地提交完成，最终HEAD见收尾manifest |
+
+分项见 [Controller](../reports/engineering-next-controller.md)、
+[TP](../reports/engineering-next-tp.md)、[Policy](../reports/engineering-next-policy.md)、
+[DP](../reports/engineering-next-dp.md)。85条质量样本冻结，有损质量未证明；历史
+FAIL/PARTIAL均保留，不将micro当Serving、不将静态registry当安全更新。
+本轮未扩旧矩阵、依赖、模型或未测支持域；用户原有待提交正文保留。
+
+以下为本轮实施前的计划及历史结果，其中“尚未实施/待执行”不覆盖上面的当前状态。
+
+<details>
+<summary>prompt3实施前的计划及历史记录（原文保留）</summary>
+
+<!-- ENGINEERING-NEXT-X0-HISTORY -->
+
 ## 2026-11-01工程深化：当前状态
 
 本轮按[prompt2](../prompts/prompt2.md)和
@@ -75,5 +104,7 @@ feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按compute
 
 R1已封口、必要回归通过，限定功能收尾完成；随后O1诊断也已按范围收尾。
 当前未追加Runtime优化，后续只在明确新目标或新证据下重开。
+
+</details>
 
 </details>

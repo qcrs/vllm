@@ -1,5 +1,8 @@
 # DP2 Gate 协议（运行前固定）
 
+本页前文为历史 DP Gate / D1 协议，不能按旧矩阵重新执行。DP3/DP4 本轮
+有限输入、测量和支持边界见末节及 [本轮报告](../reports/engineering-next-dp.md)。
+
 目标为native internal dense DP2、每replica TP1/一GPU/一个Scheduler与Pool。
 Qwen3-8B BF16、GPU0,1，既有MRV2/FA2/B16、单在途、APC/async/spec/cascade/
 connector/reserve-full-ISL off。先确认实际worker dp_size1、两个独立process/Pool；
@@ -69,3 +72,31 @@ Runtime发布字段或路由。旧计数generation可因计数不变而长期不
 传播延迟；仅首次送达的generation单列传播分布。D2回放使用最后一次可见poststep，
 是即时反事实，不模拟改变route后的服务动态。正式结果与停止判断见
 [工程报告](../reports/engineering-dp-load-chain.md)。
+
+## DP3 / DP4 有限验证协议与指标
+
+DP3已通过新鲜状态/真实排队门槛，DP4实现显式 `dp_load_balancing=known_work`，
+公式仅 `S=max(4W+R,F)+U/batch`。baseline为同源码的 `requests` 模式；默认仍requests。
+状态来源/发布边界见 [调用链](../source-analysis/dp-runtime.md)。MoE不使用新公式，
+单engine的PL2 utility不广播到DP副本。
+
+W1固定 `[8192,512]*4`，W0固定 `[4096]*8`，arrivals均 `[i*.05 for i in range(8)]`，
+每请求128输出。Qwen3-8B BF16、DP2×TP1、GPU0,1、Worker主线程CPU20/21、
+batch512/seqs8、每replica4GiB、SinkRecent/.5/reserve0/fixed、APC/async off、
+FULL_DECODE_ONLY[1,2,4,8]。输入token IDs/hash在run中，禁止临时调参找正结果。
+DP3独立diagnostic为完整warmup+2轮；DP4每模式完整warmup+3轮，正向改善仅补一次
+反向启动。全部GPU串行guard，项目NVML合计44GiB停止/45GiB硬上限。
+
+正式入口复用 `dp_serving.py --scenario w1|w0 --routing requests|known_work
+--work-counters --policy sink_recent --pool-gib 4 --max-num-batched-tokens 512
+--max-num-seqs 8 --worker-cpus 20 21 --repeats 3`，外层run_guard/环境按prompt3。
+不启用trace/load-diagnostic、payload clone、逐步同步或NSYS。两边保留同一ADD
+路由观测和完成时CPU工作计数；实际脚本快照/hash必须相同。
+
+warmup独立；timed报告每轮及聚合TTFT/TPOT/ITL分位与max、output tok/s、
+TTFT≤2s且TPOT≤80ms的成功数/goodput、每replica实际prefill/重算与Prom抢占。
+每请求记录C/U、source sequence、生成/接收/使用时间、选择及route CPU成本；
+观测wrapper含写文件成本另列。回收/首次retry若无正式采集则为UNKNOWN，不借用
+diagnostic计数。使用 [analyze_dp_work.py](../scripts/analyze_dp_work.py) `--formal`
+仅复算明确传入的run，核对route公式/tie、输入、三轮、工作恒等式和两边hash。
+token相同不证明质量保持，85条质量样本继续冻结。

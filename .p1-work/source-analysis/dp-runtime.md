@@ -1,5 +1,39 @@
 # DP2 dense 源码与局部 ownership
 
+## 2026-11-01 DP3 / DP4 当前增量
+
+下文 D1 和旧局部压力轨迹保留历史语义。本轮实现、进入证据及有限 W1/W0
+正式对照见 [下一阶段DP报告](../reports/engineering-next-dp.md)；不重跑旧矩阵。
+
+`Scheduler.get_dp_load_snapshot` 从 canonical `requests.values()` 计算
+`U=sum(max(0,num_tokens-(num_computed_tokens-num_in_flight_tokens)))`；同一请求
+移入 waiting 不增加第二份记录。在途 forward 不提前扣减，未知未来输出不计入。
+`DPLoadSnapshot` 是 CPU 控制消息：U、usage、sequence、`current_step`、生成及
+Coordinator 接收 monotonic ns；没有 GPU score、Block ownership 或容量承诺。
+usage 的 owner 仍是本 replica 的 KVCacheManager/BlockPool。
+
+EngineCore 持有 last counts、上次采样时间/状态和 source sequence。counts 改变或
+最终归零立即发布；其余变化按100ms采样，U/usage 不变也更新时间，避免逐 token
+扫描。Scheduler 只生成当前快照，不持有另一份 frontend 生命周期。普通 output
+queue 的 client=-1 编码后发到 Coordinator；dense 继续按每 rank latest 汇总，
+在现有节奏发布 `(counts,wave,running,loads,published_ns)`。Frontend 的
+`DPAsyncMPClient._apply_load_stats` 解码、切 managed slice，并记录接收时间。
+同机 monotonic 可关联首达延迟；状态年龄还含合并等待/idle，不等于网络延迟。
+
+`DPLBAsyncMPClient` 的持久 `known_work_batch_size` 由 additional_config 的
+`dp_load_balancing` 选择：默认 `requests` 继续 `C=max(4W+R,F)`；显式
+`known_work` 仅 dense 使用 `S=C+U/max_num_batched_tokens`。缺快照的 U 为0，
+不新增过期预测或usage惩罚。只有新 ADD 选择engine；显式rank、sticky、轮转tie、
+本地F下界、optimistic waiting、abort/finished affinity仍由原client拥有。
+DP4 是可选实验模式，未将其设为全局默认；MoE保留原step/wave，拒绝此模式。
+两种路由均不跨Pool free/reclaim，不迁移活跃请求。
+
+CPU控制链、真实DP2诊断及正式A/B分别验证消息/路由、实际工作与用户时延。
+`P1DPWorkScheduler` 仅实验脚本统计scheduled/prefill/重算，每请求完成写一次；
+不进入生产Scheduler的ownership状态，不把诊断频数复制到正式结果。
+
+## 既有 D1 与局部 ownership 记录
+
 真实双Engine/GPU局部压力、释放/重写与abort轨迹已PASS，详见`../reports/dp.md`。
 Serving性能独立报告，不以源码推导或诊断同步hook代替性能实测。
 

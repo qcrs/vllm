@@ -64,3 +64,14 @@ A/B。完整证据、逐rankmemory、markers和复算结果见
 
 PL0/PL1/PL2均IMPLEMENTED/CORRECTNESS_PASS。没有新增Serving收益或质量保证；
 切默认full仅影响新请求，不恢复旧请求已删除KV。85条质量样本继续冻结。
+
+## 独立顺序复算
+
+[analyze_policy_updates.py](../scripts/analyze_policy_updates.py) 从上述两个run的
+原始evidence与逐rank marker检查：所有prepare-end≤published，旧intent绑定
+0/1/2，最终仅版本3，local-done≤canonical ACK<retire；两rank keep/row/E一致、
+继续生成/释放页rewrite及Tri资源释放通过。结果为验证目录的
+`retirement-recomputed.json`，X0另存复算argv、exit与hash，不重启GPU。
+
+原helper字段`early_free_observed=true`表示observer执行了“延迟期间未free”检查，
+不是发现提前free；以实际markers、ownership检查和canonical ACK顺序为准。

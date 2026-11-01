@@ -22,7 +22,7 @@ JSON、不增加设备同步。离线 `analyze_tp_ttft.py --candidate-output` �
 CPU 受影响回归为 25 passed / 200 deselected，日志在 B0 `cb0-cpu.log`。
 旧 C0 的 29/24/5、时间 PARTIAL 与旧 Serving FAIL 均保持原义。
 
-CB1 和条件 CB2 的实现、正式对照及结论在后续增量追加。
+CB1 和条件 CB2 的实现、正式对照及结论见下文。
 
 ## CB1：最大合法保留预算
 
