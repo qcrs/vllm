@@ -1,5 +1,28 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-REFINEMENT-NAV-BEGIN -->
+
+## 2026-11-01 重试预算与状态覆盖修正：当前状态
+
+本轮三项修正、有限验证及停止决定已完成，见
+[本轮总报告](../reports/engineering-refinement-closeout.md)。
+
+| 方向 | 当前结果与保留边界 |
+| --- | --- |
+| CB1 retry / retry_pass | 尾槽与真实调度顺序预算、Pool/TP2生命周期通过；正式仍0/24、60次timed抢占，fixed默认；停止扩前瞻/调参 |
+| CB2 | 新轨迹4/148次确有触发；基于收益优先级和有限投入STOPPED / NOT_RUN，未证明gate收益 |
+| DP4 pending ADD | Engine确认水位精确撤销补计；固定W1正反向各24/24，吞吐相对requests约+20.7%/+33.9%；有限SERVING_BENEFIT，requests仍默认 |
+| TP动态E | 消除无必要对齐特化；21项GPU reference和真实TP2通过；正式18/24→16/24、吞吐-0.740%，SLO_FAIL，停止继续优化 |
+| 原策略与micro | PL0/PL1/PL2已验证能力保留；历史micro不改写为Serving收益，有损质量仍未证明 |
+| 本轮收尾 | CPU72 passed、pre-commit/manual mypy-3.12通过；19次GPU guard PASS；用户原有patch保留，本地分阶段提交，未push |
+
+分项见 [Controller](../reports/engineering-refinement-controller.md)、
+[DP](../reports/engineering-refinement-dp.md)、[TP](../reports/engineering-refinement-tp.md)。
+下方prompt3区块中的“当前”属于前轮交付；原FAIL/PARTIAL和用户正文保留，
+不覆盖本轮新结论。85条质量样本继续冻结。
+
+<!-- ENGINEERING-REFINEMENT-NAV-END -->
+
 <!-- ENGINEERING-NEXT-X0-NAV-BEGIN -->
 
 ## 2026-11-01 prompt3实施完成：当前状态

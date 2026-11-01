@@ -1,5 +1,25 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-REFINEMENT-NAV-BEGIN -->
+
+## 2026-11-01 本轮修正交付
+
+当前交付见 [重试预算、状态覆盖与TP冷路径收尾](engineering-refinement-closeout.md)。
+已实现CB有界重试预算、DP4未确认ADD补计/确认水位，以及TP动态长度特化修正。
+CPU72项、GPU reference21项、真实8B TP2与19次资源guard验证通过，阶段提交已落地。
+
+Serving单独判定：固定W1的DP新方案正反向各24/24，相对requests吞吐约+20.7%/
++33.9%，仅本机固定负载的有限证据；W0名义约3%落在波动内。CB仍明显负收益，
+TP正式无收益且16/24 SLO_FAIL，已合理停止继续调优；fixed预算与requests路由仍默认。
+分项：[Controller](engineering-refinement-controller.md)、[DP](engineering-refinement-dp.md)、
+[TP](engineering-refinement-tp.md)。PL2等既有能力保留，85条质量样本不扩，历史FAIL/
+PARTIAL不改写。用户原有未提交正文保留，未push或创建上游PR。
+
+下方prompt3的“当前交付”为前轮历史，旧DP4 PARTIAL与CB2判断按当时轨迹理解；
+本轮新结果及停止理由以本轮总报告为准。
+
+<!-- ENGINEERING-REFINEMENT-NAV-END -->
+
 <!-- ENGINEERING-NEXT-X0-NAV-BEGIN -->
 
 ## 2026-11-01 prompt3实施完成：当前交付
