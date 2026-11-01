@@ -1,5 +1,30 @@
 # DP2 dense 源码与局部 ownership
 
+## Refinement：快照覆盖与 ADD 确认
+
+`DPLBAsyncMPClient` 仅在 `known_work` 下维护短暂 pending：每个 replica 的
+`request_id -> (dp_add_sequence, prompt_tokens)`。原 `reqs_in_flight` 仍拥有
+sticky/abort/finished affinity，pending 不复制完整生命周期。路由使用
+`max(4W+R,F)+(snapshot.U+pending_prompt_tokens)/batch`；requests 默认不登记补计。
+
+序号是 frontend/replica-local，通过 `EngineCoreRequest` 编码及 `Request` 预处理
+传递。现有同源 ZMQ 输入、预处理队列和主线程按顺序消费 ADD；可靠主线程
+`EngineCoreProc._handle_client_request` 在 `add_request` 返回后才推进对应
+client 水位。`_maybe_publish_request_counts` 将水位 copy 与同次 U 打包，水位变化
+也参与状态去重，沿原100ms合并与队列转换立即发布。preprocessing 线程不读取
+全局确认状态；尚未 admission 的 ADD 不能被提前确认。
+
+Coordinator 继续透传每 replica latest。Frontend `_apply_load_stats` 在应用快照后
+删除本 client `seq <= watermark` 的 pending；其余 client 的 ACK 不删除本地记录，
+旧/重复/部分 ACK 不抹掉后续 ADD。finished/error 可先于快照删除其 pending；
+abort 发出不等于 Engine 已停止工作，因此不提前删除。新鲜时间戳只说明快照年龄，
+watermark 才界定它覆盖哪些已派发 ADD。多 frontend 只能补计各自尚未确认的工作，
+不声称掌握其他 frontend 的全部新工作。
+
+CPU 编码/主线程/ZMQ 与真实 DP2 HTTP 的证据见
+[修正报告](../reports/engineering-refinement-dp.md)；不改 MoE step/wave、Pool
+ownership 或 PL2 支持域，不将异步快照视为 admission 容量保证。
+
 ## 2026-11-01 DP3 / DP4 当前增量
 
 下文 D1 和旧局部压力轨迹保留历史语义。本轮实现、进入证据及有限 W1/W0

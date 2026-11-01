@@ -199,6 +199,8 @@ def main():
         "vllm/v1/engine/core.py",
         "vllm/v1/engine/coordinator.py",
         "vllm/v1/engine/core_client.py",
+        "vllm/v1/engine/__init__.py",
+        "vllm/v1/request.py",
         "vllm/v1/core/sched/scheduler.py",
         "vllm/v1/core/sched/interface.py",
         "vllm/v1/metrics/stats.py",

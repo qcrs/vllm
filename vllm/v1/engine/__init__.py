@@ -135,6 +135,8 @@ class EngineCoreRequest(
     # request_finished hook. Used to free P-side prefill blocks when a
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
+    # Per-frontend, per-engine ADD sequence for known-work routing.
+    dp_add_sequence: int = 0
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

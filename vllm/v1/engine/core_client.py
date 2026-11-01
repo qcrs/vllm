@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.async_utils import in_loop
 from vllm.utils.network_utils import (
     close_sockets,
@@ -1421,6 +1422,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
+        self.dp_add_sequences: dict[EngineIdentity, int] = defaultdict(int)
+        self.pending_adds: dict[EngineIdentity, dict[str, tuple[int, int]]] = (
+            defaultdict(dict)
+        )
 
         super().__init__(
             vllm_config,
@@ -1436,6 +1441,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+
+    def _apply_load_stats(self, buf: bytes) -> None:
+        super()._apply_load_stats(buf)
+        if self.known_work_batch_size is None:
+            return
+        for engine, load in zip(self.core_engines, self.lb_loads):
+            if load is None:
+                continue
+            watermark = load.add_watermarks.get(self.client_index, 0)
+            pending = self.pending_adds[engine]
+            for rid in [rid for rid, (seq, _) in pending.items() if seq <= watermark]:
+                del pending[rid]
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1460,11 +1477,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 )
                 if self.known_work_batch_size is not None:
                     load = self.lb_loads[idx]
-                    score += (
-                        load.unfinished_tokens / self.known_work_batch_size
-                        if load is not None
-                        else 0.0
+                    pending = self.pending_adds[self.core_engines[idx]]
+                    work = (load.unfinished_tokens if load is not None else 0) + sum(
+                        tokens for _, tokens in pending.values()
                     )
+                    score += work / self.known_work_batch_size
                 if score < min_score:
                     min_score = score
                     eng_index = idx
@@ -1481,6 +1498,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
+        if self.known_work_batch_size is not None:
+            self.dp_add_sequences[chosen_engine] += 1
+            request.dp_add_sequence = self.dp_add_sequences[chosen_engine]
+            self.pending_adds[chosen_engine][request.request_id] = (
+                request.dp_add_sequence,
+                length_from_prompt_token_ids_or_embeds(
+                    request.prompt_token_ids, request.prompt_embeds
+                ),
+            )
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
@@ -1502,7 +1528,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     ):
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
-                self.reqs_in_flight.pop(req_id, None)
+                engine = self.reqs_in_flight.pop(req_id, None)
+                if engine is not None and self.known_work_batch_size is not None:
+                    self.pending_adds[engine].pop(req_id, None)
 
     @staticmethod
     async def eep_process_engine_core_notification(

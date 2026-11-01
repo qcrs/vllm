@@ -31,6 +31,7 @@ def main():
         local = Counter(self.reqs_in_flight.values())
         inflight = [local[e] for e in self.core_engines]
         snapshots = [asdict(s) if s else None for s in self.lb_loads]
+        pending = [dict(self.pending_adds[e]) for e in self.core_engines]
         scan_start = self.eng_start_index
         used_ns = time.monotonic_ns()
         before = time.perf_counter_ns()
@@ -45,6 +46,10 @@ def main():
                     "explicit": request.data_parallel_rank,
                     "counts": counts,
                     "F": inflight,
+                    "pending_adds": pending,
+                    "pending_tokens": [sum(n for _, n in p.values()) for p in pending],
+                    "client_index": self.client_index,
+                    "add_sequence": request.dp_add_sequence,
                     "snapshots": snapshots,
                     "scan_start": scan_start,
                     "batch": self.known_work_batch_size,

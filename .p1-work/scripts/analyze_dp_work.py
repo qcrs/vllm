@@ -223,10 +223,24 @@ def analyze_formal(run):
         scores = [max(4 * w + r, f) for (w, r), f in zip(route["counts"], route["F"])]
         if args["routing"] == "known_work":
             assert route["batch"] == 512
+            pending = route.get("pending_tokens", [0, 0])
             scores = [
-                c + (s["unfinished_tokens"] / 512 if s else 0)
-                for c, s in zip(scores, route["snapshots"])
+                c + ((s["unfinished_tokens"] if s else 0) + p) / 512
+                for c, s, p in zip(scores, route["snapshots"], pending)
             ]
+            if "pending_adds" in route:
+                for snapshot, adds, tokens in zip(
+                    route["snapshots"], route["pending_adds"], pending
+                ):
+                    watermark = (
+                        snapshot.get("add_watermarks", {}).get(
+                            str(route["client_index"]), 0
+                        )
+                        if snapshot
+                        else 0
+                    )
+                    assert tokens == sum(n for _, n in adds.values())
+                    assert all(seq > watermark for seq, _ in adds.values())
         else:
             assert route["batch"] is None
         order = [(route["scan_start"] + i) % 2 for i in range(2)]
@@ -236,6 +250,37 @@ def analyze_formal(run):
         items = read(run / f"requests-{row['repeat']}.json")
         assert [r["prompt_tokens"] for r in items] == lengths
         assert row["aggregate"] == aggregate(items, row["elapsed_s"])
+        round_routes = [
+            next(r for r in routes if r["external"] == f"cmpl-{item['request']}-0")
+            for item in items
+        ]
+        if args["routing"] == "known_work" and "pending_adds" in round_routes[0]:
+            sent = [{}, {}]
+            prompt_lengths = {
+                route["request"]: item["prompt_tokens"]
+                for route, item in zip(round_routes, items)
+            }
+            for index, route in enumerate(
+                sorted(round_routes, key=lambda r: r["used_ns"])
+            ):
+                # These arrivals all precede completion, as verified by F.
+                assert sum(route["F"]) == index
+                for rank, snapshot in enumerate(route["snapshots"]):
+                    watermark = (
+                        snapshot["add_watermarks"].get(str(route["client_index"]), 0)
+                        if snapshot
+                        else 0
+                    )
+                    expected = {
+                        rid: value
+                        for rid, value in sent[rank].items()
+                        if value[0] > watermark
+                    }
+                    assert route["pending_adds"][rank] == expected
+                sent[route["replica"]][route["request"]] = [
+                    route["add_sequence"],
+                    prompt_lengths[route["request"]],
+                ]
         actual = [Counter(), Counter()]
         observations = []
         for item in items:
@@ -270,6 +315,7 @@ def analyze_formal(run):
                         s["unfinished_tokens"] if s else None
                         for s in route["snapshots"]
                     ],
+                    pending_U=route.get("pending_tokens", [0, 0]),
                     age_ms=[
                         (route["used_ns"] - s["generated_ns"]) / 1e6 if s else None
                         for s in route["snapshots"]
@@ -332,6 +378,10 @@ def analyze_formal(run):
         max_tpot_s=max(r["tpot_s"] for r in pooled),
         routing_cpu_us=distribution([r["route_cpu_ns"] / 1e3 for r in routes]),
         observation_cpu_us=distribution([c / 1e3 for c in costs]),
+        pending_route_calls=sum(any(r.get("pending_tokens", [])) for r in routes),
+        max_pending_tokens=max(
+            (n for r in routes for n in r.get("pending_tokens", [])), default=0
+        ),
         outputs=outputs,
         source_hashes=read(run / "dp-source-hashes.json"),
         artifact_sha256={

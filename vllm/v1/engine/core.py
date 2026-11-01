@@ -1152,7 +1152,8 @@ class EngineCoreProc(EngineCore):
             # and "hybrid" LB modes.
             self.publish_dp_lb_stats = internal_dp_balancing
             self.last_counts = (0, 0)
-            self.last_dp_load = (0, 0.0)
+            self.last_dp_load: tuple[int, float, dict[int, int]] = (0, 0.0, {})
+            self.dp_add_watermarks: dict[int, int] = {}
             self.dp_load_sequence = 0
             self.dp_load_sampled_ns = 0
 
@@ -1488,7 +1489,12 @@ class EngineCoreProc(EngineCore):
             return
         self.dp_load_sampled_ns = now
         snapshot = self.scheduler.get_dp_load_snapshot(self.dp_load_sequence + 1, now)
-        load = (snapshot.unfinished_tokens, snapshot.kv_cache_usage)
+        snapshot.add_watermarks = self.dp_add_watermarks.copy()
+        load = (
+            snapshot.unfinished_tokens,
+            snapshot.kv_cache_usage,
+            snapshot.add_watermarks,
+        )
         if counts == self.last_counts and load == self.last_dp_load:
             return
         self.last_counts, self.last_dp_load = counts, load
@@ -1613,6 +1619,8 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+            if req.dp_add_sequence:
+                self.dp_add_watermarks[req.client_index] = req.dp_add_sequence
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:

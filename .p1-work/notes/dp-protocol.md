@@ -1,5 +1,18 @@
 # DP2 Gate 协议（运行前固定）
 
+## Refinement：待确认 ADD 工作量
+
+本轮只修正 `known_work` 的状态覆盖缺口，输入与有限 A/B 协议沿用下文 W1/W0。
+有效 U 为 Engine 快照 U 加上本 frontend 已派发、尚未被该快照确认的 prompt
+tokens；不预测输出，不乘 client_count，不额外扫权重或缩短发布周期。
+
+每 frontend/replica 单调 ADD sequence 经原请求消息进入 Engine。主线程 admission
+处理后推进本 client watermark，与同次 U 一起发布；前端只撤销 sequence 不大于
+本 client watermark 的补计。abort 发出时仍保留，finished/error 按原 affinity 清理。
+显式 rank/sticky 和 requests 默认行为保持。CPU 验证部分/重复/其他 client ACK、
+真实编码与 Coordinator/ZMQ 链；正式分析逐次重建 pending 集合并核对评分。
+具体实现与本次有限结果见 [修正报告](../reports/engineering-refinement-dp.md)。
+
 本页前文为历史 DP Gate / D1 协议，不能按旧矩阵重新执行。DP3/DP4 本轮
 有限输入、测量和支持边界见末节及 [本轮报告](../reports/engineering-next-dp.md)。
 

@@ -192,6 +192,7 @@ class DPLoadSnapshot:
     step: int = 0
     generated_ns: int = 0
     coordinator_received_ns: int = 0
+    add_watermarks: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass

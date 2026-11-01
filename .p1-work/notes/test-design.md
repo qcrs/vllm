@@ -1,5 +1,12 @@
 # P1 v8 测试设计
 
+## Refinement：DP4 未确认 ADD 工作量
+
+- 用途：仅补计已派发但未被 Engine 快照覆盖的 prompt，维持原 C+U/batch。
+- I/O：每 frontend/replica ADD 序号经真实序列化进入主线程；快照携带处理水位，前端按本 client 水位撤销临时补计。
+- 风险：旧快照抹掉刚派发的长请求、部分/重复/其他 client ACK 错删、完成先于 ACK、abort 提前删除、counts/U 不变漏发布，以及显式 rank/sticky 改变。
+- 最低有效验证：现有 engine/client suite 验证序列化与主线程确认、真实 Coordinator/ZMQ 传播、路由和生命周期；再用固定 W1/W0 的真实 DP2 HTTP 有限 A/B 验证指标。沿原 100ms 合并，不新增逐 token 同步。
+
 ## Refinement：首次 retry 容量预算
 
 - 用途：将回收后下一次同步调度中、截至 requester 的分配纳入最大合法 K。

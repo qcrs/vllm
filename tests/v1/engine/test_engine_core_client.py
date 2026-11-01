@@ -8,6 +8,7 @@ import os
 import signal
 import time
 import uuid
+from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Thread
@@ -205,7 +206,10 @@ def _make_pooling_request(
 def _make_dplb_client(known_work=False):
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = 1
+    client.client_index = 0
     client.reqs_in_flight = {}
+    client.dp_add_sequences = defaultdict(int)
+    client.pending_adds = defaultdict(dict)
     client.core_engines = [b"\x00\x00", b"\x01\x00", b"\x02\x00"]
     client.lb_engines = [[0, 0], [0, 0], [0, 0]]
     client.lb_loads = [None, None, None]
@@ -280,6 +284,8 @@ def test_dplb_explicit_rank_and_abort_keep_affinity(known_work):
     client._abort_requests.assert_awaited_once_with(
         [request.request_id], client.core_engines[1]
     )
+    if known_work:
+        assert request.request_id in client.pending_adds[client.core_engines[1]]
 
 
 @pytest.mark.parametrize("known_work, expected", [(False, 0), (True, 1)])
@@ -308,6 +314,47 @@ def test_dplb_known_work_ties_still_rotate():
             )
         )
     assert chosen == client.core_engines
+
+
+def test_dplb_pending_add_work_survives_old_snapshot_and_partial_ack():
+    """Only this frontend's covered ADDs stop supplementing snapshot U."""
+    import msgspec
+
+    from vllm.v1.metrics.stats import DPLoadSnapshot
+
+    client = _make_dplb_client(known_work=True)
+    client.engine_ranks_managed = [0, 1, 2]
+    requests = [make_request(SamplingParams(max_tokens=1)) for _ in range(2)]
+    for request in requests:
+        request.prompt_token_ids = [1] * 8192
+        request.data_parallel_rank = 0
+        client.get_core_engine_for_request(request)
+    assert [r.dp_add_sequence for r in requests] == [1, 2]
+
+    def snapshot(ack, work):
+        loads = [DPLoadSnapshot(work, add_watermarks=ack), None, None]
+        client._apply_load_stats(
+            msgspec.msgpack.encode(([[0, 2], [0, 2], [1, 0]], 0, False, loads, 0))
+        )
+
+    snapshot({1: 100}, 0)
+    assert (
+        sum(n for _, n in client.pending_adds[client.core_engines[0]].values()) == 16384
+    )
+    next_request = make_request(SamplingParams(max_tokens=1))
+    assert client.get_core_engine_for_request(next_request) == client.core_engines[1]
+    snapshot({0: 1}, 4096)
+    assert list(client.pending_adds[client.core_engines[0]]) == [requests[1].request_id]
+    snapshot({0: 1}, 4096)  # Duplicate ACK cannot remove the later ADD.
+    assert len(client.pending_adds[client.core_engines[0]]) == 1
+    asyncio.run(
+        client.process_engine_outputs(
+            client, EngineCoreOutputs(finished_requests={requests[1].request_id})
+        )
+    )
+    assert not client.pending_adds[client.core_engines[0]]
+    snapshot({0: 2}, 0)  # A finished/error output may precede its ACK.
+    assert not client.pending_adds[client.core_engines[0]]
 
 
 def test_dplb_reclamation_updates_are_rejected_before_broadcast():
@@ -350,7 +397,7 @@ def test_dplb_dense_coordinator_publishes_independent_latest_counts():
         output.connect(back_out)
         encoder = MsgpackEncoder()
 
-        def publish(rank, running, waiting, step, work=0, usage=0.0):
+        def publish(rank, running, waiting, step, work=0, usage=0.0, ack=None):
             from vllm.v1.metrics.stats import DPLoadSnapshot
 
             output.send_multipart(
@@ -362,15 +409,23 @@ def test_dplb_dense_coordinator_publishes_independent_latest_counts():
                             num_waiting_reqs=waiting,
                             step_counter=step,
                             dp_load=DPLoadSnapshot(
-                                work, usage, step, step, time.monotonic_ns()
+                                work,
+                                usage,
+                                step,
+                                step,
+                                time.monotonic_ns(),
+                                add_watermarks=ack or {},
                             ),
                         ),
                     )
                 )
             )
 
-        client = _make_dplb_client()
+        client = _make_dplb_client(known_work=True)
         client.engine_ranks_managed = [0, 1]
+        request = make_request(SamplingParams(max_tokens=1))
+        request.data_parallel_rank = 0
+        client.get_core_engine_for_request(request)
 
         def receive(expected, work):
             deadline = time.monotonic() + 5
@@ -394,8 +449,9 @@ def test_dplb_dense_coordinator_publishes_independent_latest_counts():
 
         publish(0, 2, 1, 7, 8192, 0.5)
         publish(1, 1, 0, 3, 512, 0.2)
-        publish(0, 3, 0, 8, 4096, 0.4)
+        publish(0, 3, 0, 8, 4096, 0.4, {0: request.dp_add_sequence})
         receive([[0, 3], [0, 1]], [4096, 512])
+        assert not client.pending_adds[client.core_engines[0]]
         publish(1, 1, 0, 4, 128, 0.1)
         receive([[0, 3], [0, 1]], [4096, 128])
         publish(0, 0, 0, 9)

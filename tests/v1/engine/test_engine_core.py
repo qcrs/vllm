@@ -168,7 +168,8 @@ def test_dense_dp_busy_loop_publishes_queue_transitions_and_idle_zero():
     core = object.__new__(EngineCoreProc)
     core.publish_dp_lb_stats = True
     core.last_counts = (0, 0)
-    core.last_dp_load = (0, 0.0)
+    core.last_dp_load = (0, 0.0, {})
+    core.dp_add_watermarks = {}
     core.dp_load_sequence = core.dp_load_sampled_ns = 0
     core.output_queue = queue.Queue()
     state = SimpleNamespace(counts=(0, 0))
@@ -229,7 +230,8 @@ def test_dense_dp_known_work_keeps_inflight_and_preempted_history():
 def test_dense_dp_load_only_changes_coalesce_but_idle_zero_is_immediate():
     core = object.__new__(EngineCoreProc)
     core.publish_dp_lb_stats = True
-    core.last_counts, core.last_dp_load = (0, 0), (0, 0.0)
+    core.last_counts, core.last_dp_load = (0, 0), (0, 0.0, {})
+    core.dp_add_watermarks = {}
     core.dp_load_sequence = core.dp_load_sampled_ns = 0
     core.output_queue = queue.Queue()
     state = SimpleNamespace(counts=(1, 0), work=8192, usage=0.5)
@@ -283,6 +285,44 @@ def test_moe_dp_request_counts_keep_step_and_wave():
     stats = output.scheduler_stats
     assert (stats.num_running_reqs, stats.num_waiting_reqs) == (2, 3)
     assert (stats.step_counter, stats.current_wave) == (7, 4)
+
+
+def test_dense_dp_add_ack_follows_main_thread_admission_and_is_published():
+    """Same-count snapshots must still acknowledge processed ADDs."""
+    core = object.__new__(EngineCoreProc)
+    core.publish_dp_lb_stats = True
+    core.shutdown_state = EngineShutdownState.RUNNING
+    core.last_counts, core.last_dp_load = (0, 0), (0, 0.0, {})
+    core.dp_add_watermarks = {}
+    core.dp_load_sequence = core.dp_load_sampled_ns = 0
+    core.output_queue = queue.Queue()
+    core.scheduler = SimpleNamespace(
+        get_request_counts=lambda: (0, 0),
+        get_dp_load_snapshot=lambda seq, now: DPLoadSnapshot(sequence=seq),
+    )
+    wire = make_request()
+    wire.client_index, wire.dp_add_sequence = 1, 7
+    decoded = MsgpackDecoder(EngineCoreRequest).decode(MsgpackEncoder().encode(wire))
+    request = Request.from_engine_core_request(decoded, None)
+    assert request.dp_add_sequence == 7
+
+    def admit(req, wave):
+        assert req is request and wave == 0
+        assert core.dp_add_watermarks == {}
+
+    core.add_request = admit
+    core._handle_client_request(EngineCoreRequestType.ADD, (request, 0))
+    core._maybe_publish_request_counts()
+    _, output = core.output_queue.get_nowait()
+    snapshot = (
+        MsgpackDecoder(EngineCoreOutputs)
+        .decode(MsgpackEncoder().encode(output))
+        .scheduler_stats.dp_load
+    )
+    assert snapshot.add_watermarks == {1: 7}
+    core.dp_add_watermarks[1] = 8
+    assert output.scheduler_stats.dp_load.add_watermarks == {1: 7}
+    assert core.last_dp_load == (0, 0.0, {1: 7})
 
 
 def make_request() -> EngineCoreRequest:

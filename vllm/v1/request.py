@@ -78,9 +78,11 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        dp_add_sequence: int = 0,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
+        self.dp_add_sequence = dp_add_sequence
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
@@ -243,6 +245,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            dp_add_sequence=request.dp_add_sequence,
         )
 
     def append_output_token_ids(
