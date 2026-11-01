@@ -17,7 +17,9 @@ SinkRecent 保留原整页可表示快路径；评分计划不 D2H 探测 zero-c
 `TriAttentionScorer.from_file` 在初始化核对模型 config SHA、层数、所有 Q/KV heads、
 head_dim、RoPE配置/half style、Q归一化来源和finite stats；不匹配直接报错。
 非标准/scaled RoPE没有适配，不以字段缺省或Layer取模恢复。stats在GPU常驻，
-逐层复用 `[Hq,max_len]` FP32 score buffer与长度E的累积向量。
+逐层复用 `[Hq,max_len]` FP32 score buffer、长度max_len的`total`与`layer_total`。
+TP按完整GQA group分配distinct KV-head owner，本地贡献按全局head/layer数归一；
+非owner返回零贡献，也参与同一次score SUM。
 
 ## 校准与独立验证
 
@@ -41,7 +43,19 @@ host `.item()`、第二种scoring backend或新的KV payload scratch。
 
 同形状NCU降到72 registers/thread、41.57% occupancy、202.66us，memory throughput
 355.62GB/s。profile锁频/replay结果仅比较profile资源，不代替非profile CUDA events。
-归一化与selection仍用Torch；初始实测selection约0.23ms，无依据重写top-k。
+这项phase优化是既有M2结果，不计为本轮T1收益。
+
+2026-11-01的T1保留eligible域的Torch `var_mean(correction=0)`，新增
+`_normalize_reduce_scores`融合sqrt/零方差分母、FP32 z-score、GQA MAX和本地
+distinct-head mean；每层写入`layer_total`后，仍按原顺序执行`total.add_(alpha=...)`。
+kernel掩码覆盖非2幂head/group及partial tile，使用`tl.div_rn`且关闭FP fusion。
+新增常驻空间为`4*max_len` bytes；max_len9216时36KiB/rank，没有KV scratch。
+selection仍用Torch stable argsort，Runtime score SUM/plan broadcast/completion未变。
+
+三个真实Runtime shape、真实stride/校准与合成KV的micro完整reclaim缩短约33–38%；
+同配置Serving及反向启动未显示稳定收益。完整测量、独立reference、真实TP2
+continuation/free/reuse与证据限制见 [工程TP报告](../reports/engineering-tp-scoring.md)。
+这是有限形状的数值/plan验证，不保证任意输入逐bit相同或有损质量保持。
 
 ## Completion 与 ownership
 

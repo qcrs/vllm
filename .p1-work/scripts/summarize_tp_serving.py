@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validate the fixed TP2 matrix and keep diagnostic timing separate."""
 
+import argparse
 import hashlib
 import json
 import math
@@ -32,6 +33,125 @@ def preemptions(row):
         for key, value in row["counter_deltas"].items()
         if key.split("{")[0] == "vllm:num_preemptions_total"
     )
+
+
+def engineering_summary(root, baseline_micro, fused_micro, output):
+    runs, tokens = {}, {}
+    for run in sorted(root.iterdir()):
+        protocol = read(run / "protocol.json")
+        rounds = read(run / "serving.json")
+        items = [
+            item
+            for row in rounds
+            for item in read(run / f"requests-{row['repeat']}.json")
+        ]
+        args = protocol["args"]
+        count = 2 if args["workload"] == "short" else 8
+        assert len(rounds) == 3 and len(items) == count * 3
+        assert args["tp"] == 2 and args["policy"] == "triattention"
+        assert args["worker_cpus"] == [20, 21] and args["full_warmup"]
+        assert all(len(i["token_ids"]) == i["output_tokens"] == 128 for i in items)
+        prompts = read(run / "prompts.json")
+        assert protocol["prompt_sha256"] == [
+            hashlib.sha256(json.dumps(p).encode()).hexdigest() for p in prompts
+        ]
+        for row in rounds:
+            requests = read(run / f"requests-{row['repeat']}.json")
+            assert math.isclose(
+                count * 128 / row["elapsed_s"], row["output_tokens_per_s"]
+            )
+            assert row["slo_good_requests"] == sum(
+                i["ttft_s"] <= 2 and i["tpot_s"] <= 0.08 for i in requests
+            )
+            row["preemptions"] = preemptions(row)
+        elapsed = sum(r["elapsed_s"] for r in rounds)
+        key = run.name[16:]
+        tokens[key] = [i["token_ids"] for i in items]
+        guard = read(run / "result.json")
+        assert guard["exit_code"] == 0 and not guard["limit_triggered"]
+        affinity = [read(run / f"worker-affinity-{rank}.json") for rank in (0, 1)]
+        runs[key] = dict(
+            directory=str(run),
+            protocol=protocol,
+            affinity=affinity,
+            guard=guard,
+            rounds=rounds,
+            warmup_preemptions=preemptions(read(run / "warmup-summary.json")),
+            aggregate=dict(
+                output_tokens_per_s=len(items) * 128 / elapsed,
+                request_throughput_per_s=len(items) / elapsed,
+                slo_goodput_requests_per_s=sum(r["slo_good_requests"] for r in rounds)
+                / elapsed,
+                slo_good_requests=sum(r["slo_good_requests"] for r in rounds),
+                preemptions=sum(r["preemptions"] for r in rounds),
+                latencies={
+                    name: quantiles(items, name) for name in ("ttft_s", "tpot_s")
+                },
+                max_ttft_s=max(i["ttft_s"] for i in items),
+                max_tpot_s=max(i["tpot_s"] for i in items),
+                outside_slo=[
+                    i["request"] for i in items if i["ttft_s"] > 2 or i["tpot_s"] > 0.08
+                ],
+            ),
+        )
+    comparisons = []
+    for suffix in ("batch1024", "batch1024-reverse", "short"):
+        stem = "triattention-" + suffix.removesuffix("-reverse")
+        tail = "-reverse" if suffix.endswith("-reverse") else ""
+        left, right = stem + "-baseline" + tail, stem + "-fused" + tail
+        lhs, rhs = runs[left], runs[right]
+        assert lhs["protocol"]["prompt_sha256"] == rhs["protocol"]["prompt_sha256"]
+        comparisons.append(
+            dict(
+                baseline=left,
+                fused=right,
+                throughput_change_percent=100
+                * (
+                    rhs["aggregate"]["output_tokens_per_s"]
+                    / lhs["aggregate"]["output_tokens_per_s"]
+                    - 1
+                ),
+                equal_token_outputs=sum(
+                    a == b for a, b in zip(tokens[left], tokens[right])
+                ),
+                outputs=len(tokens[left]),
+            )
+        )
+
+    micro = {}
+    plans = {}
+    for version, run in (("baseline", baseline_micro), ("fused", fused_micro)):
+        records = [r for f in sorted(run.glob("runtime-rank-*.json")) for r in read(f)]
+        groups = {}
+        for record in records:
+            shape = record["shape"]["E"]
+            if record["part"] == "plan_identity":
+                plans.setdefault(shape, set()).add(record["sha256"])
+            if "median_ms" not in record:
+                continue
+            key = f"{shape}/{record['collective']}/{record['part']}"
+            groups.setdefault(key, []).append(record)
+        micro[version] = dict(
+            directory=str(run),
+            guard=read(run / "result.json"),
+            shapes=read(run / "runtime-shapes.json"),
+            stages={
+                key: dict(
+                    slowest_rank_median_ms=max(r["median_ms"] for r in rows),
+                    per_rank=rows,
+                )
+                for key, rows in groups.items()
+            },
+        )
+    assert all(len(hashes) == 1 for hashes in plans.values()), plans
+    result = dict(
+        runs=runs,
+        comparisons=comparisons,
+        micro=micro,
+        micro_plan_hashes={str(k): next(iter(v)) for k, v in plans.items()},
+    )
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(dict(output=str(output), comparisons=comparisons), indent=2))
 
 
 def main():
@@ -220,4 +340,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--engineering", type=Path)
+    parser.add_argument("--baseline-micro", type=Path)
+    parser.add_argument("--fused-micro", type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    if args.engineering:
+        engineering_summary(
+            args.engineering, args.baseline_micro, args.fused_micro, args.output
+        )
+    else:
+        main()

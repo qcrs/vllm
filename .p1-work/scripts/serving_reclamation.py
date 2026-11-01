@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -215,6 +216,23 @@ def main():
     if args.workload == "short" and args.prefix_caching:
         parser.error("short workload does not define shared prefix identities")
     run = Path(os.environ["P1_RUN_DIR"])
+    source_root = Path(__file__).resolve().parents[2]
+    sources = [
+        "vllm/v1/worker/gpu/kv_scoring.py",
+        "vllm/v1/worker/gpu/kv_reclamation.py",
+        "vllm/v1/worker/gpu/kv_compaction.py",
+        "vllm/v1/core/sched/scheduler.py",
+    ]
+    hashes = {}
+    for name in sources:
+        source = source_root / name
+        target = run / "source" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
+    if args.stats:
+        hashes[args.stats] = hashlib.sha256(Path(args.stats).read_bytes()).hexdigest()
+    (run / "runtime-source-hashes.json").write_text(json.dumps(hashes, indent=2))
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]

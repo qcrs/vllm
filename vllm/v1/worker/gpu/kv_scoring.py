@@ -73,6 +73,38 @@ def _paged_frequency_scores(
         tl.store(scores + query_head * OUTPUT_STRIDE + member, score, member < E)
 
 
+@triton.jit
+def _normalize_reduce_scores(
+    scores,
+    variance,
+    mean,
+    reduced,
+    E,
+    STRIDE: tl.constexpr,
+    HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    member = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    head = tl.arange(0, triton.next_power_of_2(HEADS))
+    query = tl.arange(0, triton.next_power_of_2(GROUP))
+    statistics_head = head[:, None] * GROUP + query[None, :]
+    valid_head = (head[:, None] < HEADS) & (query[None, :] < GROUP)
+    var = tl.load(variance + statistics_head, valid_head, 0)
+    mu = tl.load(mean + statistics_head, valid_head, 0)
+    std = tl.sqrt(var)
+    denominator = tl.where(std > 0, std, 1)
+    value = tl.load(
+        scores + statistics_head[:, :, None] * STRIDE + member[None, None, :],
+        valid_head[:, :, None] & (member[None, None, :] < E),
+        0,
+    )
+    normalized = tl.div_rn(value - mu[:, :, None], denominator[:, :, None])
+    grouped = tl.max(tl.where(valid_head[:, :, None], normalized, -float("inf")), 1)
+    result = tl.sum(tl.where(head[:, None] < HEADS, grouped, 0), 0) / HEADS
+    tl.store(reduced + member, result, member < E)
+
+
 def protected_topk(
     scores: torch.Tensor, keep: int, prefix: int, recent: int
 ) -> torch.Tensor:
@@ -135,6 +167,7 @@ class TriAttentionScorer:
             (stats.shape[1], max_len), dtype=torch.float32, device=stats.device
         )
         self.total = torch.empty(max_len, dtype=torch.float32, device=stats.device)
+        self.layer_total = torch.empty_like(self.total)
 
     @classmethod
     def from_file(cls, path, model_config, max_len, device, tp_size=1, tp_rank=0):
@@ -216,11 +249,20 @@ class TriAttentionScorer:
             variance, mean = torch.var_mean(
                 scores[:, prefix:recent], dim=1, correction=0
             )
-            std = variance.sqrt()
-            scores.sub_(mean[:, None]).div_(torch.where(std > 0, std, 1)[:, None])
-            grouped = scores.view(self.kv_heads, self.group, source_len).amax(dim=1)
+            _normalize_reduce_scores[(triton.cdiv(source_len, 128),)](
+                scores,
+                variance,
+                mean,
+                self.layer_total,
+                source_len,
+                scores.stride(0),
+                self.kv_heads,
+                self.group,
+                128,
+                enable_fp_fusion=False,
+            )
             total.add_(
-                grouped.mean(dim=0),
+                self.layer_total[:source_len],
                 alpha=self.kv_heads / (self.global_kv_heads * len(layers)),
             )
         return total

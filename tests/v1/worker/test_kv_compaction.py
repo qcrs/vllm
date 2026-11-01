@@ -152,7 +152,7 @@ def dense_frequency_reference(kv, stats, logical_next, theta):
     return torch.stack(outputs)
 
 
-@pytest.mark.parametrize("statistics_heads", [2, 8])
+@pytest.mark.parametrize("statistics_heads", [2, 6, 8])
 def test_paged_shared_frequency_scores_use_logical_time_and_gqa(statistics_heads):
     from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
 
@@ -216,6 +216,33 @@ def test_shared_frequency_zero_variance_and_stable_protection():
     )
     assert torch.equal(scores, torch.zeros_like(scores))
     assert protected_topk(scores, 7, 2, 7).tolist() == [0, 1, 2, 3, 7, 8, 9]
+
+
+def test_shared_frequency_reduction_preserves_ties_at_partial_tile_boundary(
+    monkeypatch,
+):
+    """Non-power-of-two head groups retain exact ties and a nearby cutoff."""
+    from vllm.v1.worker.gpu.kv_scoring import TriAttentionScorer, protected_topk
+
+    source, prefix, recent, keep = 131, 3, 128, 68
+    raw = torch.arange(source, dtype=torch.float32).repeat(9, 1)
+    raw[:, 65:68] = 66
+    raw[:, 68] = torch.nextafter(torch.tensor(66.0), torch.tensor(67.0))
+    raw[0].fill_(1)
+    var, mean = torch.var_mean(raw.double()[:, prefix:recent], dim=1, correction=0)
+    std = var.sqrt()
+    normalized = (raw.double() - mean[:, None]) / torch.where(std > 0, std, 1)[:, None]
+    expected = normalized.reshape(3, 3, source).amax(1).mean(0)
+    scorer = TriAttentionScorer(torch.zeros(1, 9, 3, 64, device="cuda"), 3, 1e6, 144)
+    device_raw = raw.cuda()
+    monkeypatch.setattr(scorer, "prepare_phase", lambda _: None)
+    monkeypatch.setattr(scorer, "_score_layer", lambda *args: device_raw)
+    scores = scorer.shared_scores([None], None, None, source, prefix, recent)
+    torch.testing.assert_close(scores.cpu().double(), expected, atol=2e-7, rtol=2e-6)
+    expected_plan = protected_topk(expected, keep, prefix, recent)
+    assert torch.equal(
+        protected_topk(scores, keep, prefix, recent).cpu(), expected_plan
+    )
 
 
 @pytest.mark.parametrize("kv_heads", [1, 4])

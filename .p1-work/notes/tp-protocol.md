@@ -47,3 +47,35 @@ Serving以TP2 native为基线，同Pool/同负载/同预热，报告每轮/聚�
 tokens/s、Goodput、preemptions及两卡NVML合计。使用现有TTFT≤2s、TPOT≤80ms、
 无压力noop开销≤5%预算；有损结果与质量区分。另以NSYS诊断score SUM、plan广播、
 completion三类通信和rank等待，不将profile时间混入正式Serving。
+
+## T0/T1工程深化协议（2026-11-01）
+
+以上是既有TP Gate协议；本轮只验证normalization/GQA/head reduction融合的新增风险，
+没有重复慢rank、故障或Graph组合矩阵。单卡评分reference在物理GPU1，真实TP2
+在GPU0,1；Worker主线程分别CPU20/21。沿用guard串行和项目合计显存限额。
+
+micro复用`benchmark_kv_scoring.py --runtime-shapes`，输入来自旧Tri Runtime
+intent与commit，E/keep/P/recent_start/L分别为2051/1025/16/2035/4100、
+4100/2050/16/4084/4100和8194/4097/16/8178/8194。L必须取本次
+`reclaim_commit.logical_tokens`，不能取上次settled值4099/8193或用E代替。
+36层、每rank4个KV heads/16个statistics heads，BF16 stride
+`[16384,256,1024,1]`；校准真实、KV合成，不称在线真实模型耗时。
+
+每阶段3次预热、10次CUDA Events，按最慢rank中位数解释；restore在计时外。
+独立测phase、raw+phase、normalization/reduction、score collective、stable selection、
+plan broadcast、complete plan/reclaim；独立阶段不能相加。complete reclaim包含
+row/E和completion，不含正常forward、Scheduler commit或allocation retry。
+只在benchmark比较Reduce-to-Root，目标从group映射到global rank；Runtime继续AllReduce。
+
+真实TP2轨迹采用TriAttention、两次回收及继续decode，检查全层retained payload、
+其他请求不变、commit前未free、poison后真实rewrite/reuse与最终free queue。
+脚本字段`early_free_observed=true`表示提前检查已执行且通过，不表示发现early free。
+
+Serving使用固定TriAttention calibration/retention与相同prompt/arrival，pressure
+long/full、batch1024、.75GiB/rank、seqs8、完整负载预热后3轮，正向A/B及一次
+反向B/A全部保留。no-pressure只一组short/eager、8GiB/rank、batch2048对照。
+正式trace off；warmup与timed的preemption分别报告。token一致不替代质量保证。
+
+参数、hash、复算和结果见 [工程TP报告](../reports/engineering-tp-scoring.md)。首组A
+缺dirty scorer即时快照，只能引用事后恢复来源；反向A/B与micro保存实际源码。
+最后benchmark设备API/workspace统计收尾未重跑GPU，实测harness以原归档为准。

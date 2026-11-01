@@ -34,6 +34,7 @@ def main():
         "--lifecycle", choices=["repeat", "q0", "maintenance"], default="repeat"
     )
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--worker-cpus", nargs=2, type=int)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
     hook = Path(__file__).with_name("tp_worker_hooks.py")
@@ -41,6 +42,11 @@ def main():
     if args.profile:
         shutil.copyfile(
             hook.with_name("tp_profile_hooks.py"), run / "tp_profile_hooks.py"
+        )
+    if args.worker_cpus:
+        os.environ["P1_WORKER_CPUS"] = json.dumps(args.worker_cpus)
+        shutil.copyfile(
+            hook.with_name("worker_affinity.py"), run / "worker_affinity.py"
         )
     os.environ["VLLM_KV_TRACE_FILE"] = str(run / "kv-trace.jsonl")
     os.environ["VLLM_KV_TRACE_IDS"] = "1"
@@ -83,6 +89,8 @@ def main():
             }
         },
     )
+    if args.worker_cpus:
+        options.worker_cls = "worker_affinity.AffinityWorker"
     engine = LLMEngine.from_engine_args(options)
     core = engine.engine_core.engine_core
     scheduler, executor = core.scheduler, core.model_executor

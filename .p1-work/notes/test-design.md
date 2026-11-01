@@ -82,3 +82,10 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 - I/O：`(running, waiting)` 经真实 Msgpack 进入 `[waiting, running]`；完成后归零，未变化不重复发布；MoE 保留 step/wave。
 - 防止的失败：dense 不发布、字段颠倒、完成后旧负载残留、把独立 step 当同步边界，以及快照覆盖乐观 waiting 后忽略本地在途请求。
 - 最低成本层级：复用两个 engine suite，CPU 检查 busy loop 发布与序列化、真实 Coordinator ZMQ 的独立更新、路由下界/完成/显式 rank/abort；DP2 HTTP 异构与均匀对照验证真实进程链。既有 suite 顶层 tokenizer 未缓存，选中 CPU 测试用已存在的 Qwen3 tokenizer 替换该无关模型资源，不运行其模型测试，原 collection 失败单独归档。
+
+## T1 normalization / GQA / head reduction融合
+
+- 模块用途：减少逐层评分归一化和归约的发射成本，保持current-member shared score和KeepPlan语义。
+- I/O：FP32 raw scores、eligible域population variance/mean、local distinct-head/GQA映射，输出FP32 layer contribution；沿原顺序和权重累加。
+- 防止的失败：非2幂head/group的padding参与MAX/mean、partial token tile越界、零方差分母变化、同分或相邻cutoff的计划变化，以及TP贡献计权错误。
+- 最低成本层级：扩展现有compaction suite的独立dense复数reference到group=3，再用受控raw scores隔离归约的partial tile/零方差/ties；真实TP2 collective reference检查所有rank计划，一条Qwen3-8B重复回收→continuation→free/rewrite/reuse验证真实路径。未改变completion/Graph协议，不复制旧故障注入矩阵；性能只在独立benchmark/Serving测量。
