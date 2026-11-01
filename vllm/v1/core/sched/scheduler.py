@@ -1406,13 +1406,27 @@ class Scheduler(SchedulerInterface):
         )
         fixed_selected = choose_reclaim_candidate(candidates, goal)
         demand_selected = choose_reclaim_candidate(demand, goal)
+        mode = config.budget_mode
+        if mode == "prefill_fixed":
+            # A one-pass forecast cannot amortize a known multi-step prefill.
+            # Include waiting and recomputed output history, after this forward.
+            pending_prefill = any(
+                not r.is_finished()
+                and r.num_tokens
+                - r.num_computed_tokens
+                - scheduled.get(r.request_id, 0)
+                - (num_new_computed_tokens if r is requester else 0)
+                > 1
+                for r in self.requests.values()
+            )
+            mode = "fixed" if pending_prefill else "retry_pass"
         retry = (
             self._reclaim_retry(
                 scheduled, requester, new_computed_blocks, num_new_computed_tokens
             )
             if requester is not None
             and (
-                config.budget_mode in ("retry", "retry_pass")
+                mode in ("retry", "retry_pass")
                 or self.kv_cache_manager.trace is not None
             )
             else None
@@ -1435,7 +1449,7 @@ class Scheduler(SchedulerInterface):
             "demand": demand_selected,
             "retry": retry_selected,
             "retry_pass": retry_selected,
-        }[config.budget_mode]
+        }[mode]
         if self.kv_cache_manager.trace is not None:
             from dataclasses import asdict
 
@@ -1449,6 +1463,7 @@ class Scheduler(SchedulerInterface):
                 shortfall=self.kv_cache_manager.last_allocation_shortfall,
                 goal_blocks=goal,
                 budget=asdict(config),
+                effective_budget_mode=mode,
                 candidates=[asdict(c) for c in candidates],
                 demand_candidates=[asdict(c) for c in demand],
                 retry_forecast=asdict(retry) if retry is not None else None,

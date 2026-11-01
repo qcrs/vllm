@@ -339,10 +339,11 @@ def test_pressure_retry_requester_can_be_the_victim(pressure_scheduler):
     assert a.num_preemptions == 0
 
 
+@pytest.mark.parametrize("mode", ["retry", "prefill_fixed"])
 def test_pressure_retry_preserves_running_requester_without_preemption(
-    pressure_scheduler,
+    pressure_scheduler, mode
 ):
-    scheduler = pressure_scheduler(7, budget_mode="retry", retention=0.25)
+    scheduler = pressure_scheduler(7, budget_mode=mode, retention=0.25)
     a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
     b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
     for request in (a, b):
@@ -359,7 +360,8 @@ def test_pressure_retry_preserves_running_requester_without_preemption(
 
 
 @pytest.mark.parametrize(
-    "mode,keep,preemptions", [("retry", 48, 1), ("retry_pass", 31, 0)]
+    "mode,keep,preemptions",
+    [("retry", 48, 1), ("retry_pass", 31, 0), ("prefill_fixed", 16, 0)],
 )
 def test_pressure_retry_pass_covers_following_prefill(
     pressure_scheduler, mode, keep, preemptions
@@ -385,6 +387,57 @@ def test_pressure_retry_pass_covers_following_prefill(
     assert retry.num_scheduled_tokens == (
         {"A": 1} if preemptions else {"A": 1, "B": 32}
     )
+
+
+def test_pressure_prefill_fixed_batches_release_for_waiting_prefill(pressure_scheduler):
+    """An unadmitted prompt must not look like decode via is_prefill_chunk."""
+    scheduler = pressure_scheduler(7, budget_mode="prefill_fixed", retention=0.25)
+    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+    scheduler.add_request(b)
+    assert not b.is_prefill_chunk
+    output = scheduler.schedule()
+    assert output.reclaim_request.target_keep_tokens == 16
+    complete_pressure_step(scheduler, output)
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens == {"A": 1, "B": 64}
+    assert a.num_preemptions == b.num_preemptions == 0
+
+
+@pytest.mark.parametrize("state", ["last_chunk", "aborted", "recompute"])
+def test_pressure_prefill_fixed_follows_live_post_forward_work(
+    pressure_scheduler, state
+):
+    """Use live logical work, including output replay, without a phase flag."""
+    scheduler = pressure_scheduler(16, budget_mode="prefill_fixed", retention=0.25)
+    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
+    scheduler.add_request(b)
+    output = scheduler.schedule()
+    if state == "aborted":
+        complete_pressure_step(scheduler, output)
+        scheduler.finish_requests(["B"], RequestStatus.FINISHED_ABORTED)
+        scheduled = {}
+    elif state == "recompute":
+        complete_pressure_step(scheduler, output)
+        b.append_output_token_ids([42] * 32)
+        scheduler.running.remove(b)
+        scheduler._preempt_request(b, 0)
+        scheduler.waiting.prepend_request(b)
+        # Replay has reached the prompt boundary, but known output history remains.
+        scheduled = {"B": b.num_prompt_tokens}
+    else:
+        # Selection occurs before _update_after_schedule advances these tokens.
+        for request in scheduler.running:
+            request.num_computed_tokens -= request.num_in_flight_tokens
+            request.num_in_flight_tokens = 0
+        scheduled = output.num_scheduled_tokens
+    _, candidate = scheduler._select_reclaim_candidate(scheduled, a)
+    assert candidate.keep_tokens == (16 if state == "recompute" else 48)
 
 
 def test_pressure_policy_binding_controls_budget_and_survives_preemption(

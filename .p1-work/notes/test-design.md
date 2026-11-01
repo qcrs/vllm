@@ -153,3 +153,10 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 - 用途与I/O：仅在dense internal DP新ADD上，用已收到的U及固定batch计算`S=C+U/batch`；默认requests保留D1。
 - 风险：U代替F下界、改变sticky/显式rank/abort、相同分数失去轮转、把未知输出当工作量、路由更均匀冒充性能收益。
 - 最低有效验证：在现有client suite扩展两模式行为与tie，复用affinity/F用例；W1/W0各完整预热+3轮A/B，关闭trace/load-diagnostic，仅每完成请求写CPU工作汇总、每ADD写路由快照，正收益再一次反向。
+
+## CB1 prefill 阶段预算修正（2026-11-01）
+
+- 用途：显式 `prefill_fixed` 模式在已知多 token prefill／重算未完成时使用固定比例批量回收；其余状态使用已有尾页感知 `retry_pass`，不继续扩前瞻参数。
+- I/O contract：读取同一 Scheduler post-forward 逻辑进度与已知请求历史；输出合法候选 K，仍受请求 pin 的 retention／保护区／min_keep 约束。fixed 默认及其他实验模式保留。
+- 主要失败：只保当前 requester 却让后方 prefill 进入抢占重算；用初始为 False 的 `is_prefill_chunk` 漏掉 waiting；误把已调度完的 prefill 或已结束请求当作积压；漏掉 output history 的重算。
+- 最低有效验证：扩展现有 Scheduler／真实 Pool 用例，检查 running／waiting prefill、post-forward 完成转 decode、abort 与 preempt 重算；Worker 完成仍用 CPU result，另用一次真实 Qwen3-8B TP2 诊断和有限正式 A/B 验证 Runtime 与用户指标。原 payload／全 rank completion 协议未改，不重跑旧故障矩阵。

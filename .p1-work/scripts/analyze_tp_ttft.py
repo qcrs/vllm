@@ -25,7 +25,9 @@ def candidate_summary(run, output):
     for event in events:
         if event["event"] != "reclaim_candidates":
             continue
-        mode = event["budget"].get("budget_mode", "fixed")
+        mode = event.get(
+            "effective_budget_mode", event["budget"].get("budget_mode", "fixed")
+        )
         active = event[
             {
                 "fixed": "candidates",

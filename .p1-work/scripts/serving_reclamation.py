@@ -227,7 +227,7 @@ def main():
     parser.add_argument("--reserve", type=int, default=0)
     parser.add_argument(
         "--budget-mode",
-        choices=["fixed", "demand", "retry", "retry_pass"],
+        choices=["fixed", "demand", "retry", "retry_pass", "prefill_fixed"],
         default="fixed",
     )
     parser.add_argument("--repeats", type=int, default=3)

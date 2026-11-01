@@ -27,7 +27,13 @@ class ReclamationConfig:
     budget_mode: str = "fixed"
 
     def __post_init__(self) -> None:
-        if self.budget_mode not in ("fixed", "demand", "retry", "retry_pass"):
+        if self.budget_mode not in (
+            "fixed",
+            "demand",
+            "retry",
+            "retry_pass",
+            "prefill_fixed",
+        ):
             raise ValueError("Unknown KV reclamation budget mode")
         if self.policy not in ("full", "sink_recent", "random", "triattention"):
             raise ValueError("Unknown KV reclamation policy")
@@ -184,7 +190,10 @@ def retry_reclaim_candidates(
     includes tail slack without reserving an unconditional extra page.
     """
     targets = [retry.allocations]
-    if config.budget_mode == "retry_pass" and retry.following_allocations:
+    if (
+        config.budget_mode in ("retry_pass", "prefill_fixed")
+        and retry.following_allocations
+    ):
         targets.insert(0, retry.allocations + retry.following_allocations)
     for allocations in targets:
         total = sum(a.required_blocks for a in allocations)
