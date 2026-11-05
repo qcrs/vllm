@@ -68,6 +68,13 @@ FAIL/PARTIAL均保留，不将micro当Serving、不将静态registry当安全更
 
 <!-- ENGINEERING-NEXT-X0-HISTORY -->
 
+## 2026-11-01下一阶段：详细计划已形成，尚未实施
+
+后续执行入口为[下一阶段详细计划](engineering-next-stage-plan.md)：
+B0 → CB0/CB1缺口预算 → TP2a及条件TP2b → PL0/PL1策略绑定 → PL2安全更新 →
+DP3 shadow及条件DP4。CB2门控独立按证据触发，不与预算改动混合。
+本次只更新计划与导航，没有新增Runtime、测试或GPU结果；下面的已完成状态保持原义。
+
 ## 2026-11-01工程深化：当前状态
 
 本轮按[prompt2](../prompts/prompt2.md)和
@@ -109,6 +116,10 @@ FAIL/PARTIAL均保留，不将micro当Serving、不将静态registry当安全更
 功能收尾后，按用户新授权完成一次O1补采；当前性能诊断结果见
 [tp-ttft-diagnostic](../reports/tp-ttft-diagnostic.md)。
 
+用户已接受下一阶段方向，本次形成
+[详细工程实验计划](engineering-optimization-experiment-plan.md) 与收敛后的
+[路线图](vllm_physical_kv_reclamation_engineering_roadmap.md)，尚未开始实现或新GPU实验。
+
 ## 当前状态
 
 | 范围 | 状态 | 当前结论 |
@@ -119,6 +130,10 @@ FAIL/PARTIAL均保留，不将micro当Serving、不将静态registry当安全更
 | M0→DP既有实现与Gate | 已执行 | 只按各阶段报告的配置/正确性范围交付；历史记录见delivery导航，不重跑矩阵 |
 | O1 | DIAGNOSTIC_DONE | 已审计旧trace并完成稳定ID/step/两rank设备关联；采样出现抢占且偏离原正式轨迹，不足以选择优化；未改Runtime，原SLO FAIL保留 |
 | O2/O3 | NOT_RUN | 未测Tri真实Runtime完整评分或证明metadata净收益；未融合、增旁路或扩展实验 |
+| 新阶段DP | NOT_RUN | 先修dense负载上报与接收链，再按证据判断工作量/KV压力策略；Prefix Affinity暂缓 |
+| 新阶段TP | NOT_RUN | 先测真实shape完整评分成本，再择一优化；与SinkRecent压力TTFT分开归因 |
+| Controller深化 | NOT_RUN | 现有coverage/zero-copy/byte-cost排序已完成；保留成本校准方向，有错选证据再改决策 |
+| H2O扩展 | NOT_RUN | 可选；先查真实Attention Importance来源与成本，不扩大质量评测或默认支持域 |
 
 feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按computed length初始化E；
 保留有损KV的streaming重入不在契约内。MRV2/BF16/FA2/NHD/B16、单group、单在途与
@@ -142,7 +157,7 @@ feature-on拒绝范围含retention=1。fresh/APC及preempt后重算可按compute
   本次closeout-fixes，不安装升级依赖或下载替代模型。
 
 R1已封口、必要回归通过，限定功能收尾完成；随后O1诊断也已按范围收尾。
-当前未追加Runtime优化，后续只在明确新目标或新证据下重开。
+当前未追加Runtime优化；新阶段已形成计划，实施与实验结论后续按独立增量记录。
 
 </details>
 

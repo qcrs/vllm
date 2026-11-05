@@ -99,6 +99,10 @@ canonical commit/free、真实reuse以及Prefix/Graph边界按原Gate交付。D1
 [TP TTFT诊断](tp-ttft-diagnostic.md)。采样偏离原正式零抢占轨迹，未据此修改Runtime
 或宣称性能改善；原TP pressure SLO FAIL保留。
 
+下一阶段的DP负载链、TP评分成本、Controller成本校准与可选H2O扩展，统一见
+[详细工程实验计划](../plans/engineering-optimization-experiment-plan.md)。本次仅交付计划；
+尚未实施这些Runtime修改或运行新GPU实验，不改变下列既有结论。
+
 工作树为 `worktrees/p1-v8-physical-kv-reclamation`，分支为
 `p1/v8-physical-kv-reclamation`，vLLM基线为v0.26.0 `568afb3a13`。
 沿用现有Python3.10/Torch2.11+cu129/Triton3.6环境；模型实验仅Qwen3-8B BF16。
@@ -160,6 +164,7 @@ token一致性或按KeepPlan搬移正确不能替代质量保证。限定功能�
 | 历史功能与性能收尾 | [final-review](final-review.md) | [performance-followup](performance-followup.md) |
 | 本次R1/R2/D1–D4 | [独立Review基准](independent-closeout-review.md) | [closeout-fixes](closeout-fixes.md) |
 | 后续O1请求级TTFT诊断 | [tp-runtime](../source-analysis/tp-runtime.md) | [tp-ttft-diagnostic](tp-ttft-diagnostic.md) |
+| 下一阶段工程优化（待执行） | [路线图](../plans/vllm_physical_kv_reclamation_engineering_roadmap.md) | [详细实验计划](../plans/engineering-optimization-experiment-plan.md) |
 
 本页只维护当前结论和导航；[status](../plans/status.md) 维护当前状态与未决项，
 reports保存实验事实与历史负结果，notes保存协议，source-analysis解释当前调用链、
