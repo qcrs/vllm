@@ -62,3 +62,27 @@ completion。实际输出等待后，Manager 先验证全部存活结果，再 c
 GPU均 Qwen3-8B BF16、GPU0/1、Worker主线程CPU20/21、同一guard串行。这些生命周期
 运行包含 payload/同步/故障注入，不作为 Serving 吞吐或质量保持证据。最终 micro、
 Serving 与 DP 条件结论另见后续统一评估报告。
+
+## 最终源码与有限复核
+
+双 victim 页分担现在只检查两条线性保留率曲线交点相邻的两个整数页目标，越界时
+截到合法边界。候选对仍全部枚举；精确 Fraction 排序与原目标相同。现有 CPU suite
+增加独立穷举 oracle，覆盖不同 E/L/P、尾页及边界，避免逐页扫描随 D 增长。
+
+最终源码复核在 `Engineering-Protected-Final-Correctness/`：
+
+- `20261107-213244-pair-tp2-graph-delay-reuse`：双 victim、延迟 completion、
+  TP2 全36层 payload、Graph replay 和真实释放页改写 PASS，guard峰值
+  18,152,947,712 bytes。
+- `20261107-213340-single-q0-tp2-graph-reuse`：单 victim q0、token/whole-block、
+  TP2/Graph 和真实页面复用 PASS，guard峰值18,144,559,104 bytes。
+- 三个 CPU suite 选择 `reclamation or pressure`：77 passed / 289 deselected；
+  DP route/watermark 选择15 passed / 36 deselected。适用 pre-commit 和
+  manual mypy-3.12 PASS。准确命令、日志及 hash 收入 B0 最终验证归档。
+
+protected 精确释放 D 页不提供后续 admission reservation。DP 最终 lifecycle 首次
+运行显示，前方 decode 可以先重新占用刚释放的页，使等待请求尚未 admission；
+原超时 FAIL 保留，不能把保护比例或预测页数正确写成等待请求必然立即开始。
+组合的 abort/continuation/reuse 结果及该限制见
+[DP 报告](engineering-protected-dp.md)。micro 与 Serving 分列于
+[统一评估](engineering-protected-evaluation.md)，不由这些 correctness 运行推断性能。

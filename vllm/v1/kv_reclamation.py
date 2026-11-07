@@ -249,7 +249,27 @@ def protected_reclaim_plan(
         for second in ordered[i + 1 :]:
             lower = max(1, shortfall - second.released_blocks)
             upper = min(first.released_blocks, shortfall - 1)
-            for first_pages in range(lower, upper + 1):
+            if lower > upper:
+                continue
+            first_logical = max(1, first.logical_tokens - first.protected_prefix_tokens)
+            second_logical = max(
+                1, second.logical_tokens - second.protected_prefix_tokens
+            )
+            first_private = (
+                block_size * len(first.source_block_ids) - first.protected_prefix_tokens
+            )
+            second_private = (
+                block_size * (len(second.source_block_ids) - shortfall)
+                - second.protected_prefix_tokens
+            )
+            # The two retention ratios are linear with opposite slopes. The
+            # maximum minimum is adjacent to their intersection or a bound.
+            crossing = (
+                first_private * second_logical - second_private * first_logical
+            ) // (block_size * (first_logical + second_logical))
+            for first_pages in sorted(
+                {max(lower, min(upper, p)) for p in (crossing, crossing + 1)}
+            ):
                 pair = tuple(
                     retarget_reclaim_candidate(
                         c,

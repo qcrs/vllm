@@ -170,3 +170,7 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 枚举合法页目标及真实 Pool/Scheduler CPU 测试；设备完成、跨 TP、Graph 和页改写
 必须复用真实 Qwen3-8B lifecycle，不能由 CPU 断言替代。DP 复用 watermark suite，
 usage 先诊断，不在没有有效同分错选证据时新增路由行为。
+
+双 victim 的解析选择用独立穷举全部合法页分配作 oracle，覆盖不同 E/L/P、尾页、
+交点两侧和边界，验证最小逻辑保留率及平衡顺序不变。此测试在纯 helper 层捕获
+消除逐页枚举时可能遗漏最优分配的错误；真实执行仍由既有 TP2 lifecycle 验证。

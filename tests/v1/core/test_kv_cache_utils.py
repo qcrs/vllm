@@ -4,6 +4,8 @@ import dataclasses
 import hashlib
 import importlib
 from collections.abc import Callable
+from fractions import Fraction
+from itertools import combinations
 from typing import Any
 
 import pytest
@@ -3028,3 +3030,70 @@ def test_reclamation_protected_pair_is_bounded_balanced_and_deterministic(
     assert len(plan) <= 2
     if plan:
         assert sum(c.released_blocks for c in plan) == shortfall
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        [(256, 256, 0), (399, 530, 16), (517, 780, 48)],
+        [(257, 390, 16), (400, 400, 80), (519, 900, 32)],
+        [(272, 272, 0), (272, 272, 0), (272, 272, 0)],
+        [(129, 240, 0), (400, 799, 16), (513, 999, 32)],
+    ],
+)
+def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes):
+    """Intersection selection must match every legal page split, including bounds."""
+    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    candidates = []
+    for i, (source, logical, prefix) in enumerate(shapes):
+        floor = protected_reclaim_floor(source, logical, prefix, config)
+        pages = (source + 15) // 16
+        candidates.append(
+            ReclaimCandidate(
+                str(i),
+                floor,
+                pages - (floor + 15) // 16,
+                0,
+                False,
+                float(i),
+                prefix,
+                source,
+                tuple(range(pages)),
+                logical,
+            )
+        )
+
+    def fairness(ratios):
+        return -min(ratios), abs(ratios[0] - ratios[1])
+
+    capacity = max(c.released_blocks for c in candidates)
+    for shortfall in range(capacity + 1, 2 * capacity + 2):
+        legal = []
+        for first, second in combinations(candidates, 2):
+            for first_pages in range(1, first.released_blocks + 1):
+                second_pages = shortfall - first_pages
+                if not 1 <= second_pages <= second.released_blocks:
+                    continue
+                ratios = [
+                    Fraction(
+                        16 * (len(c.source_block_ids) - pages)
+                        - c.protected_prefix_tokens,
+                        c.logical_tokens - c.protected_prefix_tokens,
+                    )
+                    for c, pages in ((first, first_pages), (second, second_pages))
+                ]
+                legal.append(fairness(ratios))
+        plan = protected_reclaim_plan(candidates, shortfall, config, 16, 2)
+        assert bool(plan) == bool(legal)
+        if plan:
+            assert len(plan) == 2
+            assert sum(c.released_blocks for c in plan) == shortfall
+            assert fairness(
+                [
+                    Fraction(
+                        c.keep_tokens - c.protected_prefix_tokens,
+                        c.logical_tokens - c.protected_prefix_tokens,
+                    )
+                    for c in plan
+                ]
+            ) == min(legal)
