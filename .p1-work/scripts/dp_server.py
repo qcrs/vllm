@@ -42,6 +42,7 @@ def main():
                 {
                     "request": request.request_id,
                     "external": request.external_req_id,
+                    "prompt_tokens": len(request.prompt_token_ids),
                     "replica": self.core_engines.index(chosen),
                     "explicit": request.data_parallel_rank,
                     "counts": counts,

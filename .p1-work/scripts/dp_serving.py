@@ -181,6 +181,9 @@ def main():
         "--routing", choices=["requests", "known_work"], default="requests"
     )
     parser.add_argument("--work-counters", action="store_true")
+    parser.add_argument(
+        "--budget-mode", choices=["fixed", "protected"], default="fixed"
+    )
     tuning_arguments(parser)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
@@ -204,6 +207,13 @@ def main():
         "vllm/v1/core/sched/scheduler.py",
         "vllm/v1/core/sched/interface.py",
         "vllm/v1/metrics/stats.py",
+        "vllm/v1/kv_reclamation.py",
+        "vllm/v1/core/kv_cache_manager.py",
+        "vllm/v1/core/sched/output.py",
+        "vllm/v1/outputs.py",
+        "vllm/v1/worker/gpu/kv_reclamation.py",
+        "vllm/v1/worker/gpu/model_runner.py",
+        "vllm/v1/executor/multiproc_executor.py",
     ):
         source = source_root / relative
         target = run / "source" / relative
@@ -278,6 +288,7 @@ def main():
             "pressure": True,
             "reserve_cap": 0,
             "stats_path": args.stats,
+            "budget_mode": args.budget_mode,
         }
     command.extend(["--additional-config", json.dumps(additional)])
     if args.trace:

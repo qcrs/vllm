@@ -227,12 +227,20 @@ def main():
     parser.add_argument("--reserve", type=int, default=0)
     parser.add_argument(
         "--budget-mode",
-        choices=["fixed", "demand", "retry", "retry_pass", "prefill_fixed"],
+        choices=[
+            "fixed",
+            "demand",
+            "retry",
+            "retry_pass",
+            "prefill_fixed",
+            "protected",
+        ],
         default="fixed",
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--reclamation-counts", action="store_true")
+    parser.add_argument("--work-counters", action="store_true")
     parser.add_argument("--prefix-caching", action="store_true")
     parser.add_argument(
         "--graph-mode", choices=["eager", "full", "piecewise"], default="eager"
@@ -253,6 +261,10 @@ def main():
         "vllm/v1/kv_reclamation.py",
         "vllm/v1/core/kv_cache_manager.py",
         "vllm/v1/core/sched/scheduler.py",
+        "vllm/v1/core/sched/output.py",
+        "vllm/v1/outputs.py",
+        "vllm/v1/worker/gpu/model_runner.py",
+        "vllm/v1/executor/multiproc_executor.py",
     ]
     hashes = {}
     for name in sources:
@@ -269,6 +281,11 @@ def main():
         port = probe.getsockname()[1]
     origin = f"http://127.0.0.1:{port}"
     env = dict(os.environ, VLLM_ENABLE_V1_MULTIPROCESSING="1")
+    if args.work_counters:
+        scripts = Path(__file__).parent
+        for helper in ("dp_hooks.py", "tp_worker_hooks.py"):
+            shutil.copyfile(scripts / helper, run / helper)
+        env["PYTHONPATH"] = str(scripts) + os.pathsep + env["PYTHONPATH"]
     if args.reclamation_counts:
         scripts = Path(__file__).parent
         shutil.copyfile(
@@ -327,6 +344,8 @@ def main():
         "--no-enable-log-requests",
     ]
     configure_worker_cpus(args, command, env, run)
+    if args.work_counters:
+        command.extend(["--scheduler-cls", "dp_hooks.P1DPWorkScheduler"])
     if args.graph_mode == "eager":
         command.append("--enforce-eager")
     else:
