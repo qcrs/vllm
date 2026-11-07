@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine.core_client import DPLBAsyncMPClient
 from vllm.v1.kv_reclamation import (
     PolicyBinding,
@@ -30,6 +31,7 @@ from vllm.v1.kv_reclamation import (
     protected_reclaim_floor,
     sink_recent_ranges,
 )
+from vllm.v1.request import RequestStatus
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 from vllm.v1.worker.gpu.kv_compaction import StableKVCompactor
@@ -46,12 +48,20 @@ def controller(shape, mode, count, demand):
     scheduler = object.__new__(Scheduler)
     scheduler.reclamation_config = config
     scheduler.block_size = 16
+    scheduler.max_num_scheduled_tokens = 1024
+    scheduler.max_model_len = 9216
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0)
     scheduler.running = [
         SimpleNamespace(
             request_id=f"r{i}",
             num_computed_tokens=shape["L"],
             num_prompt_tokens=shape["L"],
+            max_tokens=128,
+            num_tokens=shape["L"] + 1,
             num_in_flight_tokens=0,
+            has_encoder_inputs=False,
+            status=RequestStatus.RUNNING,
             effective_kv_len=shape["E"],
             arrival_time=float(i),
             policy_binding=binding,
@@ -71,10 +81,15 @@ def controller(shape, mode, count, demand):
         ]
         for i in range(count)
     }
+    manager = object.__new__(FullAttentionManager)
+    manager.block_size = 16
+    manager.req_to_blocks = rows
+    manager.num_cached_block = dict.fromkeys(rows, 0)
+    running_tail_pages = count * ((shape["E"] + 16) // 16 - pages)
     scheduler.kv_cache_manager = SimpleNamespace(
-        coordinator=SimpleNamespace(
-            single_type_managers=[SimpleNamespace(req_to_blocks=rows)]
-        ),
+        coordinator=SimpleNamespace(single_type_managers=[manager]),
+        block_pool=SimpleNamespace(get_num_free_blocks=lambda: running_tail_pages),
+        watermark_blocks=0,
         last_allocation_shortfall=demand,
         trace=None,
     )
@@ -87,6 +102,30 @@ def controller(shape, mode, count, demand):
         ]
     )
     return scheduler
+
+
+def controller_calls(shape, mode, count, demand):
+    scheduler = controller(shape, mode, count, demand)
+    yield "scan_only", partial(scheduler._select_reclaim_plan, {})
+    if mode != "protected":
+        return
+    waiting = SimpleNamespace(
+        request_id="waiting",
+        num_tokens=demand * 16,
+        num_prompt_tokens=demand * 16,
+        max_tokens=128,
+        num_computed_tokens=0,
+        effective_kv_len=0,
+        has_encoder_inputs=False,
+        status=RequestStatus.WAITING,
+    )
+    yield "waiting_full_forecast", partial(scheduler._select_reclaim_plan, {}, waiting)
+    scheduler = controller(shape, mode, count, demand)
+    scheduler.running[0].num_tokens += 1023
+    yield (
+        "prefill_reservation",
+        partial(scheduler._protected_prefill_reserved_blocks, scheduler.running[-1]),
+    )
 
 
 def cases(shapes):
@@ -104,27 +143,31 @@ def cpu_micro(shapes):
     records = []
     for shape, mode, label, demand in cases(shapes):
         for count in (2, 8):
-            scheduler = controller(shape, mode, count, demand)
-            call = partial(scheduler._select_reclaim_plan, {})
-            for _ in range(3):
-                call()
-            samples = []
-            for _ in range(30):
-                start = time.perf_counter_ns()
-                plan = call()
-                samples.append((time.perf_counter_ns() - start) / 1e3)
-            records.append(
-                dict(
-                    shape=shape,
-                    mode=mode,
-                    label=label,
-                    candidates=count,
-                    demand=demand,
-                    decision_us=samples,
-                    median_us=statistics.median(samples),
-                    plan=[asdict(c) for c in plan],
+            for context, call in controller_calls(shape, mode, count, demand):
+                for _ in range(3):
+                    call()
+                samples = []
+                for _ in range(30):
+                    start = time.perf_counter_ns()
+                    result = call()
+                    samples.append((time.perf_counter_ns() - start) / 1e3)
+                records.append(
+                    dict(
+                        shape=shape,
+                        mode=mode,
+                        label=label,
+                        context=context,
+                        candidates=count,
+                        demand=demand,
+                        decision_us=samples,
+                        median_us=statistics.median(samples),
+                        plan=(
+                            [asdict(c) for c in result]
+                            if context != "prefill_reservation"
+                            else result
+                        ),
+                    )
                 )
-            )
     routes = []
     for mode in ("requests", "known_work"):
         client = object.__new__(DPLBAsyncMPClient)
@@ -321,6 +364,7 @@ def main():
     for path in (
         "vllm/v1/kv_reclamation.py",
         "vllm/v1/core/sched/scheduler.py",
+        "vllm/v1/core/single_type_kv_cache_manager.py",
         "vllm/v1/engine/core_client.py",
         "vllm/v1/worker/gpu/kv_reclamation.py",
         "vllm/v1/worker/gpu/kv_compaction.py",

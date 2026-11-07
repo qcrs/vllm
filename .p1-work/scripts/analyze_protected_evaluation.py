@@ -3,6 +3,7 @@
 """Audit final fixed workloads; separate correctness, micro and Serving claims."""
 
 import argparse
+import ast
 import hashlib
 import json
 import statistics
@@ -17,16 +18,17 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def audit_run(run, hashes):
+def audit_run(run, hashes, *, devices="0,1", frozen_source=False):
     guard = read(run / "result.json")
     assert guard["status"] == "PASS" and guard["exit_code"] == 0
     assert not guard["limit_triggered"]
     assert guard["peak_project_nvml_bytes"] < 44 * 2**30
     for name, expected in hashes.items():
         assert digest(run / "source" / name) == expected, (run, name)
-        assert digest(Path(name)) == expected, ("final source changed", run, name)
+        if not frozen_source:
+            assert digest(Path(name)) == expected, ("final source changed", run, name)
     invocation = read(run / "invocation.json")
-    assert invocation["environment"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert invocation["environment"]["CUDA_VISIBLE_DEVICES"] == devices
     assert invocation["hard_limit_bytes"] == 45 * 2**30
     assert invocation["stop_threshold_bytes"] == 44 * 2**30
     for name, expected in invocation["source_files"].items():
@@ -64,15 +66,15 @@ def work_summary(records):
     )
 
 
-def analyze_tp(run):
+def analyze_tp(run, **audit_options):
     protocol = read(run / "protocol.json")
     args = protocol["args"]
     hashes = read(run / "runtime-source-hashes.json")
-    guard = audit_run(run, hashes)
+    guard = audit_run(run, hashes, **audit_options)
     assert args["tp"] == 2 and args["pool_gib"] == 0.75
     assert args["graph_mode"] == "full" and args["full_warmup"]
     assert args["repeats"] == 3 and args["work_counters"]
-    assert args["reclamation_counts"] and not args["trace"]
+    assert not args["trace"]
     assert not args["prefix_caching"] and args["reserve"] == 0
     assert args["max_num_batched_tokens"] == 1024 and args["max_num_seqs"] == 8
     assert protocol["slo"] == {"ttft_s": 2, "tpot_s": 0.08}
@@ -127,9 +129,13 @@ def analyze_tp(run):
             "itl_s",
         ):
             assert calculated[key] == summary[key], (run, label, key)
-        before = summary["reclamation_counts_before"][-1]["canonical_commits"]
-        after = summary["reclamation_counts_after"][-1]["canonical_commits"]
-        assert after - before == counts["reclaim_calls"]
+        if args["reclamation_counts"]:
+            before = summary["reclamation_counts_before"][-1]["canonical_commits"]
+            after = summary["reclamation_counts_after"][-1]["canonical_commits"]
+            assert after - before == counts["reclaim_calls"]
+        else:
+            assert "reclamation_counts_before" not in summary
+            assert "reclamation_counts_after" not in summary
         rounds.append(dict(repeat=label, summary=summary, work=counts))
         if label != "warmup":
             pooled.extend(items)
@@ -144,6 +150,12 @@ def analyze_tp(run):
         protocol=protocol,
         guard=guard,
         source_hashes=hashes,
+        source_audit=audit_options,
+        reclamation_count_audit=(
+            "Scheduler work records cross-checked with Worker canonical commits"
+            if args["reclamation_counts"]
+            else "Scheduler completed work records; no Worker counter RPC"
+        ),
         aggregate=combined,
         rounds=rounds,
         work=work_summary(timed_work),
@@ -161,28 +173,60 @@ def analyze_tp(run):
     )
 
 
-def compare_tp(runs):
+def compare_tp(runs, *, allow_source_change=False):
     if not runs:
         return []
     baseline = runs[0]
     helpers = ["dp_hooks.py", "tp_worker_hooks.py", "worker_affinity.py"]
     comparisons = []
     for run in runs[1:]:
-        assert run["source_hashes"] == baseline["source_hashes"]
+        if not allow_source_change:
+            assert run["source_hashes"] == baseline["source_hashes"]
         assert run["protocol"]["prompt_sha256"] == baseline["protocol"]["prompt_sha256"]
         configs = [dict(r["protocol"]["args"]) for r in (baseline, run)]
         for config in configs:
             config.pop("policy")
             config.pop("budget_mode")
         assert configs[0] == configs[1]
+        inactive_helper_changes = []
         for helper in helpers:
-            assert digest(Path(run["run"]) / helper) == digest(
-                Path(baseline["run"]) / helper
-            )
+            a = Path(baseline["run"]) / helper
+            b = Path(run["run"]) / helper
+            if digest(a) == digest(b):
+                continue
+            assert allow_source_change and helper == "tp_worker_hooks.py"
+            trees = [ast.parse(path.read_text()) for path in (a, b)]
+            # Only the unused correctness Worker class may differ. In particular,
+            # imports, module statements and the imported members() must match.
+            for tree in trees:
+                tree.body = [
+                    node
+                    for node in tree.body
+                    if not (
+                        isinstance(node, ast.ClassDef) and node.name == "P1TPWorker"
+                    )
+                ]
+            assert ast.dump(trees[0]) == ast.dump(trees[1])
+            for root in (Path(baseline["run"]), Path(run["run"])):
+                assert (
+                    "from tp_worker_hooks import members"
+                    in (root / "dp_hooks.py").read_text()
+                )
+                assert "P1TPWorker" not in (root / "dp_hooks.py").read_text()
+                serving = root / "source/.p1-work/scripts/serving_reclamation.py"
+                assert "P1TPWorker" not in serving.read_text()
+            inactive_helper_changes.append(helper)
         comparisons.append(
             dict(
                 A=baseline["run"],
                 B=run["run"],
+                changed_sources=[
+                    name
+                    for name in sorted(run["source_hashes"] | baseline["source_hashes"])
+                    if run["source_hashes"].get(name)
+                    != baseline["source_hashes"].get(name)
+                ],
+                inactive_diagnostic_helper_changes=inactive_helper_changes,
                 throughput_change_percent=100
                 * (
                     run["aggregate"]["output_tokens_per_s"]
@@ -194,9 +238,9 @@ def compare_tp(runs):
     return comparisons
 
 
-def analyze_dp(run):
+def analyze_dp(run, **audit_options):
     output = analyze_formal(run)
-    audit_run(run, output["source_hashes"])
+    audit_run(run, output["source_hashes"], **audit_options)
     records = [events(run / f"replica-{rank}/work.jsonl") for rank in (0, 1)]
     timed = read(run / "serving.json")
     output["timed_work"] = [
@@ -241,10 +285,13 @@ def analyze_dp(run):
     return output
 
 
-def analyze_micro(run):
+def analyze_micro(run, *, devices="0,1"):
     hashes = read(run / "source-hashes.json")
     guard = read(run / "result.json")
     assert guard["status"] == "PASS" and not guard["limit_triggered"]
+    assert guard["peak_project_nvml_bytes"] < 44 * 2**30
+    invocation = read(run / "invocation.json")
+    assert invocation["environment"]["CUDA_VISIBLE_DEVICES"] == devices
     for name, expected in hashes.items():
         assert digest(run / "source" / name) == digest(Path(name)) == expected
     cpu = read(run / "cpu-micro.json")
@@ -293,19 +340,30 @@ def main():
     parser.add_argument("--dp", nargs="*", type=Path, default=[])
     parser.add_argument("--combo", type=Path)
     parser.add_argument("--micro", type=Path)
+    parser.add_argument("--devices", default="0,1")
+    parser.add_argument("--frozen-source-run", action="append", type=Path, default=[])
+    parser.add_argument("--allow-source-change", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    tp = [analyze_tp(run) for run in args.tp]
-    dp = [analyze_dp(run) for run in args.dp]
+    frozen = {run.resolve() for run in args.frozen_source_run}
+
+    def audit_options(run):
+        return dict(devices=args.devices, frozen_source=run.resolve() in frozen)
+
+    assert frozen <= {run.resolve() for run in [*args.tp, *args.dp, args.combo] if run}
+    tp = [analyze_tp(run, **audit_options(run)) for run in args.tp]
+    dp = [analyze_dp(run, **audit_options(run)) for run in args.dp]
     # compare_formal also audits token IDs; retain that result before projection.
     comparisons = compare_formal([analyze_formal(run) for run in args.dp])
     output = dict(
         tp=tp,
-        tp_comparisons=compare_tp(tp),
+        tp_comparisons=compare_tp(tp, allow_source_change=args.allow_source_change),
         dp=dp,
         dp_comparisons=comparisons,
-        combo=analyze_dp(args.combo) if args.combo else None,
-        micro=analyze_micro(args.micro) if args.micro else None,
+        combo=analyze_dp(args.combo, **audit_options(args.combo))
+        if args.combo
+        else None,
+        micro=analyze_micro(args.micro, devices=args.devices) if args.micro else None,
     )
     args.output.write_text(json.dumps(output, indent=2) + "\n")
     print(
