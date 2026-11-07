@@ -4,6 +4,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -28,6 +29,7 @@ async def exercise(args, run):
         dtype="bfloat16",
         data_parallel_size=2,
         data_parallel_size_local=2,
+        worker_cls="worker_affinity.AffinityWorker" if args.worker_cpus else "auto",
         worker_extension_cls="dp_hooks.P1DPWorker",
         scheduler_cls="dp_hooks.P1DPScheduler",
         enforce_eager=True,
@@ -45,14 +47,20 @@ async def exercise(args, run):
         gpu_memory_utilization=0.3,
         seed=0,
         disable_log_stats=True,
-        additional_config={}
-        if args.policy == "full"
-        else {
-            "kv_reclamation": {
-                "policy": args.policy,
-                "pressure": True,
-                "min_keep_tokens": 32,
-            }
+        additional_config={
+            "dp_load_balancing": args.routing,
+            **(
+                {}
+                if args.policy == "full"
+                else {
+                    "kv_reclamation": {
+                        "policy": args.policy,
+                        "pressure": True,
+                        "min_keep_tokens": 32,
+                        "budget_mode": args.budget_mode,
+                    }
+                }
+            ),
         },
     )
     llm = AsyncLLM.from_engine_args(options)
@@ -79,6 +87,17 @@ async def exercise(args, run):
     llm.engine_core.get_core_engine_for_request = route
     tokenizer = AutoTokenizer.from_pretrained(options.model, local_files_only=True)
     text = tokenizer.encode("Mary went to the garden. John carried the bag. " * 100)
+    (run / "protocol.json").write_text(
+        json.dumps(
+            {
+                "args": vars(args),
+                "pool_blocks": 33,
+                "prompt_sha256": hashlib.sha256(json.dumps(text).encode()).hexdigest(),
+                "support": "DP2 TP1 eager; independent pools and abort affinity",
+            },
+            indent=2,
+        )
+    )
     first = {name: asyncio.Event() for name in ("A", "C", "B")}
 
     async def generate(name, length, maximum, rank):
@@ -141,7 +160,8 @@ async def exercise(args, run):
             await until(
                 lambda: any(e["event"] == "reclaim_commit" for e in lines(trace0))
             )
-            await until(first["C"].is_set)
+            if args.budget_mode == "fixed":
+                await until(first["C"].is_set)
         tasks.append(asyncio.create_task(generate("B", 128, 128, 1)))
         await until(first["B"].is_set)
         await until(lambda: token_counts.get("B", 0) >= 16)
@@ -150,6 +170,7 @@ async def exercise(args, run):
         assert affinity[a_internal] == llm.engine_core.core_engines[0]
         abort_time = time.monotonic_ns()
         peer_tokens_at_abort = token_counts["B"]
+        c_started_before_abort = first["C"].is_set()
         assert peer_tokens_at_abort < 128
         await llm.abort("A")
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=90)
@@ -181,7 +202,15 @@ async def exercise(args, run):
                 for rid, pages in payload[0]["rewritten_by_request"].items()
                 if rid.startswith("C-")
             }
-            assert reused_by_c and all(reused_by_c.values())
+            if args.budget_mode == "fixed":
+                assert reused_by_c and all(reused_by_c.values())
+            else:
+                reused_by_a = {
+                    rid: pages
+                    for rid, pages in payload[0]["rewritten_by_request"].items()
+                    if rid.startswith("A-")
+                }
+                assert reused_by_a and all(reused_by_a.values())
         assert not payload[1]["released"]
         assert payload[1]["counts"]["peer_retained_forward"] > 1
         peer_after_abort = [
@@ -197,6 +226,8 @@ async def exercise(args, run):
                 {
                     "status": "PASS",
                     "policy": args.policy,
+                    "budget_mode": args.budget_mode,
+                    "routing": args.routing,
                     "identities": identities,
                     "scheduler_identities": scheduler_identities,
                     "first_local_miss": {**first_miss, "shortfall": shortfall},
@@ -208,6 +239,7 @@ async def exercise(args, run):
                     "free_final": [32, 32],
                     "abort_time_ns": abort_time,
                     "peer_tokens_at_abort": peer_tokens_at_abort,
+                    "c_started_before_abort": c_started_before_abort,
                     "peer_verified_forwards_after_abort": len(peer_after_abort),
                     "abort_affinity": {
                         k: llm.engine_core.core_engines.index(v)
@@ -229,12 +261,35 @@ def main():
     parser.add_argument(
         "--policy", choices=["full", "sink_recent"], default="sink_recent"
     )
+    parser.add_argument(
+        "--budget-mode", choices=["fixed", "protected"], default="fixed"
+    )
+    parser.add_argument(
+        "--routing", choices=["requests", "known_work"], default="requests"
+    )
+    parser.add_argument("--worker-cpus", nargs=2, type=int)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
     os.environ["VLLM_KV_TRACE_IDS"] = "1"
-    for name in ("dp_hooks.py", "tp_worker_hooks.py"):
+    if args.worker_cpus:
+        os.environ["P1_WORKER_CPUS"] = json.dumps(args.worker_cpus)
+    for name in ("dp_hooks.py", "tp_worker_hooks.py", "worker_affinity.py"):
         shutil.copyfile(Path(__file__).with_name(name), run / name)
+    hashes = {}
+    for path in (
+        "vllm/v1/kv_reclamation.py",
+        "vllm/v1/core/sched/scheduler.py",
+        "vllm/v1/core/kv_cache_manager.py",
+        "vllm/v1/engine/core_client.py",
+        "vllm/v1/worker/gpu/kv_reclamation.py",
+        ".p1-work/scripts/dp_reclamation.py",
+    ):
+        target = run / "source" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+        hashes[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    (run / "source-hashes.json").write_text(json.dumps(hashes, indent=2))
     asyncio.run(exercise(args, run))
 
 

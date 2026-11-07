@@ -45,3 +45,29 @@ counts变化记录 scalar snapshot/free，allocation miss 和 pressure action �
 新报告不覆盖历史 DP4 PARTIAL/SLO_FAIL、pending ADD 修复的有限正反收益或 W0
 噪声范围结论。后续 W1/W0 正式复测及 known_work+protected 组合另见
 [统一评估](engineering-protected-evaluation.md)；85条质量样本继续冻结。
+
+## 最终组合 lifecycle 与一次超时
+
+最终源码的 `known_work + protected` 组合在独立33页池、DP2×TP1 eager 下验证，
+真实 GPU0/1、Worker主线程CPU20/21，所有 GPU 经同一 guard 串行。
+`Engineering-Protected-Final-Correctness/20261107-213442-dp2-known-work-local-pressure`
+原 guard FAIL/exit1、87.71秒，峰34,154,217,472 bytes，无资源阈值触发。
+旧 harness 等待 C 首次输出才启动 B 和 abort A；protected 每次精确释放 D1，
+前方 A 的下一次 decode 先重新使用该页。实际100次 commit、199次 miss 后仍未
+满足 C 的启动等待条件。这是等待 admission 的真实限制，不归因为超时噪声。
+
+只调整 correctness harness 的事件先后：protected 观察本地 commit 后启动 peer B，
+B 产生16 token 后按原 affinity abort A，再验证 C 完成；fixed 的原等待条件保留。
+没有修改 Runtime、正式 Serving workload、预算或超时阈值。
+`20261107-213909-dp2-known-work-pressure-abort-reuse` PASS/exit0、35.20秒，
+峰34,183,577,600 bytes：
+
+- replica0 首次 miss D1 时 peer 有32 free，独立池和 foreign mutation 检查通过。
+- 本地两次 reclaim，A 与 C 均真实改写释放页17，全36层 payload 验证通过。
+- A 生成4 token 后 abort；C 在 abort 前未开始，随后完成64 token，B 完成128 token。
+  peer 在 abort 后继续112次已验证 forward。
+- 四个后续请求走 known_work，两个副本均处理请求；最终 free=[32,32]。
+
+该 PASS 验证池隔离、abort affinity、continuation 和真实页 reuse；不覆盖“等待
+请求在回收后立即 admission”的主张，也不属于 Serving 性能或有损质量证据。
+原 FAIL 和修订后的 PASS 分开保存在 B0 `final-correctness-addendum.json` 及原目录。
