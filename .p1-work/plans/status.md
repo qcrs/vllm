@@ -1,5 +1,30 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-PROTECTED-NAV-BEGIN -->
+
+## 2026-11-07 protected Controller / DP：本轮完成
+
+当前以[本轮收尾](../reports/engineering-protected-closeout.md)及
+[统一评估](../reports/engineering-protected-evaluation.md)为准。
+
+| 范围 | 本轮结论 |
+| --- | --- |
+| protected Controller | 已实现单次私有E最多删除20%、私有已计算L至少保留50%；真实miss优先单victim，必要时最多两个，固定模式仍默认 |
+| Correctness | CPU预算/Pool/Scheduler 77 passed、DP route/watermark 15 passed；真实8B TP2单/双victim、全rank completion、Graph及rewrite/reuse PASS；DP2独立池/abort/continuation PASS |
+| Micro | 决策、TP2 Worker回收与compaction、路由成本已量化；不同释放量不可等动作比较，未证明本轮micro加速 |
+| TP2 Serving | native/fixed/protected均0/24；protected相对fixed观测吞吐−88.60%，SLO_FAIL，停止继续扩实验 |
+| DP2 Serving | W1/W0正向差异在反向未稳定复现，单项SLO均FAIL；requests仍默认，不宣称稳定路由收益 |
+| DP usage tie-break | STOPPED / NOT_RUN；没有重复新鲜同分错选后发生miss/抢占的进入证据 |
+| 组合 | W1 known_work+protected为24/24，但正式零回收，不能归因Controller；真实压力能力见correctness小池 |
+
+机制与边界见[Controller](../reports/engineering-protected-controller.md)、
+[DP](../reports/engineering-protected-dp.md)。SLO仍为TTFT≤2s且TPOT≤80ms；保护比例不
+保证质量或立即admission。本轮及历史FAIL/PARTIAL均保留，85条质量样本未扩，
+未重跑旧矩阵。分阶段本地提交完成，原用户改动保留；未push、未创建PR。
+下方历史导航和正文按原日期、配置理解。
+
+<!-- ENGINEERING-PROTECTED-NAV-END -->
+
 <!-- ENGINEERING-REVISION-NAV-BEGIN -->
 
 ## 2026-11-01 CB1 / TP 退化复核：当前状态

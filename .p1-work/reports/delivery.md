@@ -1,5 +1,27 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-PROTECTED-NAV-BEGIN -->
+
+## 2026-11-07 protected Controller / DP 交付
+
+本轮已从B0推进至X0，交付有单次cap和逻辑累计floor的protected预算、最多双victim
+批次及TP2/Graph/真实页复用验证。结论见[本轮收尾](engineering-protected-closeout.md)，
+机制见[Controller](engineering-protected-controller.md)、[DP](engineering-protected-dp.md)，
+完整correctness/micro/Serving见[统一评估](engineering-protected-evaluation.md)。
+
+Correctness：CPU 77+15项通过，真实Qwen3-8B TP2单/双victim、延迟completion、
+36层payload、Graph与真实页面rewrite/reuse通过；DP2独立池/abort/peer continuation通过。
+Micro只交付成本测量，未证明加速。Serving保持TTFT≤2s且TPOT≤80ms：TP2三组均
+0/24，protected较fixed观测吞吐−88.60%；DP W1/W0正向差异未稳定复现，单项均
+SLO_FAIL。组合24/24但零回收，不能归因protected；固定预算与requests继续默认。
+
+usage tie-break缺重复有效同分错选证据，STOPPED / NOT_RUN。历史与本轮FAIL/PARTIAL
+全部保留，85条质量样本未扩大，无有损质量保持结论。全部GPU同guard串行、GPU0/1、
+Worker主线程CPU20/21，显存未达44GiB停止线。分阶段本地提交、最终证据hash及用户
+原有patch保护收入B0 completion manifest；未push或创建PR，下方历史正文原样保留。
+
+<!-- ENGINEERING-PROTECTED-NAV-END -->
+
 <!-- ENGINEERING-REVISION-NAV-BEGIN -->
 
 ## 2026-11-01 CB1 / TP 疑似退化复核交付
