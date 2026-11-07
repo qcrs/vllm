@@ -15,7 +15,7 @@ from tp_worker_hooks import members
 from vllm.distributed import get_tp_group
 from vllm.v1.core.kv_cache_metrics import KVCacheTrace
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.kv_reclamation import sink_recent_ranges
+from vllm.v1.kv_reclamation import sink_recent_ranges, whole_block_row
 
 
 def directory(config):
@@ -35,6 +35,36 @@ class P1DPWorkScheduler(Scheduler):
         self._p1_work_stream = (directory(self.vllm_config) / "work.jsonl").open(
             "a", buffering=1
         )
+        allocate = self.kv_cache_manager.allocate_slots
+
+        def counted_allocate(request, *args, **kwargs):
+            result = allocate(request, *args, **kwargs)
+            if result is None:
+                self._work_record(request)["allocation_misses"] += 1
+            return result
+
+        self.kv_cache_manager.allocate_slots = counted_allocate
+
+    def _work_record(self, request):
+        return self._p1_work.setdefault(
+            request.request_id,
+            dict(
+                request=request.request_id,
+                prompt_tokens=request.num_prompt_tokens,
+                scheduled_tokens=0,
+                prefill_tokens=0,
+                recomputed_tokens=0,
+                high_water=0,
+                allocation_misses=0,
+                reclaim_calls=0,
+                released_pages=0,
+                estimated_copy_bytes=0,
+                zero_copy_calls=0,
+                max_batch_victims=0,
+                usage_min=1.0,
+                usage_max=0.0,
+            ),
+        )
 
     def schedule(self, *args, **kwargs):
         output = super().schedule(*args, **kwargs)
@@ -42,17 +72,7 @@ class P1DPWorkScheduler(Scheduler):
             request = self.requests[rid]
             end = request.num_computed_tokens
             start = end - q
-            record = self._p1_work.setdefault(
-                rid,
-                dict(
-                    request=rid,
-                    prompt_tokens=request.num_prompt_tokens,
-                    scheduled_tokens=0,
-                    prefill_tokens=0,
-                    recomputed_tokens=0,
-                    high_water=0,
-                ),
-            )
+            record = self._work_record(request)
             record["scheduled_tokens"] += q
             record["prefill_tokens"] += min(end, request.num_prompt_tokens) - min(
                 start, request.num_prompt_tokens
@@ -61,12 +81,54 @@ class P1DPWorkScheduler(Scheduler):
                 0, min(end, record["high_water"]) - start
             )
             record["high_water"] = max(record["high_water"], end)
+        usage = self.kv_cache_manager.usage
+        for rid, record in self._p1_work.items():
+            record["preemptions"] = self.requests[rid].num_preemptions
+            record["usage_min"] = min(record["usage_min"], usage)
+            record["usage_max"] = max(record["usage_max"], usage)
         return output
 
-    def update_from_output(self, *args, **kwargs):
-        output = super().update_from_output(*args, **kwargs)
+    def update_from_output(self, scheduler_output, model_output):
+        intents = scheduler_output.reclaim_requests
+        results = model_output.reclaim_results
+        output = super().update_from_output(scheduler_output, model_output)
+        for intent, result in zip(intents, results):
+            record = self._p1_work[intent.request_id]
+            prefix, recent = sink_recent_ranges(
+                intent.source_effective_kv_len,
+                intent.target_keep_tokens,
+                intent.policy_binding.config.sink_tokens,
+                intent.protected_prefix_tokens,
+            )
+            whole = intent.policy_binding.config.policy == "sink_recent" and (
+                whole_block_row(
+                    intent.source_block_ids,
+                    intent.source_effective_kv_len,
+                    intent.target_keep_tokens,
+                    prefix,
+                    recent,
+                    self.block_size,
+                )
+                is not None
+            )
+            group = self.kv_cache_config.kv_cache_groups[0]
+            member_bytes = (
+                group.kv_cache_spec.page_size_bytes
+                // self.block_size
+                * len(group.layer_names)
+            )
+            record["reclaim_calls"] += 1
+            record["released_pages"] += len(intent.source_block_ids) - len(
+                result.retained_block_ids
+            )
+            record["zero_copy_calls"] += int(whole)
+            record["estimated_copy_bytes"] += (
+                0 if whole else 2 * (intent.target_keep_tokens - prefix) * member_bytes
+            )
+            record["max_batch_victims"] = max(record["max_batch_victims"], len(intents))
         for rid in self._p1_work.keys() - self.requests.keys():
             record = self._p1_work.pop(rid)
+            record["completed_ns"] = time.monotonic_ns()
             self._p1_work_stream.write(json.dumps(record) + "\n")
         return output
 
@@ -96,7 +158,7 @@ class P1DPScheduler(Scheduler):
             running=len(self.running),
             retry=self.reclaim_retry_pending,
             scheduled=output.num_scheduled_tokens,
-            intent=asdict(output.reclaim_request) if output.reclaim_request else None,
+            intents=[asdict(i) for i in output.reclaim_requests],
             requests={
                 rid: {
                     "L": r.num_computed_tokens,

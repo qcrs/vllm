@@ -57,7 +57,7 @@ class P1TPWorker:
             "options": options,
             "rank": rank,
             "directory": directory,
-            "pending": None,
+            "pending": [],
             "references": {},
             "released": set(),
             "rewritten": set(),
@@ -145,12 +145,18 @@ class P1TPWorker:
             worker.retire_policies = policy_retire
 
         def compact(row, keep, **kwargs):
-            state["pending"]["compacted"] = True
-            state["pending"]["keep"] = keep.cpu().tolist()
-            if rank == options["delay_rank"] and state["number"] == 1:
-                (directory / "delay-start-1").write_text(str(time.monotonic_ns()))
+            state["pending"][-1]["compacted"] = True
+            state["pending"][-1]["keep"] = keep.cpu().tolist()
+            if rank == options["delay_rank"] and state["number"] == options.get(
+                "delay_number", 1
+            ):
+                (directory / f"delay-start-{state['number']}").write_text(
+                    str(time.monotonic_ns())
+                )
                 time.sleep(options["delay_s"])
-                (directory / "delay-end-1").write_text(str(time.monotonic_ns()))
+                (directory / f"delay-end-{state['number']}").write_text(
+                    str(time.monotonic_ns())
+                )
             if rank == options["fail_rank"]:
                 (directory / "injected-failure").write_text(str(time.monotonic_ns()))
                 raise RuntimeError("P1 injected non-output-rank compaction failure")
@@ -165,23 +171,26 @@ class P1TPWorker:
                 intent.policy_binding.config.sink_tokens,
                 intent.protected_prefix_tokens,
             )
-            state["pending"] = {
-                "intent": intent,
-                "source": [
-                    members(
-                        v, intent.source_block_ids, intent.source_effective_kv_len
-                    ).cpu()
-                    for v in views
-                ],
-                "keep": [
-                    *range(prefix),
-                    *range(recent, intent.source_effective_kv_len),
-                ],
-                "others": [],
-                "compacted": False,
-            }
+            state["pending"].append(
+                {
+                    "number": state["number"],
+                    "intent": intent,
+                    "source": [
+                        members(
+                            v, intent.source_block_ids, intent.source_effective_kv_len
+                        ).cpu()
+                        for v in views
+                    ],
+                    "keep": [
+                        *range(prefix),
+                        *range(recent, intent.source_effective_kv_len),
+                    ],
+                    "others": [],
+                    "compacted": False,
+                }
+            )
             for rid, idx in runner.req_states.req_id_to_index.items():
-                if rid == intent.request_id:
+                if rid in state["batch_ids"]:
                     continue
                 length = int(worker.effective_kv_len_np[idx])
                 row = (
@@ -190,7 +199,7 @@ class P1TPWorker:
                     .cpu()
                     .tolist()
                 )
-                state["pending"]["others"].append(
+                state["pending"][-1]["others"].append(
                     (row, [members(v, row, length).cpu() for v in views])
                 )
             event = worker.local_reclaim_done
@@ -198,8 +207,16 @@ class P1TPWorker:
                 event = event.event
             worker.local_reclaim_done = EventProbe(event, directory, state["number"])
             result = original_reclaim(intent, tables)
-            state["pending"]["result"] = result
+            state["pending"][-1]["result"] = result
             return result
+
+        original_batch = worker.reclaim_batch
+
+        def reclaim_batch(intents, tables):
+            state["batch_ids"] = {intent.request_id for intent in intents}
+            return original_batch(intents, tables)
+
+        worker.reclaim_batch = reclaim_batch
 
         def prepare(batch):
             state["active"] = batch
@@ -365,9 +382,8 @@ class P1TPWorker:
     def p1_check(self, active_ids):
         state, runner = self._p1, self.model_runner
         worker, views = runner.reclamation, runner.reclamation.layers
-        pending = state["pending"]
-        result = None
-        if pending:
+        results = []
+        for pending in state["pending"]:
             assert worker.local_reclaim_done.event.query()
             keep, row = pending["keep"], pending["result"].retained_block_ids
             assert (
@@ -388,22 +404,24 @@ class P1TPWorker:
                         members(view, other_row, len(value)).cpu(), value
                     )
             state["references"][pending["intent"].request_id] = (row, expected)
-            result = {
-                "rank": state["rank"],
-                "number": state["number"],
-                "keep": keep,
-                "row": row,
-                "E": len(keep),
-                "path": "token" if pending["compacted"] else "whole",
-            }
-            state["pending"] = None
+            results.append(
+                {
+                    "rank": state["rank"],
+                    "number": pending["number"],
+                    "keep": keep,
+                    "row": row,
+                    "E": len(keep),
+                    "path": "token" if pending["compacted"] else "whole",
+                }
+            )
+        state["pending"] = []
         for rid, (row, values) in state["references"].items():
             if rid not in active_ids:
                 continue
             for view, value in zip(views, values):
                 assert torch.equal(members(view, row, len(value)).cpu(), value)
         return {
-            "reclaim": result,
+            "reclaims": results,
             "rank": state["rank"],
             "counts": dict(state["counts"]),
             "rewritten": sorted(state["rewritten"]),

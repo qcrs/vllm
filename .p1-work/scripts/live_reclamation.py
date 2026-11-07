@@ -215,7 +215,7 @@ def main():
                 if lifecycle == "maintenance":
                     keep = 127
                 intent = scheduler.make_reclaim_request(request, output, keep)
-                output.reclaim_request = intent
+                output.reclaim_requests = (intent,)
                 events.append(
                     {
                         "event": "intent",
@@ -325,7 +325,7 @@ def main():
 
     def checked_update(output, result):
         nonlocal completed_reclaims
-        intent = output.reclaim_request
+        intent = output.reclaim_requests[0] if output.reclaim_requests else None
         if intent:
             assert completion_event.query(), "Output returned before GPU publication"
             for view, wanted in zip(views.values(), reference):
@@ -349,7 +349,7 @@ def main():
             active = request is not None and not request.is_finished()
             row = scheduler.kv_cache_manager.get_block_ids(internal_ids["A"])[0]
             removed = set(intent.source_block_ids) - set(
-                result.reclaim_result.retained_block_ids
+                result.reclaim_results[0].retained_block_ids
             )
             released.update(removed)
             events.append(

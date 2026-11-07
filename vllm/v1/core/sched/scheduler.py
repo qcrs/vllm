@@ -449,7 +449,7 @@ class Scheduler(SchedulerInterface):
             and not self.reclaim_retry_pending
         )
         self.reclaim_retry_pending = False
-        reclaim_candidate: tuple[Request, ReclaimCandidate] | None = None
+        reclaim_plan: tuple[ReclaimCandidate, ...] = ()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -598,10 +598,10 @@ class Scheduler(SchedulerInterface):
                         break
 
                     if allow_reclamation:
-                        reclaim_candidate = self._select_reclaim_candidate(
+                        reclaim_plan = self._select_reclaim_plan(
                             num_scheduled_tokens, request
                         )
-                        if reclaim_candidate is not None:
+                        if reclaim_plan:
                             break
 
                     # The request cannot be scheduled.
@@ -698,7 +698,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if (
             not preempted_reqs
-            and reclaim_candidate is None
+            and not reclaim_plan
             and self._pause_state == PauseState.UNPAUSED
         ):
             step_skipped_waiting = create_request_queue(self.policy)
@@ -987,7 +987,7 @@ class Scheduler(SchedulerInterface):
                     # The request cannot be scheduled.
 
                     if allow_reclamation:
-                        reclaim_candidate = self._select_reclaim_candidate(
+                        reclaim_plan = self._select_reclaim_plan(
                             num_scheduled_tokens,
                             request,
                             new_computed_blocks=new_computed_blocks,
@@ -1235,13 +1235,9 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        if reclaim_candidate is not None:
-            request, candidate = reclaim_candidate
-            scheduler_output.reclaim_request = self.make_reclaim_request(
-                request,
-                scheduler_output,
-                candidate.keep_tokens,
-                candidate.protected_prefix_tokens,
+        if reclaim_plan:
+            scheduler_output.reclaim_requests = self.make_reclaim_requests(
+                reclaim_plan, scheduler_output
             )
             self.reclaim_retry_pending = True
         return scheduler_output
@@ -1317,14 +1313,14 @@ class Scheduler(SchedulerInterface):
             tuple(following),
         )
 
-    def _select_reclaim_candidate(
+    def _select_reclaim_plan(
         self,
         scheduled: dict[str, int],
         requester: Request | None = None,
         *,
         new_computed_blocks: KVCacheBlocks | None = None,
         num_new_computed_tokens: int = 0,
-    ) -> tuple[Request, ReclaimCandidate] | None:
+    ) -> tuple[ReclaimCandidate, ...]:
         config = self.reclamation_config
         assert config is not None
         manager = self.kv_cache_manager.coordinator.single_type_managers[0]
@@ -1420,7 +1416,7 @@ class Scheduler(SchedulerInterface):
                     candidates=[asdict(c) for c in candidates],
                     plan=[asdict(c) for c in plan],
                 )
-            return (self.requests[plan[0].request_id], plan[0]) if plan else None
+            return plan
         demand = (
             demand_reclaim_candidates(
                 candidates, shortfall, goal, config, self.block_size, member_bytes
@@ -1500,7 +1496,7 @@ class Scheduler(SchedulerInterface):
                 selected=selected.request_id if selected else None,
             )
         if selected is None:
-            return None
+            return ()
         request = self.requests[selected.request_id]
         if self.kv_cache_manager.trace is not None:
             self.kv_cache_manager.trace_request(
@@ -1516,16 +1512,16 @@ class Scheduler(SchedulerInterface):
                 protected_prefix_tokens=selected.protected_prefix_tokens,
                 q=scheduled.get(selected.request_id, 0),
             )
-        return request, selected
+        return (selected,)
 
-    def make_reclaim_request(
+    def _prepare_reclaim_request(
         self,
         request: Request,
         scheduler_output: SchedulerOutput,
         keep_tokens: int,
         protected_prefix_tokens: int | None = None,
     ) -> ReclaimRequest:
-        """Deindex the private suffix and describe post-forward reclamation."""
+        """Describe post-forward reclamation without mutating canonical state."""
         assert self.reclamation_config is not None
         binding = request.policy_binding
         assert binding is not None
@@ -1559,8 +1555,6 @@ class Scheduler(SchedulerInterface):
             for block in blocks[protected_blocks:]
         )
         assert len(row) > (keep_tokens + self.block_size - 1) // self.block_size
-        if self.kv_cache_manager.enable_caching:
-            self.kv_cache_manager.evict_blocks(set(row[protected_blocks:]))
         return ReclaimRequest(
             request.request_id,
             source_len,
@@ -1569,6 +1563,58 @@ class Scheduler(SchedulerInterface):
             protected_prefix_tokens,
             binding,
         )
+
+    def make_reclaim_request(
+        self,
+        request: Request,
+        scheduler_output: SchedulerOutput,
+        keep_tokens: int,
+        protected_prefix_tokens: int | None = None,
+    ) -> ReclaimRequest:
+        """Prepare and deindex one diagnostic/manual reclamation."""
+        intent = Scheduler._prepare_reclaim_request(
+            self, request, scheduler_output, keep_tokens, protected_prefix_tokens
+        )
+        if self.kv_cache_manager.enable_caching:
+            self.kv_cache_manager.evict_blocks(
+                set(
+                    intent.source_block_ids[
+                        intent.protected_prefix_tokens // self.block_size :
+                    ]
+                )
+            )
+        return intent
+
+    def make_reclaim_requests(
+        self, plan: tuple[ReclaimCandidate, ...], scheduler_output: SchedulerOutput
+    ) -> tuple[ReclaimRequest, ...]:
+        """Validate the entire plan before deindexing any private suffix."""
+        assert 1 <= len(plan) <= 2
+        assert len({c.request_id for c in plan}) == len(plan)
+        intents = tuple(
+            self._prepare_reclaim_request(
+                self.requests[c.request_id],
+                scheduler_output,
+                c.keep_tokens,
+                c.protected_prefix_tokens,
+            )
+            for c in plan
+        )
+        for candidate, intent in zip(plan, intents):
+            assert intent.source_effective_kv_len == candidate.source_effective_kv_len
+            assert tuple(intent.source_block_ids) == candidate.source_block_ids
+            assert intent.policy_binding == candidate.policy_binding
+        if self.kv_cache_manager.enable_caching:
+            self.kv_cache_manager.evict_blocks(
+                {
+                    block_id
+                    for intent in intents
+                    for block_id in intent.source_block_ids[
+                        intent.protected_prefix_tokens // self.block_size :
+                    ]
+                }
+            )
+        return intents
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -1986,19 +2032,22 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         if self.reclamation_config is not None:
-            result = model_runner_output.reclaim_result
-            intent = scheduler_output.reclaim_request
-            assert (intent is None) == (result is None)
+            results = model_runner_output.reclaim_results
+            intents = scheduler_output.reclaim_requests
+            assert len(intents) == len(results)
+            assert len({i.request_id for i in intents}) == len(intents)
             for rid, q in num_scheduled_tokens.items():
                 request = self.requests.get(rid)
                 if request is not None and not request.is_finished():
                     request.effective_kv_len += q
-            if result is not None:
-                assert intent is not None
-                request = self.requests.get(result.request_id)
+            commits = []
+            for intent, result in zip(intents, results):
+                assert intent.request_id == result.request_id
+                assert intent.policy_binding == result.policy_binding
+                request = self.requests.get(intent.request_id)
                 if request is not None and not request.is_finished():
-                    assert request.effective_kv_len == intent.source_effective_kv_len
-                    self.kv_cache_manager.commit_reclamation(request, intent, result)
+                    commits.append((request, intent, result))
+            self.kv_cache_manager.commit_reclamations(commits)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

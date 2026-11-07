@@ -1208,10 +1208,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
-                if scheduler_output.reclaim_request is not None:
+                if scheduler_output.reclaim_requests:
                     assert self.reclamation is not None
-                    result = self.reclamation.reclaim(
-                        scheduler_output.reclaim_request, self.block_tables
+                    result = self.reclamation.reclaim_batch(
+                        scheduler_output.reclaim_requests, self.block_tables
                     )
                     completion = torch.cuda.Event()
                     completion.record(self.main_stream)
@@ -1220,7 +1220,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         req_ids=[],
                         req_id_to_index={},
                         sampled_token_ids=[],
-                        reclaim_result=result,
+                        reclaim_results=result,
                     )
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
@@ -1449,7 +1449,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            reclaim_request=scheduler_output.reclaim_request,
+            reclaim_requests=scheduler_output.reclaim_requests,
         )
 
         if not self.is_last_pp_rank:
@@ -1472,7 +1472,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
-        reclaim_request = self.execute_model_state.reclaim_request
+        reclaim_requests = self.execute_model_state.reclaim_requests
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1530,7 +1530,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        if reclaim_request is not None:
+        if reclaim_requests:
             assert self.reclamation is not None
             self.postprocess_sampled(
                 input_batch.idx_mapping,
@@ -1540,8 +1540,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.query_start_loc,
             )
             self.reclamation.advance(input_batch)
-            model_runner_output.reclaim_result = self.reclamation.reclaim(
-                reclaim_request, self.block_tables
+            model_runner_output.reclaim_results = self.reclamation.reclaim_batch(
+                reclaim_requests, self.block_tables
             )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1567,7 +1567,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        if reclaim_request is None:
+        if not reclaim_requests:
             self.postprocess_sampled(
                 input_batch.idx_mapping,
                 sampler_output.sampled_token_ids,
@@ -1731,7 +1731,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
-    reclaim_request: ReclaimRequest | None = None
+    reclaim_requests: tuple[ReclaimRequest, ...] = ()
 
 
 def sort_batch_req_ids(

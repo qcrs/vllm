@@ -128,8 +128,10 @@ def main():
         request = pending
         pending = None
         output = SchedulerOutput.make_empty()
-        output.reclaim_request = scheduler.make_reclaim_request(
-            request, output, max(128, request.effective_kv_len // 2)
+        output.reclaim_requests = (
+            scheduler.make_reclaim_request(
+                request, output, max(128, request.effective_kv_len // 2)
+            ),
         )
         return output
 

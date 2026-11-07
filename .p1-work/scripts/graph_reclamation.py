@@ -191,10 +191,10 @@ def main():
             )
             if args.path == "token":
                 keep -= 1 if step == 16 else 2
-            output.reclaim_request = scheduler.make_reclaim_request(
-                request, output, keep
+            output.reclaim_requests = (
+                scheduler.make_reclaim_request(request, output, keep),
             )
-            assert output.reclaim_request.protected_prefix_tokens == (
+            assert output.reclaim_requests[0].protected_prefix_tokens == (
                 64 if args.prefix else 0
             )
         if step % 2:
@@ -485,7 +485,7 @@ def main():
         return result
 
     def checked_update(output, result):
-        intent = output.reclaim_request
+        intent = output.reclaim_requests[0] if output.reclaim_requests else None
         free = pool.get_num_free_blocks()
         if intent:
             assert completion.query(), "Canonical release preceded local GPU completion"

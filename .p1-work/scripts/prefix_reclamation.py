@@ -183,10 +183,10 @@ def main():
         if forced and step in targets:
             external, keep = targets[step]
             request = scheduler.requests[ids[external]]
-            output.reclaim_request = scheduler.make_reclaim_request(
-                request, output, keep
+            output.reclaim_requests = (
+                scheduler.make_reclaim_request(request, output, keep),
             )
-            assert output.reclaim_request.protected_prefix_tokens == (
+            assert output.reclaim_requests[0].protected_prefix_tokens == (
                 144 if mode == "gap" and step == 17 else 64
             )
             abort_pending = lifecycle == "abort"
@@ -210,8 +210,8 @@ def main():
             if new.req_id == ids.get("C") and forced:
                 assert new.num_computed_tokens == (144 if mode == "gap" else 64)
                 assert new.block_ids[0][:4] == manager.get_block_ids(ids["B"])[0][:4]
-        if output.reclaim_request is not None:
-            intent = output.reclaim_request
+        if output.reclaim_requests:
+            intent = output.reclaim_requests[0] if output.reclaim_requests else None
             assert all(
                 pool.blocks[i].ref_cnt == 1
                 for i in intent.source_block_ids[intent.protected_prefix_tokens // 16 :]
@@ -340,7 +340,7 @@ def main():
         first_layer.impl.forward = checked_attention
 
     def checked_update(output, result):
-        intent = output.reclaim_request
+        intent = output.reclaim_requests[0] if output.reclaim_requests else None
         free_before = pool.get_num_free_blocks()
         if intent is not None:
             assert completion.query(), "GPU publication must precede canonical free"
@@ -456,7 +456,7 @@ def main():
             assert owner.num_cached_block[rid] == p
             assert all(b.block_hash is None for b in owner.req_to_blocks[rid][p:])
         if mode == "no_gain" and step == 1:
-            assert scheduler._select_reclaim_candidate({}) is None
+            assert not scheduler._select_reclaim_plan({})
             events.append(
                 {
                     "event": "no_gain",

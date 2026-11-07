@@ -263,7 +263,7 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
-    reclaim_request: ReclaimRequest | None = None
+    reclaim_requests: tuple[ReclaimRequest, ...] = ()
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

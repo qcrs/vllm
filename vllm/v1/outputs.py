@@ -281,7 +281,7 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
-    reclaim_result: "ReclaimResult | None" = None
+    reclaim_results: "tuple[ReclaimResult, ...]" = ()
 
     @staticmethod
     def with_kv_conn_output_only(

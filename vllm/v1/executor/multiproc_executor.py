@@ -910,6 +910,11 @@ class WorkerProc:
             else:
                 logger.exception("WorkerProc failed.")
 
+            if worker is not None and worker.reclamation_enabled:
+                # A peer may be waiting on a reclaim collective. CUDA teardown
+                # can block too, so let the executor's death monitor stop it.
+                os._exit(1)
+
             # The parent sends a SIGTERM to all worker processes if
             # any worker dies. Set this value so we don't re-throw
             # SystemExit() to avoid zmq exceptions in __del__.

@@ -1714,7 +1714,9 @@ def test_reclamation_demand_real_pool_releases_only_required_page(reclamation_ow
     )[0]
     intent = dataclasses.replace(intent, target_keep_tokens=selected.keep_tokens)
     before = manager.block_pool.get_num_free_blocks()
-    manager.commit_reclamation(request, intent, ReclaimResult("A", 48, list(row[:3])))
+    manager.commit_reclamations(
+        [(request, intent, ReclaimResult("A", 48, list(row[:3])))]
+    )
     assert manager.block_pool.get_num_free_blocks() == before + selected.released_blocks
     assert request.effective_kv_len == 48
 
@@ -1725,7 +1727,7 @@ def test_reclamation_reuses_released_pages_and_grows_from_effective_length(
     """An aligned retained tail grows one page, and B owns the released pages."""
     manager, request, intent = reclamation_owner
     original = manager.coordinator.single_type_managers[0].req_to_blocks["A"].copy()
-    manager.commit_reclamation(request, intent, ReclaimResult("A", 16, [1]))
+    manager.commit_reclamations([(request, intent, ReclaimResult("A", 16, [1]))])
     assert request.num_computed_tokens == 64 and request.effective_kv_len == 16
     assert (
         manager.coordinator.single_type_managers[0].req_to_blocks["A"] == original[:1]
@@ -1759,7 +1761,7 @@ def test_reclamation_rejects_invalid_ownership_before_free(reclamation_owner, in
         manager.block_pool.blocks[2].ref_cnt += 1
     before = manager.block_pool.get_num_free_blocks()
     with pytest.raises(AssertionError):
-        manager.commit_reclamation(request, intent, ReclaimResult("A", 32, row))
+        manager.commit_reclamations([(request, intent, ReclaimResult("A", 32, row))])
     assert manager.block_pool.get_num_free_blocks() == before
     assert manager.get_block_ids("A")[0] == [1, 2, 3, 4]
     assert request.effective_kv_len == 64
@@ -2998,3 +3000,31 @@ def test_reclamation_protected_prefers_private_logical_retention():
     plan = protected_reclaim_plan(candidates, 2, config, 16, 1)
     assert plan[0].request_id == "new"
     assert protected_reclaim_plan(candidates, 0, config, 16, 1) == ()
+
+
+@pytest.mark.parametrize("shortfall,keeps", [(2, [224]), (4, [224, 224]), (7, [])])
+def test_reclamation_protected_pair_is_bounded_balanced_and_deterministic(
+    shortfall, keeps
+):
+    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    candidates = [
+        ReclaimCandidate(
+            rid,
+            205,
+            3,
+            0,
+            False,
+            arrival,
+            0,
+            256,
+            tuple(range(16 * arrival, 16 * arrival + 16)),
+            256,
+        )
+        for rid, arrival in (("A", 1), ("B", 2))
+    ]
+    plan = protected_reclaim_plan(candidates, shortfall, config, 16, 2)
+    assert [c.keep_tokens for c in plan] == keeps
+    assert plan == protected_reclaim_plan(candidates[::-1], shortfall, config, 16, 2)
+    assert len(plan) <= 2
+    if plan:
+        assert sum(c.released_blocks for c in plan) == shortfall

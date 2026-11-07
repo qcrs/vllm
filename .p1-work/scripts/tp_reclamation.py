@@ -49,6 +49,7 @@ def main():
     parser.add_argument("--demand-pages", type=int)
     parser.add_argument("--retry-tail", action="store_true")
     parser.add_argument("--protected", action="store_true")
+    parser.add_argument("--victims", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
     if args.retry_tail and args.demand_pages is None:
         parser.error("--retry-tail requires --demand-pages")
@@ -102,6 +103,7 @@ def main():
         additional_config={
             "kv_reclamation": {
                 "min_keep_tokens": 32,
+                "pressure": args.victims == 2,
                 "budget_mode": "protected" if args.protected else "fixed",
                 "policy": args.policy,
                 "stats_path": os.environ.get("P1_STATS"),
@@ -124,6 +126,7 @@ def main():
             {
                 "delay_rank": non_output if args.delay else -1,
                 "delay_s": 3,
+                "delay_number": 2 if args.victims == 2 else 1,
                 "fail_rank": non_output if args.fail else -1,
                 "policy_updates": args.policy_updates,
                 "prepare_delay_rank": non_output,
@@ -149,6 +152,9 @@ def main():
         "C": common + tokenizer.encode("Carol crossed the river. " * 60)[:128],
         "D": common + tokenizer.encode("David stayed at home. " * 40)[:64],
     }
+    if args.victims == 2:
+        assert args.protected and not args.prefix and not args.policy_updates
+        prompts["C"] = prompts["C"][:160]
     ids, outputs, events = {}, {}, []
     original_schedule, original_update = (
         scheduler.schedule,
@@ -163,9 +169,13 @@ def main():
         {16: "A", 24: "B", 32: "C"} if args.policy_updates else {16: "A", 32: "A"}
     )
 
+    if args.victims == 2:
+        reclaim_steps = {}
+
     def watch():
-        marker = run / f"rank-{executor.output_rank}" / "local-done-1"
-        delayed_done = run / f"rank-{non_output}" / "local-done-1"
+        number = 2 if args.victims == 2 else 1
+        marker = run / f"rank-{executor.output_rank}" / f"local-done-{number}"
+        delayed_done = run / f"rank-{non_output}" / f"local-done-{number}"
         while not stop.wait(0.001):
             if updating:
                 version = updating["version"]
@@ -179,14 +189,17 @@ def main():
             if marker.exists() and not delayed_done.exists() and inflight:
                 try:
                     assert pool.get_num_free_blocks() == inflight["free"]
-                    assert manager.get_block_ids(ids["A"])[0] == inflight["row"]
+                    assert all(
+                        manager.get_block_ids(rid)[0] == row
+                        for rid, row in inflight["rows"].items()
+                    )
                     inflight["observed"] = True
                 except BaseException as error:
                     early_errors.append(repr(error))
                     return
 
     def schedule(*args_, **kwargs):
-        q0 = step == 16 and args.lifecycle == "q0"
+        q0 = step == 16 and args.lifecycle == "q0" and args.victims == 1
         if q0:
             scheduler.running.remove(scheduler.requests[ids["A"]])
         output = (
@@ -278,10 +291,10 @@ def main():
                 )
                 assert len(plan) == 1
                 keep = plan[0].keep_tokens
-            output.reclaim_request = scheduler.make_reclaim_request(
-                request, output, keep
+            output.reclaim_requests = (
+                scheduler.make_reclaim_request(request, output, keep),
             )
-            intent = output.reclaim_request
+            intent = output.reclaim_requests[0] if output.reclaim_requests else None
             if (
                 args.demand_pages is None
                 and args.path == "token"
@@ -294,18 +307,22 @@ def main():
                     intent.protected_prefix_tokens,
                 )
                 if recent % 16 == 0:
-                    output.reclaim_request = scheduler.make_reclaim_request(
-                        request, output, keep - 1
+                    output.reclaim_requests = (
+                        scheduler.make_reclaim_request(request, output, keep - 1),
                     )
             if step == 16 and args.lifecycle != "repeat":
                 assert ids["A"] not in output.num_scheduled_tokens
-            assert output.reclaim_request.protected_prefix_tokens == (
+            assert output.reclaim_requests[0].protected_prefix_tokens == (
                 64 if args.prefix else 0
             )
+        if output.reclaim_requests:
             inflight.clear()
             inflight.update(
                 free=pool.get_num_free_blocks(),
-                row=manager.get_block_ids(ids["A"])[0].copy(),
+                rows={
+                    i.request_id: manager.get_block_ids(i.request_id)[0].copy()
+                    for i in output.reclaim_requests
+                },
                 observed=False,
             )
         if step % 2:
@@ -319,36 +336,46 @@ def main():
         return output
 
     def update(output, result):
-        intent = output.reclaim_request
-        if intent:
+        intents = output.reclaim_requests
+        if intents:
+            first = sum(len(e["intents"]) for e in events) + 1
             markers = [
-                run / f"rank-{rank}" / f"local-done-{len(events) + 1}"
+                run / f"rank-{rank}" / f"local-done-{number}"
                 for rank in range(args.tp)
+                for number in range(first, first + len(intents))
             ]
-            # The device ACK gates release; EventProbe only observes local completion.
             deadline = time.monotonic() + 2
             while not all(p.exists() for p in markers) and time.monotonic() < deadline:
                 time.sleep(0.001)
             assert all(p.exists() for p in markers)
             if args.delay and not events:
                 assert inflight["observed"] and not early_errors
-            row = result.reclaim_result.retained_block_ids
+            rows = [r.retained_block_ids for r in result.reclaim_results]
             free = pool.get_num_free_blocks()
         answer = original_update(output, result)
-        if intent:
-            released = sorted(set(intent.source_block_ids) - set(row))
+        if intents:
+            released = sorted(
+                {
+                    page
+                    for intent, row in zip(intents, rows)
+                    for page in set(intent.source_block_ids) - set(row)
+                }
+            )
             assert pool.get_num_free_blocks() == free + len(released)
             events.append(
                 {
                     "step": step,
-                    "q": output.num_scheduled_tokens.get(intent.request_id, 0),
+                    "q": [
+                        output.num_scheduled_tokens.get(i.request_id, 0)
+                        for i in intents
+                    ],
                     "batch_tokens": output.total_num_scheduled_tokens,
-                    "intent": asdict(intent),
-                    "row": row,
+                    "intents": [asdict(i) for i in intents],
+                    "rows": rows,
                     "released": released,
                     "local_done_ns": [int(p.read_text()) for p in markers],
                     "ack_ns": time.monotonic_ns(),
-                    "early_free_observed": inflight["observed"],
+                    "canonical_unchanged_while_waiting": inflight["observed"],
                 }
             )
         return answer
@@ -362,7 +389,7 @@ def main():
             external = (
                 {0: "A", 2: "B", 17: "C", 34: "D"}
                 if args.policy_updates
-                else {0: "A", 2: "B", 17: "C"}
+                else {0: "A", 2: "B", (16 if args.victims == 2 else 17): "C"}
             ).get(step)
             if args.policy_updates and external in ("B", "C", "D"):
                 policy = {"B": "random", "C": "triattention", "D": "full"}[external]
@@ -421,7 +448,10 @@ def main():
                 if not args.fail:
                     raise
                 assert step == 16 and not events
-                assert manager.get_block_ids(ids["A"])[0] == inflight["row"]
+                assert all(
+                    manager.get_block_ids(rid)[0] == row
+                    for rid, row in inflight["rows"].items()
+                )
                 assert pool.get_num_free_blocks() == inflight["free"]
                 assert (run / f"rank-{non_output}" / "injected-failure").exists()
                 deadline = time.monotonic() + 15
@@ -461,24 +491,28 @@ def main():
                 )
                 for request in scheduler.requests.values():
                     assert request.policy_binding.version in core.reclamation_policies
-            if step in reclaim_steps:
-                left = last_checks[0]["reclaim"]
-                right = last_checks[-1]["reclaim"]
-                assert (
-                    left["keep"] == right["keep"]
-                    and left["row"] == right["row"]
-                    and left["E"] == right["E"]
-                )
-                assert left["path"] == right["path"]
-                if args.demand_pages is None:
-                    assert left["path"] == args.path
-                else:
+            if events and events[-1]["step"] == step:
+                left = last_checks[0]["reclaims"]
+                right = last_checks[-1]["reclaims"]
+                assert len(left) == len(right) == len(events[-1]["intents"])
+                for left_rank, right_rank in zip(left, right):
+                    assert all(
+                        left_rank[k] == right_rank[k]
+                        for k in ("keep", "row", "E", "path")
+                    )
+                    if args.demand_pages is None and args.victims == 1:
+                        assert left_rank["path"] == args.path
+                if args.demand_pages is not None:
                     assert len(events[-1]["released"]) == args.demand_pages
                 events[-1]["rank_results"] = [left, right]
                 executor.collective_rpc("p1_poison", args=(events[-1]["released"],))
             if step >= 17 and not engine.has_unfinished_requests():
                 break
-        assert not args.fail and len(events) == (3 if args.policy_updates else 2)
+        assert not args.fail
+        if args.victims == 2:
+            assert any(len(e["intents"]) == 2 for e in events)
+        else:
+            assert len(events) == (3 if args.policy_updates else 2)
         assert all(item["finished"] for item in outputs.values())
         assert pool.get_num_free_blocks() == 32
         assert all(c["rewritten"] for c in last_checks)

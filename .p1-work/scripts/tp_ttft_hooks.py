@@ -65,15 +65,14 @@ class TimelineScheduler(Scheduler):
                     for rid, q in output.num_scheduled_tokens.items()
                 },
                 waiting=[request.request_id for request in self.waiting],
-                reclaim=(
+                reclaim=[
                     dict(
-                        request_id=output.reclaim_request.request_id,
-                        source_e=output.reclaim_request.source_effective_kv_len,
-                        target_e=output.reclaim_request.target_keep_tokens,
+                        request_id=intent.request_id,
+                        source_e=intent.source_effective_kv_len,
+                        target_e=intent.target_keep_tokens,
                     )
-                    if output.reclaim_request is not None
-                    else None
-                ),
+                    for intent in output.reclaim_requests
+                ],
             )
         )
         return output

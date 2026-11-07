@@ -154,6 +154,21 @@ class KVReclamationWorker:
         self.kv_seq_lens[: batch.num_reqs].copy_(batch.seq_lens)
         return replace(batch, seq_lens=self.kv_seq_lens[: batch.num_reqs_after_padding])
 
+    def reclaim_batch(
+        self, intents: tuple[ReclaimRequest, ...], block_tables
+    ) -> tuple[ReclaimResult, ...]:
+        """Check all host contracts before the first victim's device mutation."""
+        assert 1 <= len(intents) <= 2
+        assert len({i.request_id for i in intents}) == len(intents)
+        for intent in intents:
+            idx = self.req_states.req_id_to_index[intent.request_id]
+            binding = intent.policy_binding
+            assert binding is not None and binding == self.slot_bindings[idx]
+            prepared, policy = self.policies[binding.version]
+            assert prepared == binding and policy is not None
+            assert self.effective_kv_len_np[idx] == intent.source_effective_kv_len
+        return tuple(self.reclaim(intent, block_tables) for intent in intents)
+
     def reclaim(self, intent: ReclaimRequest, block_tables) -> ReclaimResult:
         idx = self.req_states.req_id_to_index[intent.request_id]
         binding = intent.policy_binding

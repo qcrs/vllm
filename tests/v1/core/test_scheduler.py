@@ -104,14 +104,15 @@ def test_reclamation_rejects_pooling_lifecycle(pressure_scheduler, monkeypatch):
 def complete_pressure_step(scheduler, output):
     """Supply a completed worker result; use the real scheduler/pool commit."""
     req_ids = list(output.num_scheduled_tokens)
-    result = None
-    if intent := output.reclaim_request:
-        result = ReclaimResult(
+    results = tuple(
+        ReclaimResult(
             intent.request_id,
             intent.target_keep_tokens,
             intent.source_block_ids[: (intent.target_keep_tokens + 15) // 16],
             intent.policy_binding,
         )
+        for intent in output.reclaim_requests
+    )
     scheduler.update_from_output(
         output,
         ModelRunnerOutput(
@@ -120,7 +121,7 @@ def complete_pressure_step(scheduler, output):
             sampled_token_ids=[[42]] * len(req_ids),
             logprobs=None,
             prompt_logprobs_dict={},
-            reclaim_result=result,
+            reclaim_results=results,
         ),
     )
 
@@ -197,18 +198,21 @@ def test_pressure_prefix_protects_through_last_shared_page(
     blocks = manager.get_blocks("A").blocks[0]
     shared = [blocks[i] for i in shared_indices]
     manager.block_pool.touch(shared)
-    selected = scheduler._select_reclaim_candidate({})
+    selected = scheduler._select_reclaim_plan({})
     if len(shared_indices) == len(blocks):
-        assert selected is None
+        assert not selected
     else:
-        request, candidate = selected
+        (candidate,) = selected
+        request = scheduler.requests[candidate.request_id]
         protected = 16 * (shared_indices[-1] + 1)
         assert request is a and candidate.protected_prefix_tokens == protected
         assert candidate.keep_tokens == protected + max(16, (96 - protected) // 2)
         free_before = manager.block_pool.get_num_free_blocks()
         output = SchedulerOutput.make_empty()
-        output.reclaim_request = scheduler.make_reclaim_request(
-            a, output, candidate.keep_tokens, candidate.protected_prefix_tokens
+        output.reclaim_requests = (
+            scheduler.make_reclaim_request(
+                a, output, candidate.keep_tokens, candidate.protected_prefix_tokens
+            ),
         )
         assert all(block.block_hash is not None for block in blocks[: protected // 16])
         assert all(block.block_hash is None for block in blocks[protected // 16 :])
@@ -233,14 +237,14 @@ def test_pressure_running_miss_preserves_partial_batch_and_bounds_retry(
     before = scheduler.kv_cache_manager.get_block_ids(a.request_id)[0].copy()
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"A": 1}
-    assert output.reclaim_request.request_id == "A"
-    assert output.reclaim_request.source_effective_kv_len == 32
+    assert output.reclaim_requests[0].request_id == "A"
+    assert output.reclaim_requests[0].source_effective_kv_len == 32
     assert a.num_preemptions == b.num_preemptions == 0
     complete_pressure_step(scheduler, output)
     assert a.effective_kv_len == 16 and a.num_computed_tokens == 32
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 1
     retry = scheduler.schedule()
-    assert retry.reclaim_request is None
+    assert not retry.reclaim_requests
     assert retry.num_scheduled_tokens == {"A": 1}
     assert b.num_preemptions == 1
     assert scheduler.kv_cache_manager.get_block_ids("A")[0] == before
@@ -258,11 +262,11 @@ def test_pressure_waiting_miss_retries_admission_with_released_pages(
     scheduler.add_request(b)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"A": 1}
-    assert output.reclaim_request.request_id == "A"
-    assert output.reclaim_request.source_effective_kv_len == 49
+    assert output.reclaim_requests[0].request_id == "A"
+    assert output.reclaim_requests[0].source_effective_kv_len == 49
     complete_pressure_step(scheduler, output)
     retry = scheduler.schedule()
-    assert retry.reclaim_request is None
+    assert not retry.reclaim_requests
     assert retry.num_scheduled_tokens == {"A": 1, "B": 32}
     assert b.status == RequestStatus.RUNNING
 
@@ -276,11 +280,11 @@ def test_pressure_running_miss_can_use_maintenance_without_fake_forward(
     complete_pressure_step(scheduler, scheduler.schedule())
     output = scheduler.schedule()
     assert output.total_num_scheduled_tokens == 0
-    assert output.reclaim_request.source_effective_kv_len == 32
+    assert output.reclaim_requests[0].source_effective_kv_len == 32
     complete_pressure_step(scheduler, output)
     retry = scheduler.schedule()
     assert retry.num_scheduled_tokens == {"A": 1}
-    assert retry.reclaim_request is None
+    assert not retry.reclaim_requests
     assert a.num_preemptions == 0
 
 
@@ -291,7 +295,7 @@ def test_pressure_demand_uses_same_post_forward_snapshot(pressure_scheduler, q):
     scheduler.add_request(request)
     complete_pressure_step(scheduler, scheduler.schedule())
     scheduler.kv_cache_manager.last_allocation_shortfall = 1
-    _, candidate = scheduler._select_reclaim_candidate({"A": q})
+    (candidate,) = scheduler._select_reclaim_plan({"A": q})
     assert candidate.source_effective_kv_len == 63 + q
     assert candidate.keep_tokens == 48 and candidate.released_blocks == 1
     assert candidate.q == q
@@ -311,12 +315,12 @@ def test_pressure_retry_accounts_for_earlier_victim_tail(
     b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
     scheduler.add_request(b)
     output = scheduler.schedule()
-    assert output.reclaim_request.request_id == "A"
-    assert output.reclaim_request.target_keep_tokens == keep
+    assert output.reclaim_requests[0].request_id == "A"
+    assert output.reclaim_requests[0].target_keep_tokens == keep
     complete_pressure_step(scheduler, output)
     free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     retry = scheduler.schedule()
-    assert retry.reclaim_request is None
+    assert not retry.reclaim_requests
     # B is waiting: lack of space must never become an eager preemption.
     assert a.num_preemptions == b.num_preemptions == 0
     assert (b.status == RequestStatus.WAITING) == bool(preemptions)
@@ -331,7 +335,7 @@ def test_pressure_retry_requester_can_be_the_victim(pressure_scheduler):
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
     output = scheduler.schedule()
-    assert output.reclaim_request.target_keep_tokens == 16
+    assert output.reclaim_requests[0].target_keep_tokens == 16
     assert output.total_num_scheduled_tokens == 0
     complete_pressure_step(scheduler, output)
     retry = scheduler.schedule()
@@ -351,8 +355,8 @@ def test_pressure_retry_preserves_running_requester_without_preemption(
     complete_pressure_step(scheduler, scheduler.schedule())
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"A": 1}
-    assert output.reclaim_request.request_id == "A"
-    assert output.reclaim_request.target_keep_tokens == 47
+    assert output.reclaim_requests[0].request_id == "A"
+    assert output.reclaim_requests[0].target_keep_tokens == 47
     complete_pressure_step(scheduler, output)
     retry = scheduler.schedule()
     assert retry.num_scheduled_tokens == {"A": 1, "B": 1}
@@ -379,10 +383,10 @@ def test_pressure_retry_pass_covers_following_prefill(
     scheduler.max_num_scheduled_tokens = 33
     output = scheduler.schedule()
     assert output.total_num_scheduled_tokens == 0
-    assert output.reclaim_request.target_keep_tokens == keep
+    assert output.reclaim_requests[0].target_keep_tokens == keep
     complete_pressure_step(scheduler, output)
     retry = scheduler.schedule()
-    assert retry.reclaim_request is None
+    assert not retry.reclaim_requests
     assert b.num_preemptions == preemptions
     assert retry.num_scheduled_tokens == (
         {"A": 1} if preemptions else {"A": 1, "B": 32}
@@ -399,7 +403,7 @@ def test_pressure_prefill_fixed_batches_release_for_waiting_prefill(pressure_sch
     scheduler.add_request(b)
     assert not b.is_prefill_chunk
     output = scheduler.schedule()
-    assert output.reclaim_request.target_keep_tokens == 16
+    assert output.reclaim_requests[0].target_keep_tokens == 16
     complete_pressure_step(scheduler, output)
     retry = scheduler.schedule()
     assert retry.num_scheduled_tokens == {"A": 1, "B": 64}
@@ -436,7 +440,7 @@ def test_pressure_prefill_fixed_follows_live_post_forward_work(
             request.num_computed_tokens -= request.num_in_flight_tokens
             request.num_in_flight_tokens = 0
         scheduled = output.num_scheduled_tokens
-    _, candidate = scheduler._select_reclaim_candidate(scheduled, a)
+    (candidate,) = scheduler._select_reclaim_plan(scheduled, a)
     assert candidate.keep_tokens == (16 if state == "recompute" else 48)
 
 
@@ -453,13 +457,13 @@ def test_pressure_policy_binding_controls_budget_and_survives_preemption(
     request.policy_binding = PolicyBinding(1, config)
     scheduler.add_request(request)
     complete_pressure_step(scheduler, scheduler.schedule())
-    assert scheduler._select_reclaim_candidate({}) is None
+    assert not scheduler._select_reclaim_plan({})
     with pytest.raises(ValueError, match="Full KV"):
         scheduler.make_reclaim_request(request, SchedulerOutput.make_empty(), 32)
     request.policy_binding = PolicyBinding(
         2, replace(config, policy="random", retention=0.75)
     )
-    _, candidate = scheduler._select_reclaim_candidate({})
+    (candidate,) = scheduler._select_reclaim_plan({})
     assert candidate.keep_tokens == 48 and not candidate.zero_copy
     assert candidate.policy_binding == request.policy_binding
     assert (
@@ -479,7 +483,7 @@ def test_pressure_zero_releasable_pages_uses_native_preemption(pressure_schedule
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
     output = scheduler.schedule()
-    assert output.reclaim_request is None
+    assert not output.reclaim_requests
     assert a.num_preemptions == 1
 
 
@@ -491,7 +495,7 @@ def test_pressure_incomplete_prefill_uses_native_preemption(pressure_scheduler):
     complete_pressure_step(scheduler, scheduler.schedule())
     assert request.num_computed_tokens < request.num_prompt_tokens
     output = scheduler.schedule()
-    assert output.reclaim_request is None
+    assert not output.reclaim_requests
     assert request.num_preemptions == 1
 
 
@@ -5905,15 +5909,16 @@ def test_pressure_protected_repeated_reclaim_stops_at_logical_floor(pressure_sch
     reclaimed = 0
     while True:
         manager.last_allocation_shortfall = 1
-        selected = scheduler._select_reclaim_candidate({})
-        if selected is None:
+        selected = scheduler._select_reclaim_plan({})
+        if not selected:
             break
-        request, candidate = selected
+        (candidate,) = selected
+        request = scheduler.requests[candidate.request_id]
         before = request.effective_kv_len
         free = manager.block_pool.get_num_free_blocks()
         output = SchedulerOutput.make_empty()
-        output.reclaim_request = scheduler.make_reclaim_request(
-            request, output, candidate.keep_tokens
+        output.reclaim_requests = (
+            scheduler.make_reclaim_request(request, output, candidate.keep_tokens),
         )
         complete_pressure_step(scheduler, output)
         assert 5 * (before - request.effective_kv_len) <= before
@@ -5926,5 +5931,129 @@ def test_pressure_protected_repeated_reclaim_stops_at_logical_floor(pressure_sch
     assert a.effective_kv_len == 128
     row = manager.get_block_ids("A")
     manager.last_allocation_shortfall = 100
-    assert scheduler._select_reclaim_candidate({}) is None
+    assert not scheduler._select_reclaim_plan({})
     assert manager.get_block_ids("A") == row
+
+
+@pytest.mark.parametrize("invalid_second", [False, True])
+def test_pressure_protected_pair_commits_only_after_all_results_validate(
+    pressure_scheduler, invalid_second
+):
+    """A real waiting miss needs two victims; a bad second ACK frees neither."""
+    scheduler = pressure_scheduler(21, budget_mode="protected")
+    a, b = create_requests(2, num_tokens=128, max_tokens=128, req_ids=["A", "B"])
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    c = create_requests(1, num_tokens=80, req_ids=["C"])[0]
+    scheduler.add_request(c)
+    output = scheduler.schedule()
+    intents = output.reclaim_requests
+    assert len(intents) == 2
+    assert scheduler.kv_cache_manager.last_allocation_shortfall == 3
+    assert (
+        sum(
+            len(i.source_block_ids) - (i.target_keep_tokens + 15) // 16 for i in intents
+        )
+        == 3
+    )
+    manager = scheduler.kv_cache_manager
+    before = manager.block_pool.get_num_free_blocks()
+    rows = {r.request_id: manager.get_block_ids(r.request_id) for r in (a, b)}
+    if invalid_second:
+        results = tuple(
+            ReclaimResult(
+                i.request_id,
+                i.target_keep_tokens,
+                i.source_block_ids[: (i.target_keep_tokens + 15) // 16],
+                i.policy_binding,
+            )
+            for i in intents
+        )
+        results = (results[0], dataclasses.replace(results[1], retained_block_ids=[0]))
+        with pytest.raises(AssertionError):
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=["A", "B"],
+                    req_id_to_index={"A": 0, "B": 1},
+                    sampled_token_ids=[[42], [42]],
+                    reclaim_results=results,
+                ),
+            )
+        assert manager.block_pool.get_num_free_blocks() == before
+        assert all(manager.get_block_ids(rid) == row for rid, row in rows.items())
+        assert a.effective_kv_len == b.effective_kv_len == 129
+    else:
+        complete_pressure_step(scheduler, output)
+        assert manager.block_pool.get_num_free_blocks() == before + 3
+        assert sorted(r.effective_kv_len for r in (a, b)) == [112, 128]
+        assert a.num_computed_tokens == b.num_computed_tokens == 129
+
+
+def test_pressure_protected_invalid_plan_does_not_deindex_first_victim(
+    pressure_scheduler,
+):
+    """Planning/validation finishes before any shared hash index is changed."""
+    scheduler = pressure_scheduler(
+        40, budget_mode="protected", enable_prefix_caching=True
+    )
+    a, b = create_requests(2, num_tokens=128, max_tokens=128, req_ids=["A", "B"])
+    for request in (a, b):
+        scheduler.add_request(request)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    manager = scheduler.kv_cache_manager
+    manager.last_allocation_shortfall = 2
+    plan = scheduler._select_reclaim_plan({})
+    assert len(plan) == 2
+    blocks = manager.get_blocks(plan[0].request_id).blocks[0]
+    hashes = [block.block_hash for block in blocks]
+    assert all(h is not None for h in hashes)
+    invalid = (plan[0], dataclasses.replace(plan[1], keep_tokens=1000))
+    with pytest.raises(AssertionError):
+        scheduler.make_reclaim_requests(invalid, SchedulerOutput.make_empty())
+    assert [block.block_hash for block in blocks] == hashes
+    manager.last_allocation_shortfall = 3
+    assert not scheduler._select_reclaim_plan({})
+
+
+@pytest.mark.parametrize("victims", [1, 2])
+@pytest.mark.parametrize("end", ["abort", "finish"])
+def test_pressure_protected_ended_victim_frees_once_and_live_peer_commits(
+    pressure_scheduler, victims, end
+):
+    """Native abort/finish frees once; late ACK skips an aborted victim."""
+    scheduler = pressure_scheduler(11 if victims == 1 else 21, budget_mode="protected")
+    requests = create_requests(
+        victims, num_tokens=128, max_tokens=128, req_ids=["A", "B"][:victims]
+    )
+    requests[0].max_tokens = 2
+    for request in requests:
+        scheduler.add_request(request)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    scheduler.add_request(
+        create_requests(1, num_tokens=32 if victims == 1 else 80, req_ids=["C"])[0]
+    )
+    output = scheduler.schedule()
+    intents = output.reclaim_requests
+    assert len(intents) == victims
+    manager = scheduler.kv_cache_manager
+    before = manager.block_pool.get_num_free_blocks()
+    ended_pages = len(manager.get_block_ids("A")[0])
+    if end == "abort":
+        scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
+        assert manager.block_pool.get_num_free_blocks() == before + ended_pages
+    complete_pressure_step(scheduler, output)
+    assert requests[0].is_finished()
+    assert "A" not in scheduler.requests
+    live_released = sum(
+        len(i.source_block_ids) - (i.target_keep_tokens + 15) // 16
+        for i in intents
+        if i.request_id != "A"
+    )
+    assert (
+        manager.block_pool.get_num_free_blocks() == before + ended_pages + live_released
+    )
+    if victims == 2:
+        intent = next(i for i in intents if i.request_id == "B")
+        assert requests[1].effective_kv_len == intent.target_keep_tokens

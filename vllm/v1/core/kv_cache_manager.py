@@ -575,16 +575,26 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
-    def commit_reclamation(
+    def commit_reclamations(
+        self, commits: list[tuple[Request, ReclaimRequest, ReclaimResult]]
+    ) -> None:
+        """Validate the whole batch before committing or freeing any victim."""
+        for request, intent, result in commits:
+            self.validate_reclamation(request, intent, result)
+        for request, intent, result in commits:
+            self._commit_reclamation(request, intent, result)
+
+    def validate_reclamation(
         self, request: Request, intent: ReclaimRequest, result: ReclaimResult
     ) -> None:
-        """Commit completed worker layout, then release canonical Block objects."""
+        """Validate a completed worker result without changing any Pool state."""
         manager = self.coordinator.single_type_managers[0]
         blocks = manager.req_to_blocks[request.request_id]
         ids = [block.block_id for block in blocks]
         retained = result.retained_block_ids
         retained_set = set(retained)
         block_size = manager.block_size
+        assert request.effective_kv_len == intent.source_effective_kv_len
         assert ids == intent.source_block_ids
         assert result.request_id == request.request_id == intent.request_id
         assert request.policy_binding == intent.policy_binding == result.policy_binding
@@ -604,15 +614,26 @@ class KVCacheManager:
             not block.is_null and block.ref_cnt == 1
             for block in blocks[protected_blocks:]
         )
+        if request.request_id in manager.num_cached_block:
+            assert manager.num_cached_block[request.request_id] >= protected_blocks
+        else:
+            assert protected_blocks == 0
+
+    def _commit_reclamation(
+        self, request: Request, intent: ReclaimRequest, result: ReclaimResult
+    ) -> None:
+        """Apply a validated result after every member of the batch is validated."""
+        manager = self.coordinator.single_type_managers[0]
+        blocks = manager.req_to_blocks[request.request_id]
+        retained = result.retained_block_ids
+        retained_set = set(retained)
+        protected_blocks = intent.protected_prefix_tokens // manager.block_size
         by_id = {b.block_id: b for b in blocks}
         removed = [b for b in blocks if b.block_id not in retained_set]
         manager.req_to_blocks[request.request_id] = [by_id[i] for i in retained]
         request.effective_kv_len = result.new_effective_kv_len
         if request.request_id in manager.num_cached_block:
-            assert manager.num_cached_block[request.request_id] >= protected_blocks
             manager.num_cached_block[request.request_id] = protected_blocks
-        else:
-            assert protected_blocks == 0
         self.block_pool.free_blocks(reversed(removed))
         self.trace_request(
             "reclaim_commit",

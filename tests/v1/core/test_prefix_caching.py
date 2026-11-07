@@ -49,7 +49,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.kv_reclamation import ReclaimResult
+from vllm.v1.kv_reclamation import PolicyBinding, ReclaimResult, ReclamationConfig
 from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
@@ -369,6 +369,7 @@ def test_reclamation_deindexes_private_suffix_before_release_and_real_apc_hit(ke
     assert manager.allocate_slots(a, 96) is not None
     a.status = RequestStatus.RUNNING
     a.num_computed_tokens = a.effective_kv_len = 96
+    a.policy_binding = PolicyBinding(0, ReclamationConfig(min_keep_tokens=32))
     hits, hit_tokens, _ = manager.get_computed_blocks(b)
     assert hit_tokens == 32
     assert manager.allocate_slots(b, 16, hit_tokens, hits) is not None
@@ -417,7 +418,9 @@ def test_reclamation_deindexes_private_suffix_before_release_and_real_apc_hit(ke
     hits, hit_tokens, _ = manager.get_computed_blocks(c)
     assert hit_tokens == 32 and hits.get_block_ids()[0] == row[:2]
     retained = row[:2] + row[4:] if keep == 64 else row[:4]
-    manager.commit_reclamation(a, intent, ReclaimResult("A", keep, retained))
+    manager.commit_reclamations(
+        [(a, intent, ReclaimResult("A", keep, retained, a.policy_binding))]
+    )
     assert pool.get_num_free_blocks() == free_before + 2
     assert owner.num_cached_block["A"] == 2
     assert manager.get_block_ids("A")[0] == retained

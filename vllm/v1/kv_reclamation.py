@@ -221,23 +221,63 @@ def protected_reclaim_plan(
                     member_bytes,
                 )
             )
-    if not covering:
-        return ()
-    return (
-        min(
-            covering,
-            key=lambda c: (
-                -Fraction(
-                    c.keep_tokens - c.protected_prefix_tokens,
-                    max(1, c.logical_tokens - c.protected_prefix_tokens),
+
+    def ratio(candidate: ReclaimCandidate) -> Fraction:
+        return Fraction(
+            candidate.keep_tokens - candidate.protected_prefix_tokens,
+            max(1, candidate.logical_tokens - candidate.protected_prefix_tokens),
+        )
+
+    if covering:
+        return (
+            min(
+                covering,
+                key=lambda c: (
+                    -ratio(c),
+                    not c.zero_copy,
+                    c.copy_bytes,
+                    c.arrival_time,
+                    c.request_id,
                 ),
-                not c.zero_copy,
-                c.copy_bytes,
-                c.arrival_time,
-                c.request_id,
             ),
-        ),
-    )
+        )
+
+    best: tuple[ReclaimCandidate, ...] = ()
+    best_key = None
+    ordered = sorted(candidates, key=lambda c: (c.arrival_time, c.request_id))
+    for i, first in enumerate(ordered):
+        for second in ordered[i + 1 :]:
+            lower = max(1, shortfall - second.released_blocks)
+            upper = min(first.released_blocks, shortfall - 1)
+            for first_pages in range(lower, upper + 1):
+                pair = tuple(
+                    retarget_reclaim_candidate(
+                        c,
+                        min(
+                            c.source_effective_kv_len - 1,
+                            block_size * (len(c.source_block_ids) - pages),
+                        ),
+                        c.policy_binding.config if c.policy_binding else config,
+                        block_size,
+                        member_bytes,
+                    )
+                    for c, pages in (
+                        (first, first_pages),
+                        (second, shortfall - first_pages),
+                    )
+                )
+                ratios = [ratio(c) for c in pair]
+                key = (
+                    sum(c.released_blocks for c in pair) - shortfall,
+                    -min(ratios),
+                    abs(ratios[0] - ratios[1]),
+                    sum(not c.zero_copy for c in pair),
+                    sum(c.copy_bytes for c in pair),
+                    tuple((c.arrival_time, c.request_id) for c in pair),
+                )
+                if best_key is None or key < best_key:
+                    best, best_key = pair, key
+    return best
 
 
 def retry_reclaim_candidates(
