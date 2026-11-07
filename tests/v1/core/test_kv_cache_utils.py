@@ -3039,6 +3039,58 @@ def test_reclamation_protected_pair_is_bounded_balanced_and_deterministic(
         assert sum(c.released_blocks for c in plan) == shortfall
 
 
+@pytest.mark.parametrize("shortfall", [1, 4, 7])
+@pytest.mark.parametrize("headroom", [0, 1, 1000])
+def test_reclamation_protected_headroom_stays_with_hard_victims(shortfall, headroom):
+    """Soft capacity cannot add victims, bypass infeasibility or break either cap."""
+    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    candidates = []
+    for i in range(3):
+        source, logical, prefix = 257, 400, 16
+        floor = protected_reclaim_floor(source, logical, prefix, config)
+        candidates.append(
+            ReclaimCandidate(
+                str(i),
+                floor,
+                3,
+                0,
+                False,
+                float(i),
+                prefix,
+                source,
+                tuple(range(17)),
+                logical,
+            )
+        )
+    allocations = tuple(ReclaimAllocation(c.request_id, 1, 0) for c in candidates)
+    hard = protected_reclaim_plan(
+        candidates, shortfall, config, 16, 2, ReclaimRetry(0, allocations)
+    )
+    plan = protected_reclaim_plan(
+        candidates,
+        shortfall,
+        config,
+        16,
+        2,
+        ReclaimRetry(0, allocations, completion_headroom_blocks=headroom),
+    )
+    assert {c.request_id for c in plan} == {c.request_id for c in hard}
+    assert len(plan) <= 2
+    if not hard:
+        return
+    selected = [c for c in candidates if c.request_id in {p.request_id for p in hard}]
+    capacity = sum(
+        max(17 - (k + 1 + 15) // 16 for k in range(c.keep_tokens, 257))
+        for c in selected
+    )
+    assert sum(17 - (c.keep_tokens + 1 + 15) // 16 for c in plan) == min(
+        shortfall + headroom, capacity
+    )
+    for c in plan:
+        assert 5 * (257 - c.keep_tokens) <= 257 - 16
+        assert 2 * (c.keep_tokens - 16) >= 400 - 16
+
+
 @pytest.mark.parametrize(
     "shapes",
     [

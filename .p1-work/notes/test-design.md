@@ -187,3 +187,13 @@ usage 先诊断，不在没有有效同分错选证据时新增路由行为。
 - 设备证据：既有 Qwen3-8B TP2 单/双 victim、全 rank 延迟 completion、Graph 与改写复用；
   DP2 原小池必须在 abort 前输出，并由等待者改写回收页。延迟 probe 放在 reclaim 入口，
   同时覆盖 token compaction 与 whole-page remapping，不能因 zero-copy 跳过故障注入。
+
+## 2026-11-08：有界completion容量余量
+
+- 用途与I/O：Scheduler将post-forward已知prefill/下一decode的硬预算和有限输出
+  上限转换成页余量；纯计划函数仅扩展已经可行的1–2victim集合。
+- 风险：软预算引入第三victim、原硬缺口不可行却先删一部分、未来token进入L、
+  未计尾页、短输出过删、输出上限大于模型长度、合并后没有减少重复maintenance。
+- 最低层：扩展现有纯预算oracle和真实Pool Scheduler fixture；用公开schedule→
+  completion→commit行为检查连续decode不再每页回收、无抢占且等待者能完成。
+- GPU只验证受影响计划：既有TP2/Graph/双victim延迟/真实改写复用与DP2独立池。

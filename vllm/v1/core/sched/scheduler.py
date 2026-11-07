@@ -1285,6 +1285,7 @@ class Scheduler(SchedulerInterface):
         manager = self.kv_cache_manager.coordinator.single_type_managers[0]
         allocations: list[ReclaimAllocation] = []
         following: list[ReclaimAllocation] = []
+        completion_headroom = 0
         reached_requester = False
         budget = self.max_num_scheduled_tokens
         requests = self.running
@@ -1333,6 +1334,16 @@ class Scheduler(SchedulerInterface):
                 required += self.kv_cache_manager.watermark_blocks
             target = following if reached_requester else allocations
             target.append(ReclaimAllocation(request.request_id, tokens, required))
+            if full_prefill:
+                completion_limit = min(
+                    request.num_prompt_tokens + request.max_tokens - 1,
+                    self.max_model_len - 1,
+                )
+                remaining = max(0, completion_limit - computed - tokens)
+                # Upper-bound future page growth after any victim remapping.
+                completion_headroom += (remaining + self.block_size - 1) // (
+                    self.block_size
+                )
             if request is requester:
                 reached_requester = True
             if not full_prefill:
@@ -1345,6 +1356,7 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.block_pool.get_num_free_blocks(),
             tuple(allocations),
             tuple(following),
+            completion_headroom,
         )
 
     def _protected_prefill_reserved_blocks(self, request: Request) -> int:

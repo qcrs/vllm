@@ -174,6 +174,7 @@ class ReclaimRetry:
     free_blocks: int
     allocations: tuple[ReclaimAllocation, ...]
     following_allocations: tuple[ReclaimAllocation, ...] = ()
+    completion_headroom_blocks: int = 0
 
 
 def protected_reclaim_floor(
@@ -200,6 +201,42 @@ def protected_reclaim_plan(
     block_size: int,
     member_bytes: int,
     retry: ReclaimRetry | None = None,
+) -> tuple[ReclaimCandidate, ...]:
+    """Cover hard demand, then amortize within the same protected victims."""
+    plan = _protected_reclaim_plan(
+        candidates, shortfall, config, block_size, member_bytes, retry
+    )
+    if not plan or retry is None or retry.completion_headroom_blocks == 0:
+        return plan
+    chosen = {c.request_id for c in plan}
+    selected = [c for c in candidates if c.request_id in chosen]
+    allocations = {
+        a.request_id: a for a in (*retry.allocations, *retry.following_allocations)
+    }
+    capacity = 0
+    for candidate in selected:
+        allocation = allocations.get(
+            candidate.request_id, ReclaimAllocation(candidate.request_id, 0, 0)
+        )
+        capacity += (
+            len(candidate.source_block_ids)
+            - (candidate.keep_tokens + allocation.num_tokens + block_size - 1)
+            // block_size
+            + allocation.required_blocks
+        )
+    goal = min(shortfall + retry.completion_headroom_blocks, capacity)
+    return _protected_reclaim_plan(
+        selected, goal, config, block_size, member_bytes, retry
+    )
+
+
+def _protected_reclaim_plan(
+    candidates: list[ReclaimCandidate],
+    shortfall: int,
+    config: ReclamationConfig,
+    block_size: int,
+    member_bytes: int,
+    retry: ReclaimRetry | None,
 ) -> tuple[ReclaimCandidate, ...]:
     """Cover net demand, including victims' own post-reclaim allocations."""
     if shortfall <= 0:

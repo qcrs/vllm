@@ -6005,6 +6005,49 @@ def test_pressure_protected_reserves_already_admitted_prefill(pressure_scheduler
     assert c_completed and c.num_preemptions == a.num_preemptions == 0
 
 
+def test_pressure_protected_amortizes_decode_pages_until_completion(pressure_scheduler):
+    """One maintenance covers both bounded decodes without subsequent page misses."""
+    scheduler = pressure_scheduler(257, budget_mode="protected")
+    scheduler.max_num_scheduled_tokens = 2048
+    a = create_requests(1, num_tokens=2048, max_tokens=64, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    c = create_requests(1, num_tokens=2048, max_tokens=64, req_ids=["C"])[0]
+    scheduler.add_request(c)
+    maintenance = 0
+    for _ in range(70):
+        output = scheduler.schedule()
+        assert not output.preempted_req_ids
+        maintenance += bool(output.reclaim_requests)
+        for intent in output.reclaim_requests:
+            assert 2 * intent.target_keep_tokens >= a.num_computed_tokens
+            assert 5 * (intent.source_effective_kv_len - intent.target_keep_tokens) <= (
+                intent.source_effective_kv_len
+            )
+        complete_pressure_step(scheduler, output)
+        if a.is_finished() and c.is_finished():
+            break
+    assert a.is_finished() and c.is_finished()
+    assert maintenance == 1
+    assert a.num_preemptions == c.num_preemptions == 0
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 256
+
+
+@pytest.mark.parametrize("max_tokens", [1, 128, 100000])
+def test_pressure_protected_headroom_uses_bounded_uncomputed_output(
+    pressure_scheduler, max_tokens
+):
+    """Future output sizes capacity only; it never changes the logical KV floor."""
+    scheduler = pressure_scheduler(65, budget_mode="protected")
+    request = create_requests(1, num_tokens=256, max_tokens=max_tokens)[0]
+    scheduler.add_request(request)
+    retry = scheduler._reclaim_retry({}, request, None, 0, full_prefill=True)
+    assert retry is not None
+    limit = min(256 + max_tokens - 1, scheduler.max_model_len - 1)
+    assert retry.completion_headroom_blocks == (max(0, limit - 256) + 15) // 16
+    assert request.num_computed_tokens == request.effective_kv_len == 0
+
+
 @pytest.mark.parametrize("invalid_second", [False, True])
 def test_pressure_protected_pair_commits_only_after_all_results_validate(
     pressure_scheduler, invalid_second
@@ -6025,7 +6068,7 @@ def test_pressure_protected_pair_commits_only_after_all_results_validate(
         sum(
             len(i.source_block_ids) - (i.target_keep_tokens + 15) // 16 for i in intents
         )
-        == 3
+        == 4
     )
     manager = scheduler.kv_cache_manager
     before = manager.block_pool.get_num_free_blocks()
@@ -6056,8 +6099,8 @@ def test_pressure_protected_pair_commits_only_after_all_results_validate(
         assert a.effective_kv_len == b.effective_kv_len == 129
     else:
         complete_pressure_step(scheduler, output)
-        assert manager.block_pool.get_num_free_blocks() == before + 3
-        assert sorted(r.effective_kv_len for r in (a, b)) == [111, 113]
+        assert manager.block_pool.get_num_free_blocks() == before + 4
+        assert sorted(r.effective_kv_len for r in (a, b)) == [111, 111]
         assert a.num_computed_tokens == b.num_computed_tokens == 129
 
 
