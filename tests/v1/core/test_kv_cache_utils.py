@@ -2986,7 +2986,14 @@ def test_reclamation_protected_floor_and_exact_page_target(source, logical, pref
         legal = [k for k in range(floor, source) if len(row) - (k + 15) // 16 >= target]
         assert bool(plan) == bool(legal)
         if legal:
-            assert plan[0].keep_tokens == max(legal)
+            largest = max(legal)
+            aligned = [
+                k
+                for k in legal
+                if largest - k < 16
+                and (source - k + min(k, max(prefix, config.sink_tokens))) % 16 == 0
+            ]
+            assert plan[0].keep_tokens == max(aligned or [largest])
             assert plan[0].released_blocks == target
 
 
@@ -3041,8 +3048,9 @@ def test_reclamation_protected_pair_is_bounded_balanced_and_deterministic(
         [(129, 240, 0), (400, 799, 16), (513, 999, 32)],
     ],
 )
-def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes):
-    """Intersection selection must match every legal page split, including bounds."""
+@pytest.mark.parametrize("next_tokens", [0, 1])
+def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes, next_tokens):
+    """Independent token enumeration checks net capacity, remapping and fairness."""
     config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
     candidates = []
     for i, (source, logical, prefix) in enumerate(shapes):
@@ -3066,28 +3074,81 @@ def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes):
     def fairness(ratios):
         return -min(ratios), abs(ratios[0] - ratios[1])
 
-    capacity = max(c.released_blocks for c in candidates)
+    allocations = {
+        c.request_id: ReclaimAllocation(
+            c.request_id,
+            next_tokens,
+            (c.source_effective_kv_len + next_tokens + 15) // 16
+            - len(c.source_block_ids),
+        )
+        for c in candidates
+    }
+    retry = ReclaimRetry(0, tuple(allocations.values()))
+
+    def retained(candidate, credit):
+        allocation = allocations[candidate.request_id]
+        legal = [
+            k
+            for k in range(candidate.keep_tokens, candidate.source_effective_kv_len)
+            if len(candidate.source_block_ids) - (k + 15) // 16 >= 1
+            and len(candidate.source_block_ids)
+            + allocation.required_blocks
+            - (k + next_tokens + 15) // 16
+            >= credit
+        ]
+        if not legal:
+            return None
+        largest = max(legal)
+        mapped = [
+            k
+            for k in legal
+            if largest - k < 16
+            and (k + next_tokens + 15) // 16 == (largest + next_tokens + 15) // 16
+            and (
+                candidate.source_effective_kv_len
+                - k
+                + max(candidate.protected_prefix_tokens, config.sink_tokens)
+            )
+            % 16
+            == 0
+        ]
+        return max(mapped or [largest])
+
+    capacity = max(
+        len(c.source_block_ids)
+        + allocations[c.request_id].required_blocks
+        - (c.keep_tokens + next_tokens + 15) // 16
+        for c in candidates
+    )
     for shortfall in range(capacity + 1, 2 * capacity + 2):
         legal = []
         for first, second in combinations(candidates, 2):
-            for first_pages in range(1, first.released_blocks + 1):
+            for first_pages in range(1, shortfall):
                 second_pages = shortfall - first_pages
-                if not 1 <= second_pages <= second.released_blocks:
+                keeps = [retained(first, first_pages), retained(second, second_pages)]
+                if any(k is None for k in keeps):
                     continue
                 ratios = [
                     Fraction(
-                        16 * (len(c.source_block_ids) - pages)
-                        - c.protected_prefix_tokens,
+                        k - c.protected_prefix_tokens,
                         c.logical_tokens - c.protected_prefix_tokens,
                     )
-                    for c, pages in ((first, first_pages), (second, second_pages))
+                    for c, k in zip((first, second), keeps)
                 ]
                 legal.append(fairness(ratios))
-        plan = protected_reclaim_plan(candidates, shortfall, config, 16, 2)
+        plan = protected_reclaim_plan(candidates, shortfall, config, 16, 2, retry)
         assert bool(plan) == bool(legal)
         if plan:
             assert len(plan) == 2
-            assert sum(c.released_blocks for c in plan) == shortfall
+            assert (
+                sum(
+                    len(c.source_block_ids)
+                    + allocations[c.request_id].required_blocks
+                    - (c.keep_tokens + next_tokens + 15) // 16
+                    for c in plan
+                )
+                == shortfall
+            )
             assert fairness(
                 [
                     Fraction(

@@ -174,3 +174,16 @@ usage 先诊断，不在没有有效同分错选证据时新增路由行为。
 双 victim 的解析选择用独立穷举全部合法页分配作 oracle，覆盖不同 E/L/P、尾页、
 交点两侧和边界，验证最小逻辑保留率及平衡顺序不变。此测试在纯 helper 层捕获
 消除逐页枚举时可能遗漏最优分配的错误；真实执行仍由既有 TP2 lifecycle 验证。
+
+## Protected 进展与整页重映射修正（2026-11-07）
+
+- 用途与 I/O：在真实 miss 时用完整已知 prefill/下一步 decode 的净页需求选择至多两个
+  victim；已经 admission 的 prefill 余量不能被其他 decode 消耗。未计算 prompt 不进入 L。
+- 失败模式：只释放眼前一页仍不能启动等待者；首 chunk 能 fit 但完整 prefill 中途抢占；
+  victim 自己的尾页吞回容量；APC 共享页重复计数；整页映射使 pair 的公平性交点分段。
+- 最低有效层：现有 Scheduler/Pool suite 检查 abort 前进展、完整 chunked prefill、
+  无可行计划时无 mutation；真实 FullAttention/APC 检查物理域与 reservation 计数。
+  纯 helper 用独立逐 token 枚举 oracle 核对净容量、公平性和页边界。
+- 设备证据：既有 Qwen3-8B TP2 单/双 victim、全 rank 延迟 completion、Graph 与改写复用；
+  DP2 原小池必须在 abort 前输出，并由等待者改写回收页。延迟 probe 放在 reclaim 入口，
+  同时覆盖 token compaction 与 whole-page remapping，不能因 zero-copy 跳过故障注入。

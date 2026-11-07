@@ -457,6 +457,10 @@ class KVCacheManager:
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
+            if self.enable_kv_reclamation:
+                full_num_tokens += (
+                    request.effective_kv_len - request.num_computed_tokens
+                )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
@@ -469,14 +473,22 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+            if self.enable_kv_reclamation:
+                self.last_allocation_shortfall = max(
+                    0, required_blocks - available_blocks
+                )
+                self.last_allocation_capacity = (required_blocks, available_blocks)
+            if required_blocks > available_blocks:
                 if self.trace is not None:
                     self.trace_request(
                         "allocation_miss",
                         request,
                         q=num_new_tokens,
                         required=required_blocks,
-                        available=self.block_pool.get_num_free_blocks(),
+                        available=available_blocks,
+                        reserved=reserved_blocks,
+                        watermark=watermark_blocks,
                         reason="full_sequence_reservation",
                     )
                 return None

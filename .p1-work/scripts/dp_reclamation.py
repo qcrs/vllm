@@ -160,8 +160,7 @@ async def exercise(args, run):
             await until(
                 lambda: any(e["event"] == "reclaim_commit" for e in lines(trace0))
             )
-            if args.budget_mode == "fixed":
-                await until(first["C"].is_set)
+            await until(first["C"].is_set)
         tasks.append(asyncio.create_task(generate("B", 128, 128, 1)))
         await until(first["B"].is_set)
         await until(lambda: token_counts.get("B", 0) >= 16)
@@ -202,15 +201,8 @@ async def exercise(args, run):
                 for rid, pages in payload[0]["rewritten_by_request"].items()
                 if rid.startswith("C-")
             }
-            if args.budget_mode == "fixed":
-                assert reused_by_c and all(reused_by_c.values())
-            else:
-                reused_by_a = {
-                    rid: pages
-                    for rid, pages in payload[0]["rewritten_by_request"].items()
-                    if rid.startswith("A-")
-                }
-                assert reused_by_a and all(reused_by_a.values())
+            assert c_started_before_abort
+            assert reused_by_c and all(reused_by_c.values())
         assert not payload[1]["released"]
         assert payload[1]["counts"]["peer_retained_forward"] > 1
         peer_after_abort = [

@@ -450,6 +450,11 @@ class Scheduler(SchedulerInterface):
         )
         self.reclaim_retry_pending = False
         reclaim_plan: tuple[ReclaimCandidate, ...] = ()
+        protected_admission = (
+            self.reclamation_config is not None
+            and self.reclamation_config.pressure
+            and self.reclamation_config.budget_mode == "protected"
+        )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -591,6 +596,11 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        reserved_blocks=(
+                            self._protected_prefill_reserved_blocks(request)
+                            if protected_admission
+                            else 0
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -968,6 +978,20 @@ class Scheduler(SchedulerInterface):
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
+                elif protected_admission:
+                    retry = self._reclaim_retry(
+                        num_scheduled_tokens,
+                        request,
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        full_prefill=True,
+                    )
+                    assert retry is not None
+                    reserved_blocks = sum(
+                        a.required_blocks
+                        for a in retry.allocations
+                        if a.request_id != request_id
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -978,7 +1002,9 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl or protected_admission
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
@@ -1248,6 +1274,8 @@ class Scheduler(SchedulerInterface):
         requester: Request,
         new_computed_blocks: KVCacheBlocks | None,
         num_new_computed_tokens: int,
+        *,
+        full_prefill: bool = False,
     ) -> ReclaimRetry | None:
         """Project continuing requests through one synchronous retry pass.
 
@@ -1269,10 +1297,11 @@ class Scheduler(SchedulerInterface):
             cached = num_new_computed_tokens if request is requester else 0
             computed = request.num_computed_tokens + q + cached
             tokens = max(1, request.num_tokens - computed)
-            threshold = self.scheduler_config.long_prefill_token_threshold
-            if threshold > 0:
-                tokens = min(tokens, threshold)
-            tokens = min(tokens, budget)
+            if not full_prefill:
+                threshold = self.scheduler_config.long_prefill_token_threshold
+                if threshold > 0:
+                    tokens = min(tokens, threshold)
+                tokens = min(tokens, budget)
             if request.status == RequestStatus.RUNNING:
                 tokens = min(
                     tokens,
@@ -1296,21 +1325,42 @@ class Scheduler(SchedulerInterface):
                 physical,
                 physical + tokens,
             )
-            if request is requester and request.status != RequestStatus.RUNNING:
+            if (
+                request is requester
+                and request.status != RequestStatus.RUNNING
+                and (self.running or not full_prefill)
+            ):
                 required += self.kv_cache_manager.watermark_blocks
             target = following if reached_requester else allocations
             target.append(ReclaimAllocation(request.request_id, tokens, required))
             if request is requester:
                 reached_requester = True
-            budget -= tokens
-            if budget == 0:
-                break
+            if not full_prefill:
+                budget -= tokens
+                if budget == 0:
+                    break
         if not reached_requester:
             return None
         return ReclaimRetry(
             self.kv_cache_manager.block_pool.get_num_free_blocks(),
             tuple(allocations),
             tuple(following),
+        )
+
+    def _protected_prefill_reserved_blocks(self, request: Request) -> int:
+        """Keep decodes from consuming an admitted prefill's remaining capacity."""
+        manager = self.kv_cache_manager.coordinator.single_type_managers[0]
+        return sum(
+            manager.get_num_blocks_to_allocate(
+                other.request_id,
+                other.effective_kv_len + other.num_tokens - other.num_computed_tokens,
+                (),
+                other.effective_kv_len,
+                other.effective_kv_len,
+                other.effective_kv_len + other.num_tokens - other.num_computed_tokens,
+            )
+            for other in self.running
+            if other is not request and other.num_tokens - other.num_computed_tokens > 1
         )
 
     def _select_reclaim_plan(
@@ -1403,8 +1453,28 @@ class Scheduler(SchedulerInterface):
         )
         shortfall = self.kv_cache_manager.last_allocation_shortfall
         if config.budget_mode == "protected":
+            retry = (
+                self._reclaim_retry(
+                    scheduled,
+                    requester,
+                    new_computed_blocks,
+                    num_new_computed_tokens,
+                    full_prefill=True,
+                )
+                if requester is not None
+                else None
+            )
+            if retry is not None:
+                shortfall = max(
+                    shortfall,
+                    sum(
+                        a.required_blocks
+                        for a in (*retry.allocations, *retry.following_allocations)
+                    )
+                    - retry.free_blocks,
+                )
             plan = protected_reclaim_plan(
-                candidates, shortfall, config, self.block_size, member_bytes
+                candidates, shortfall, config, self.block_size, member_bytes, retry
             )
             if self.kv_cache_manager.trace is not None:
                 from dataclasses import asdict
@@ -1413,6 +1483,7 @@ class Scheduler(SchedulerInterface):
                     "protected_plan",
                     requester=requester.request_id if requester else None,
                     shortfall=shortfall,
+                    retry_forecast=asdict(retry) if retry is not None else None,
                     candidates=[asdict(c) for c in candidates],
                     plan=[asdict(c) for c in plan],
                 )

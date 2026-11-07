@@ -199,28 +199,63 @@ def protected_reclaim_plan(
     config: ReclamationConfig,
     block_size: int,
     member_bytes: int,
+    retry: ReclaimRetry | None = None,
 ) -> tuple[ReclaimCandidate, ...]:
-    """Cover a real miss with the largest legal K and highest private retention."""
+    """Cover net demand, including victims' own post-reclaim allocations."""
     if shortfall <= 0:
         return ()
-    covering = []
-    for candidate in candidates:
+    allocations = (
+        {a.request_id: a for a in (*retry.allocations, *retry.following_allocations)}
+        if retry is not None
+        else {}
+    )
+
+    def demand(candidate: ReclaimCandidate) -> ReclaimAllocation:
+        return allocations.get(
+            candidate.request_id, ReclaimAllocation(candidate.request_id, 0, 0)
+        )
+
+    def capacity(candidate: ReclaimCandidate) -> int:
+        allocation = demand(candidate)
+        return (
+            len(candidate.source_block_ids)
+            - (candidate.keep_tokens + allocation.num_tokens + block_size - 1)
+            // block_size
+            + allocation.required_blocks
+        )
+
+    def target(candidate: ReclaimCandidate, pages: int) -> ReclaimCandidate | None:
+        allocation = demand(candidate)
+        source_pages = len(candidate.source_block_ids)
         keep = min(
             candidate.source_effective_kv_len - 1,
-            block_size * (len(candidate.source_block_ids) - shortfall),
+            block_size * (source_pages - 1),
+            block_size * (source_pages + allocation.required_blocks - pages)
+            - allocation.num_tokens,
         )
-        if keep >= candidate.keep_tokens:
-            covering.append(
-                retarget_reclaim_candidate(
-                    candidate,
-                    keep,
-                    candidate.policy_binding.config
-                    if candidate.policy_binding is not None
-                    else config,
-                    block_size,
-                    member_bytes,
-                )
+        if keep < candidate.keep_tokens:
+            return None
+        policy = candidate.policy_binding.config if candidate.policy_binding else config
+        if policy.policy == "sink_recent":
+            prefix, _ = sink_recent_ranges(
+                candidate.source_effective_kv_len,
+                keep,
+                policy.sink_tokens,
+                candidate.protected_prefix_tokens,
             )
+            aligned = (
+                keep - (keep - candidate.source_effective_kv_len - prefix) % block_size
+            )
+            if (
+                prefix % block_size == 0
+                and aligned >= max(prefix, candidate.keep_tokens)
+                and (aligned + allocation.num_tokens + block_size - 1) // block_size
+                == (keep + allocation.num_tokens + block_size - 1) // block_size
+            ):
+                keep = aligned
+        return retarget_reclaim_candidate(
+            candidate, keep, policy, block_size, member_bytes
+        )
 
     def ratio(candidate: ReclaimCandidate) -> Fraction:
         return Fraction(
@@ -228,6 +263,7 @@ def protected_reclaim_plan(
             max(1, candidate.logical_tokens - candidate.protected_prefix_tokens),
         )
 
+    covering = [c for candidate in candidates if (c := target(candidate, shortfall))]
     if covering:
         return (
             min(
@@ -247,48 +283,30 @@ def protected_reclaim_plan(
     ordered = sorted(candidates, key=lambda c: (c.arrival_time, c.request_id))
     for i, first in enumerate(ordered):
         for second in ordered[i + 1 :]:
-            lower = max(1, shortfall - second.released_blocks)
-            upper = min(first.released_blocks, shortfall - 1)
+            lower = max(1, shortfall - capacity(second))
+            upper = min(capacity(first), shortfall - 1)
             if lower > upper:
                 continue
-            first_logical = max(1, first.logical_tokens - first.protected_prefix_tokens)
-            second_logical = max(
-                1, second.logical_tokens - second.protected_prefix_tokens
-            )
-            first_private = (
-                block_size * len(first.source_block_ids) - first.protected_prefix_tokens
-            )
-            second_private = (
-                block_size * (len(second.source_block_ids) - shortfall)
-                - second.protected_prefix_tokens
-            )
-            # The two retention ratios are linear with opposite slopes. The
-            # maximum minimum is adjacent to their intersection or a bound.
-            crossing = (
-                first_private * second_logical - second_private * first_logical
-            ) // (block_size * (first_logical + second_logical))
-            for first_pages in sorted(
-                {max(lower, min(upper, p)) for p in (crossing, crossing + 1)}
-            ):
-                pair = tuple(
-                    retarget_reclaim_candidate(
-                        c,
-                        min(
-                            c.source_effective_kv_len - 1,
-                            block_size * (len(c.source_block_ids) - pages),
-                        ),
-                        c.policy_binding.config if c.policy_binding else config,
-                        block_size,
-                        member_bytes,
-                    )
-                    for c, pages in (
-                        (first, first_pages),
-                        (second, shortfall - first_pages),
-                    )
-                )
+            # Page remapping makes the ratios piecewise, but still monotone
+            # with opposite slopes. Find the crossing without scanning pages.
+            left, right = lower, upper
+            while left < right:
+                middle = (left + right) // 2
+                a = target(first, middle)
+                b = target(second, shortfall - middle)
+                assert a is not None and b is not None
+                if ratio(a) > ratio(b):
+                    left = middle + 1
+                else:
+                    right = middle
+            for first_pages in sorted({max(lower, left - 1), left}):
+                a = target(first, first_pages)
+                b = target(second, shortfall - first_pages)
+                if a is None or b is None:
+                    continue
+                pair = (a, b)
                 ratios = [ratio(c) for c in pair]
                 key = (
-                    sum(c.released_blocks for c in pair) - shortfall,
                     -min(ratios),
                     abs(ratios[0] - ratios[1]),
                     sum(not c.zero_copy for c in pair),

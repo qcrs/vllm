@@ -5935,6 +5935,76 @@ def test_pressure_protected_repeated_reclaim_stops_at_logical_floor(pressure_sch
     assert manager.get_block_ids("A") == row
 
 
+def test_pressure_protected_waiter_uses_reclaimed_capacity_before_abort(
+    pressure_scheduler,
+):
+    """A decode tail must not repeatedly consume the waiting request's page."""
+    scheduler = pressure_scheduler(33, budget_mode="protected")
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    c = create_requests(1, num_tokens=256, max_tokens=3, req_ids=["C"])[0]
+    scheduler.add_request(c)
+    first = scheduler.schedule()
+    assert first.reclaim_requests
+    complete_pressure_step(scheduler, first)
+    retry = scheduler.schedule()
+    assert "C" in retry.num_scheduled_tokens
+    assert not retry.reclaim_requests and not retry.preempted_req_ids
+    complete_pressure_step(scheduler, retry)
+    for _ in range(6):
+        output = scheduler.schedule()
+        assert not output.preempted_req_ids
+        complete_pressure_step(scheduler, output)
+        if c.is_finished():
+            break
+    assert c.is_finished() and not a.is_finished()
+    assert a.num_preemptions == c.num_preemptions == 0
+
+
+def test_pressure_protected_rejects_partial_admission_without_full_capacity(
+    pressure_scheduler,
+):
+    """A first chunk fitting must not admit an unfinishable long prefill."""
+    scheduler = pressure_scheduler(25, budget_mode="protected")
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    scheduler.max_num_scheduled_tokens = 64
+    c = create_requests(1, num_tokens=256, req_ids=["C"])[0]
+    scheduler.add_request(c)
+    for _ in range(4):
+        output = scheduler.schedule()
+        assert "C" not in output.num_scheduled_tokens
+        assert not output.reclaim_requests and not output.preempted_req_ids
+        complete_pressure_step(scheduler, output)
+    assert c.num_computed_tokens == c.effective_kv_len == 0
+    assert a.num_preemptions == 0
+
+
+def test_pressure_protected_reserves_already_admitted_prefill(pressure_scheduler):
+    """New admissions cannot consume capacity owed to an earlier chunked prefill."""
+    scheduler = pressure_scheduler(34, budget_mode="protected")
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    scheduler.max_num_scheduled_tokens = 64
+    c, d = create_requests(2, num_tokens=256, max_tokens=3, req_ids=["C", "D"])
+    scheduler.add_request(c)
+    scheduler.add_request(d)
+    c_completed = False
+    for _ in range(12):
+        output = scheduler.schedule()
+        assert not output.preempted_req_ids
+        if not c_completed:
+            assert "D" not in output.num_scheduled_tokens
+        complete_pressure_step(scheduler, output)
+        c_completed |= c.is_finished()
+        if c_completed:
+            break
+    assert c_completed and c.num_preemptions == a.num_preemptions == 0
+
+
 @pytest.mark.parametrize("invalid_second", [False, True])
 def test_pressure_protected_pair_commits_only_after_all_results_validate(
     pressure_scheduler, invalid_second
@@ -5987,7 +6057,7 @@ def test_pressure_protected_pair_commits_only_after_all_results_validate(
     else:
         complete_pressure_step(scheduler, output)
         assert manager.block_pool.get_num_free_blocks() == before + 3
-        assert sorted(r.effective_kv_len for r in (a, b)) == [112, 128]
+        assert sorted(r.effective_kv_len for r in (a, b)) == [111, 113]
         assert a.num_computed_tokens == b.num_computed_tokens == 129
 
 

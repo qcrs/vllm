@@ -147,16 +147,6 @@ class P1TPWorker:
         def compact(row, keep, **kwargs):
             state["pending"][-1]["compacted"] = True
             state["pending"][-1]["keep"] = keep.cpu().tolist()
-            if rank == options["delay_rank"] and state["number"] == options.get(
-                "delay_number", 1
-            ):
-                (directory / f"delay-start-{state['number']}").write_text(
-                    str(time.monotonic_ns())
-                )
-                time.sleep(options["delay_s"])
-                (directory / f"delay-end-{state['number']}").write_text(
-                    str(time.monotonic_ns())
-                )
             if rank == options["fail_rank"]:
                 (directory / "injected-failure").write_text(str(time.monotonic_ns()))
                 raise RuntimeError("P1 injected non-output-rank compaction failure")
@@ -206,6 +196,16 @@ class P1TPWorker:
             if isinstance(event, EventProbe):
                 event = event.event
             worker.local_reclaim_done = EventProbe(event, directory, state["number"])
+            if rank == options["delay_rank"] and state["number"] == options.get(
+                "delay_number", 1
+            ):
+                (directory / f"delay-start-{state['number']}").write_text(
+                    str(time.monotonic_ns())
+                )
+                time.sleep(options["delay_s"])
+                (directory / f"delay-end-{state['number']}").write_text(
+                    str(time.monotonic_ns())
+                )
             result = original_reclaim(intent, tables)
             state["pending"][-1]["result"] = result
             return result

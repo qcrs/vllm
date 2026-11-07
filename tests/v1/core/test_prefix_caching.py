@@ -351,6 +351,78 @@ def test_prefill(hash_fn):
     )
 
 
+def test_reclamation_full_admission_counts_apc_and_other_reservations():
+    """A cached prefix is counted once; a failed full admission changes no rows."""
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 9),
+        max_model_len=256,
+        enable_caching=True,
+        enable_kv_reclamation=True,
+        hash_block_size=16,
+    )
+    a = make_request("A", [1] * 32 + [2] * 64, 16, sha256)
+    assert manager.allocate_slots(a, 96) is not None
+    a.num_computed_tokens = a.effective_kv_len = 96
+    b = make_request("B", [1] * 32 + [3] * 32, 16, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(b)
+    assert hit_tokens == 32
+    free = manager.block_pool.get_num_free_blocks()
+    refs = [block.ref_cnt for block in hits.blocks[0]]
+    assert (
+        manager.allocate_slots(
+            b, 16, hit_tokens, hits, full_sequence_must_fit=True, reserved_blocks=1
+        )
+        is None
+    )
+    assert manager.last_allocation_capacity == (2, 1)
+    assert manager.last_allocation_shortfall == 1
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert [block.ref_cnt for block in hits.blocks[0]] == refs
+    assert not manager.get_block_ids("B")[0]
+    assert (
+        manager.allocate_slots(b, 16, hit_tokens, hits, full_sequence_must_fit=True)
+        is not None
+    )
+    assert len(manager.get_block_ids("B")[0]) == 3
+
+
+def test_reclamation_full_admission_uses_physical_retained_context():
+    """A lossy decode needs space for E+1, rather than its logical C+1."""
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 9),
+        max_model_len=256,
+        enable_caching=False,
+        enable_kv_reclamation=True,
+        hash_block_size=16,
+    )
+    a = make_request("A", [1] * 96, 16, sha256)
+    assert manager.allocate_slots(a, 96) is not None
+    a.status = RequestStatus.RUNNING
+    a.num_computed_tokens = a.effective_kv_len = 96
+    a.policy_binding = PolicyBinding(0, ReclamationConfig(min_keep_tokens=32))
+    scheduler = SimpleNamespace(
+        reclamation_config=object(), block_size=16, kv_cache_manager=manager
+    )
+    intent = Scheduler.make_reclaim_request(
+        scheduler, a, SimpleNamespace(num_scheduled_tokens={}), 64
+    )
+    manager.commit_reclamations(
+        [
+            (
+                a,
+                intent,
+                ReclaimResult("A", 64, intent.source_block_ids[:4], a.policy_binding),
+            )
+        ]
+    )
+    b = make_request("B", [2] * 48, 16, sha256)
+    assert manager.allocate_slots(b, 48) is not None
+    assert manager.block_pool.get_num_free_blocks() == 1
+    a.append_output_token_ids(2)
+    assert manager.allocate_slots(a, 1, full_sequence_must_fit=True) is not None
+    assert len(manager.get_block_ids("A")[0]) == 5
+
+
 @pytest.mark.parametrize("keep", [63, 64])
 def test_reclamation_deindexes_private_suffix_before_release_and_real_apc_hit(keep):
     """Deindex all aliases before mutation, then reuse only unshared pages."""
