@@ -5893,3 +5893,38 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_pressure_protected_repeated_reclaim_stops_at_logical_floor(pressure_scheduler):
+    """Repeated real Pool commits keep L while bounding each deletion and total loss."""
+    scheduler = pressure_scheduler(40, budget_mode="protected")
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    manager = scheduler.kv_cache_manager
+    reclaimed = 0
+    while True:
+        manager.last_allocation_shortfall = 1
+        selected = scheduler._select_reclaim_candidate({})
+        if selected is None:
+            break
+        request, candidate = selected
+        before = request.effective_kv_len
+        free = manager.block_pool.get_num_free_blocks()
+        output = SchedulerOutput.make_empty()
+        output.reclaim_request = scheduler.make_reclaim_request(
+            request, output, candidate.keep_tokens
+        )
+        complete_pressure_step(scheduler, output)
+        assert 5 * (before - request.effective_kv_len) <= before
+        assert 2 * request.effective_kv_len >= request.num_computed_tokens == 256
+        assert (
+            manager.block_pool.get_num_free_blocks() == free + candidate.released_blocks
+        )
+        reclaimed += 1
+    assert reclaimed == 8
+    assert a.effective_kv_len == 128
+    row = manager.get_block_ids("A")
+    manager.last_allocation_shortfall = 100
+    assert scheduler._select_reclaim_candidate({}) is None
+    assert manager.get_block_ids("A") == row

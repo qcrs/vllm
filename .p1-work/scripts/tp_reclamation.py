@@ -20,6 +20,8 @@ from vllm.v1.kv_reclamation import (
     ReclaimAllocation,
     ReclaimCandidate,
     ReclaimRetry,
+    protected_reclaim_floor,
+    protected_reclaim_plan,
     retry_reclaim_candidates,
     sink_recent_ranges,
 )
@@ -46,6 +48,7 @@ def main():
     parser.add_argument("--worker-cpus", nargs="+", type=int)
     parser.add_argument("--demand-pages", type=int)
     parser.add_argument("--retry-tail", action="store_true")
+    parser.add_argument("--protected", action="store_true")
     args = parser.parse_args()
     if args.retry_tail and args.demand_pages is None:
         parser.error("--retry-tail requires --demand-pages")
@@ -99,6 +102,7 @@ def main():
         additional_config={
             "kv_reclamation": {
                 "min_keep_tokens": 32,
+                "budget_mode": "protected" if args.protected else "fixed",
                 "policy": args.policy,
                 "stats_path": os.environ.get("P1_STATS"),
             }
@@ -247,6 +251,33 @@ def main():
                         16,
                         1,
                     )[0].keep_tokens
+            if args.protected:
+                assert args.demand_pages is not None
+                source = request.effective_kv_len + output.num_scheduled_tokens.get(
+                    request.request_id, 0
+                )
+                logical = request.num_computed_tokens
+                config = request.policy_binding.config
+                floor = protected_reclaim_floor(source, logical, 0, config)
+                row = tuple(manager.get_block_ids(request.request_id)[0])
+                candidate = ReclaimCandidate(
+                    request.request_id,
+                    floor,
+                    len(row) - (floor + 15) // 16,
+                    0,
+                    False,
+                    request.arrival_time,
+                    0,
+                    source,
+                    row,
+                    logical,
+                    policy_binding=request.policy_binding,
+                )
+                plan = protected_reclaim_plan(
+                    [candidate], args.demand_pages, config, 16, 1
+                )
+                assert len(plan) == 1
+                keep = plan[0].keep_tokens
             output.reclaim_request = scheduler.make_reclaim_request(
                 request, output, keep
             )

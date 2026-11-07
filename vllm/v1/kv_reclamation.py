@@ -3,6 +3,7 @@
 """Physical KV reclamation contracts shared by scheduler and worker."""
 
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from functools import cmp_to_key
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,7 @@ class ReclamationConfig:
             "retry",
             "retry_pass",
             "prefill_fixed",
+            "protected",
         ):
             raise ValueError("Unknown KV reclamation budget mode")
         if self.policy not in ("full", "sink_recent", "random", "triattention"):
@@ -172,6 +174,70 @@ class ReclaimRetry:
     free_blocks: int
     allocations: tuple[ReclaimAllocation, ...]
     following_allocations: tuple[ReclaimAllocation, ...] = ()
+
+
+def protected_reclaim_floor(
+    source: int, logical: int, prefix: int, config: ReclamationConfig
+) -> int:
+    """Keep the legacy E-domain floor, at least 80% of E and 50% of L privately."""
+    private = source - prefix
+    return max(
+        prefix
+        + max(
+            config.min_keep_tokens,
+            config.recent_tokens + max(0, config.sink_tokens - prefix),
+            int(config.retention * private),
+        ),
+        prefix + (4 * private + 4) // 5,
+        prefix + (max(0, logical - prefix) + 1) // 2,
+    )
+
+
+def protected_reclaim_plan(
+    candidates: list[ReclaimCandidate],
+    shortfall: int,
+    config: ReclamationConfig,
+    block_size: int,
+    member_bytes: int,
+) -> tuple[ReclaimCandidate, ...]:
+    """Cover a real miss with the largest legal K and highest private retention."""
+    if shortfall <= 0:
+        return ()
+    covering = []
+    for candidate in candidates:
+        keep = min(
+            candidate.source_effective_kv_len - 1,
+            block_size * (len(candidate.source_block_ids) - shortfall),
+        )
+        if keep >= candidate.keep_tokens:
+            covering.append(
+                retarget_reclaim_candidate(
+                    candidate,
+                    keep,
+                    candidate.policy_binding.config
+                    if candidate.policy_binding is not None
+                    else config,
+                    block_size,
+                    member_bytes,
+                )
+            )
+    if not covering:
+        return ()
+    return (
+        min(
+            covering,
+            key=lambda c: (
+                -Fraction(
+                    c.keep_tokens - c.protected_prefix_tokens,
+                    max(1, c.logical_tokens - c.protected_prefix_tokens),
+                ),
+                not c.zero_copy,
+                c.copy_bytes,
+                c.arrival_time,
+                c.request_id,
+            ),
+        ),
+    )
 
 
 def retry_reclaim_candidates(

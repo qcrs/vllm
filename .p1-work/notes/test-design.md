@@ -160,3 +160,13 @@ abort A沿原affinity发送，逐forward核对B的128-token前缀KV不变。nati
 - I/O contract：读取同一 Scheduler post-forward 逻辑进度与已知请求历史；输出合法候选 K，仍受请求 pin 的 retention／保护区／min_keep 约束。fixed 默认及其他实验模式保留。
 - 主要失败：只保当前 requester 却让后方 prefill 进入抢占重算；用初始为 False 的 `is_prefill_chunk` 漏掉 waiting；误把已调度完的 prefill 或已结束请求当作积压；漏掉 output history 的重算。
 - 最低有效验证：扩展现有 Scheduler／真实 Pool 用例，检查 running／waiting prefill、post-forward 完成转 decode、abort 与 preempt 重算；Worker 完成仍用 CPU result，另用一次真实 Qwen3-8B TP2 诊断和有限正式 A/B 验证 Runtime 与用户指标。原 payload／全 rank completion 协议未改，不重跑旧故障矩阵。
+
+## 2026-11-07 protected Controller 与有序批次
+
+模块为 allocation miss 后的有界回收决策和 completion→commit/free。输入为同一
+调度边界的 E/L/P、B、真实缺口 D 与请求绑定，输出为最大合法 K 的至多双 victim
+计划；不包含未运行 prompt 或未来输出。防止重复回收侵蚀逻辑累计下限、页取整
+超删、无覆盖仍 mutation，以及批次后项失败导致前项部分释放。最低层为纯 helper
+枚举合法页目标及真实 Pool/Scheduler CPU 测试；设备完成、跨 TP、Graph 和页改写
+必须复用真实 Qwen3-8B lifecycle，不能由 CPU 断言替代。DP 复用 watermark suite，
+usage 先诊断，不在没有有效同分错选证据时新增路由行为。

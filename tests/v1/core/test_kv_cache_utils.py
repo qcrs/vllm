@@ -67,6 +67,8 @@ from vllm.v1.kv_reclamation import (
     ReclamationConfig,
     choose_reclaim_candidate,
     demand_reclaim_candidates,
+    protected_reclaim_floor,
+    protected_reclaim_plan,
     retry_reclaim_candidates,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -2950,3 +2952,49 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+@pytest.mark.parametrize(
+    "source,logical,prefix",
+    [(2051, 2051, 0), (2051, 4100, 16), (100, 256, 16), (80, 80, 80)],
+)
+def test_reclamation_protected_floor_and_exact_page_target(source, logical, prefix):
+    """Both caps survive rounding; infeasible floors never produce an action."""
+    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    floor = protected_reclaim_floor(source, logical, prefix, config)
+    assert 5 * (source - floor) <= source - prefix
+    assert 2 * (floor - prefix) >= logical - prefix
+    row = tuple(range((source + 15) // 16))
+    candidate = ReclaimCandidate(
+        "a",
+        floor,
+        len(row) - (floor + 15) // 16,
+        0,
+        False,
+        0,
+        prefix,
+        source,
+        row,
+        logical,
+    )
+    for target in range(1, len(row) + 1):
+        plan = protected_reclaim_plan([candidate], target, config, 16, 2)
+        legal = [k for k in range(floor, source) if len(row) - (k + 15) // 16 >= target]
+        assert bool(plan) == bool(legal)
+        if legal:
+            assert plan[0].keep_tokens == max(legal)
+            assert plan[0].released_blocks == target
+
+
+def test_reclamation_protected_prefers_private_logical_retention():
+    """Equal physical capacity favors the less cumulatively compressed request."""
+    config = ReclamationConfig(budget_mode="protected")
+    candidates = [
+        ReclaimCandidate(
+            rid, 800, 14, 0, False, arrival, 0, 1024, tuple(range(64)), logical
+        )
+        for rid, arrival, logical in [("old", 0, 1536), ("new", 1, 1024)]
+    ]
+    plan = protected_reclaim_plan(candidates, 2, config, 16, 1)
+    assert plan[0].request_id == "new"
+    assert protected_reclaim_plan(candidates, 0, config, 16, 1) == ()

@@ -63,6 +63,8 @@ from vllm.v1.kv_reclamation import (
     ReclamationConfig,
     choose_reclaim_candidate,
     demand_reclaim_candidates,
+    protected_reclaim_floor,
+    protected_reclaim_plan,
     retry_reclaim_candidates,
     sink_recent_ranges,
     whole_block_row,
@@ -1360,6 +1362,13 @@ class Scheduler(SchedulerInterface):
                 + max(0, request_config.sink_tokens - protected_prefix),
                 int(request_config.retention * (source_len - protected_prefix)),
             )
+            if config.budget_mode == "protected":
+                keep = protected_reclaim_floor(
+                    source_len,
+                    request.num_computed_tokens + q,
+                    protected_prefix,
+                    request_config,
+                )
             released = len(blocks) - (keep + self.block_size - 1) // self.block_size
             if not 0 < keep < source_len or released <= 0:
                 continue
@@ -1397,6 +1406,21 @@ class Scheduler(SchedulerInterface):
             config.reserve_cap, live_decode_count
         )
         shortfall = self.kv_cache_manager.last_allocation_shortfall
+        if config.budget_mode == "protected":
+            plan = protected_reclaim_plan(
+                candidates, shortfall, config, self.block_size, member_bytes
+            )
+            if self.kv_cache_manager.trace is not None:
+                from dataclasses import asdict
+
+                self.kv_cache_manager.trace.record(
+                    "protected_plan",
+                    requester=requester.request_id if requester else None,
+                    shortfall=shortfall,
+                    candidates=[asdict(c) for c in candidates],
+                    plan=[asdict(c) for c in plan],
+                )
+            return (self.requests[plan[0].request_id], plan[0]) if plan else None
         demand = (
             demand_reclaim_candidates(
                 candidates, shortfall, goal, config, self.block_size, member_bytes
