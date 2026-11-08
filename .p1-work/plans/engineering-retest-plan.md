@@ -1,5 +1,23 @@
 # GPU0/1 当前版本基线与压力复测
 
+## GPU1/2 续测补充（2026-11-08）
+
+用户最新授权改用GPU1/2，覆盖旧GPU2禁用约束。GPU0本轮续测不使用。
+单卡改为物理GPU1、CPU20；TP2/DP2改为物理GPU1/2，仍沿用CPU20/21
+Worker主线程放置。两卡为NODE链路、无NVLink；不将设备/拓扑变化解释为策略收益。
+每次运行保存UUID、外部进程、每秒利用率及逐PID pmon，按共享设备条件报告，
+有进程但无GPU计算不再直接拒绝启动；不终止其他用户进程。
+
+在新设备重建相同配置的fixed/protected baseline、burst，以及既定DP W1/W0
+和小池组合。native仅各补一个baseline以保留lossless对照，不因补矩阵再次运行
+已证明重算风暴的native burst。先补设备相关TP2双victim/DP生命周期正确性及
+一个代表micro，再执行Serving。正向收益或明显漂移仍仅追加一次反序A/B，
+不扫参数。若外部计算持续活跃，性能数据标记共享背景/PARTIAL，不宣称独占收益。
+此前GPU0单卡及GPU0/1多卡数据、污染标记和FAIL全部保留，不与新设备混比。
+
+续测B0见`/tmp/p1-retest12-b0-path`指向的归档；最终报告给出绝对路径。
+其余阈值、预热、重复数、SLO、显存限制与不改Runtime的边界沿下文。
+
 2026-11-08，起点 `9f62c70be5`。用户授权重新建立基线并实测单卡、TP2、DP2。
 B0：`/data_ssd/qcrs/experiments/p1-v8/Engineering-Retest-B0/20261108-143448-initial`。
 环境、资源、归档与Git继承prompt3/4；本轮单卡使用GPU0/CPU20，双卡GPU0/1、

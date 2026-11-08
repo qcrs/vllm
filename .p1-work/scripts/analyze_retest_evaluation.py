@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Audit the bounded GPU0/1 baseline and arrival-pressure retest protocol."""
+"""Audit bounded baseline and arrival-pressure retests on a specified GPU pair."""
 
 import argparse
 import hashlib
@@ -16,7 +16,7 @@ from analyze_two_round_evaluation import normalized_requests
 from dp_serving import aggregate
 
 
-def audit_protocol(run):
+def audit_protocol(run, device_pair):
     protocol, guard = read(run / "protocol.json"), read(run / "result.json")
     args, command = protocol["args"], protocol["command"]
     dp = "scenario" in args
@@ -70,7 +70,8 @@ def audit_protocol(run):
     for relative, expected in hashes.items():
         assert digest(run / "source" / relative) == expected, (run, relative)
     invocation = read(run / "invocation.json")
-    devices = "0,1" if dp or args["tp"] == 2 else "0"
+    physical_devices = device_pair if dp or args["tp"] == 2 else device_pair[:1]
+    devices = ",".join(map(str, physical_devices))
     assert invocation["environment"]["CUDA_VISIBLE_DEVICES"] == devices
     assert invocation["hard_limit_bytes"] == 45 * 2**30
     assert invocation["stop_threshold_bytes"] == 44 * 2**30
@@ -79,12 +80,18 @@ def audit_protocol(run):
             expected
         )
     affinities = [
-        read(run / f"worker-affinity-{i}.json")
-        for i in range(2 if devices == "0,1" else 1)
+        read(run / f"worker-affinity-{i}.json") for i in range(len(physical_devices))
     ]
     assert [v["affinity"] for v in affinities] == (
-        [[20], [21]] if devices == "0,1" else [[20]]
+        [[20], [21]] if len(physical_devices) == 2 else [[20]]
     )
+    placements = {}
+    for sample in events(run / "nvml.jsonl"):
+        for process in sample["processes"]:
+            assert process["gpu"] in physical_devices, (run, process)
+            placements.setdefault(process["pid"], set()).add(process["gpu"])
+    for rank, affinity in enumerate(affinities):
+        assert placements[affinity["pid"]] == {physical_devices[rank]}
     helpers = {
         name: digest(run / name) for name in ("dp_hooks.py", "tp_worker_hooks.py")
     }
@@ -168,8 +175,10 @@ def observed_runtime(run, config):
     )
 
 
-def analyze(run):
-    protocol, guard, hashes, invocation, affinities, helpers = audit_protocol(run)
+def analyze(run, device_pair):
+    protocol, guard, hashes, invocation, affinities, helpers = audit_protocol(
+        run, device_pair
+    )
     args = protocol["args"]
     dp = "scenario" in args
     routes = audit_routes(run, args["routing"]) if dp else []
@@ -267,6 +276,7 @@ def analyze(run):
         affinity=affinities,
         guard=guard,
         commit=invocation["commit"],
+        physical_devices=invocation["environment"]["CUDA_VISIBLE_DEVICES"],
         observed_runtime=observed_runtime(run, args),
         slo_failures=dict(
             ttft=sum(r["ttft_s"] > 2 for r in all_items),
@@ -304,8 +314,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("runs", type=Path, nargs="+")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device-pair", choices=("0,1", "1,2"), default="0,1")
     args = parser.parse_args()
-    answer = [analyze(run) for run in args.runs]
+    device_pair = [int(device) for device in args.device_pair.split(",")]
+    answer = [analyze(run, device_pair) for run in args.runs]
     sources, helpers, inputs = {}, {}, {}
     for row in answer:
         for observed, expected in (
