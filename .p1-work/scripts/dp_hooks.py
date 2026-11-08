@@ -45,6 +45,11 @@ class P1DPWorkScheduler(Scheduler):
 
         self.kv_cache_manager.allocate_slots = counted_allocate
 
+    def add_request(self, request):
+        received_ns = time.monotonic_ns()
+        super().add_request(request)
+        self._work_record(request)["received_ns"] = received_ns
+
     def _work_record(self, request):
         return self._p1_work.setdefault(
             request.request_id,
@@ -68,11 +73,13 @@ class P1DPWorkScheduler(Scheduler):
 
     def schedule(self, *args, **kwargs):
         output = super().schedule(*args, **kwargs)
+        scheduled_ns = time.monotonic_ns()
         for rid, q in output.num_scheduled_tokens.items():
             request = self.requests[rid]
             end = request.num_computed_tokens
             start = end - q
             record = self._work_record(request)
+            record.setdefault("first_scheduled_ns", scheduled_ns)
             record["scheduled_tokens"] += q
             record["prefill_tokens"] += min(end, request.num_prompt_tokens) - min(
                 start, request.num_prompt_tokens
@@ -89,6 +96,17 @@ class P1DPWorkScheduler(Scheduler):
         return output
 
     def update_from_output(self, scheduler_output, model_output):
+        completed_ns = time.monotonic_ns()
+        for rid in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(rid)
+            if request is None:
+                continue
+            record = self._work_record(request)
+            if request.num_computed_tokens >= request.num_prompt_tokens:
+                record.setdefault("prefill_completed_ns", completed_ns)
+            index = model_output.req_id_to_index.get(rid)
+            if index is not None and model_output.sampled_token_ids[index]:
+                record.setdefault("first_token_ns", completed_ns)
         intents = scheduler_output.reclaim_requests
         results = model_output.reclaim_results
         output = super().update_from_output(scheduler_output, model_output)

@@ -59,12 +59,18 @@ def pressure_scheduler(tmp_path, monkeypatch):
         reserve=0,
         enable_prefix_caching=False,
         enable_reclamation=True,
+        max_num_batched_tokens=256,
+        max_model_len=32768,
+        long_prefill_token_threshold=0,
         **kwargs,
     ):
         scheduler = create_scheduler(
             model=str(model_path),
             num_blocks=num_blocks,
-            max_num_batched_tokens=256,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
+            long_prefill_token_threshold=long_prefill_token_threshold,
+            skip_tokenizer_init=True,
             use_v2_model_runner=True,
             enable_prefix_caching=enable_prefix_caching,
             reclamation_config=(
@@ -118,7 +124,13 @@ def complete_pressure_step(scheduler, output):
         ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-            sampled_token_ids=[[42]] * len(req_ids),
+            sampled_token_ids=[
+                [42]
+                if (request := scheduler.requests.get(rid)) is None
+                or request.num_computed_tokens >= request.num_prompt_tokens
+                else []
+                for rid in req_ids
+            ],
             logprobs=None,
             prompt_logprobs_dict={},
             reclaim_results=results,
@@ -5965,7 +5977,7 @@ def test_pressure_protected_waiter_uses_reclaimed_capacity_before_abort(
 def test_pressure_protected_two_rounds_require_completed_decode(pressure_scheduler):
     """Partial releases admit the original waiter only after a real decode gap."""
     scheduler = pressure_scheduler(
-        28, budget_mode="protected", admission_bypass_limit=2, decode_reclaim_rounds=2
+        29, budget_mode="protected", admission_bypass_limit=2, decode_reclaim_rounds=2
     )
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
@@ -6009,6 +6021,77 @@ def test_pressure_protected_two_rounds_require_completed_decode(pressure_schedul
     assert c.is_finished() and a.num_preemptions == c.num_preemptions == 0
 
 
+@pytest.mark.parametrize("threshold", [0, 512])
+def test_pressure_protected_prefill_budget_allows_short_request_progress(
+    pressure_scheduler, threshold
+):
+    """KV admission and compute fairness must both allow short requests to run."""
+    scheduler = pressure_scheduler(
+        682,
+        budget_mode="protected",
+        admission_bypass_limit=2,
+        decode_reclaim_rounds=2,
+        max_num_batched_tokens=1024,
+        max_model_len=9216,
+    )
+    incumbent = create_requests(
+        1, num_tokens=4096, max_tokens=128, req_ids=["incumbent"]
+    )[0]
+    scheduler.add_request(incumbent)
+    for _ in range(4):
+        complete_pressure_step(scheduler, scheduler.schedule())
+    assert incumbent.num_computed_tokens == 4096
+    assert incumbent.num_output_tokens == 1
+    scheduler.scheduler_config.long_prefill_token_threshold = threshold
+    long = create_requests(1, num_tokens=8192, max_tokens=128, req_ids=["long"])[0]
+    short = create_requests(2, num_tokens=128, max_tokens=128, req_ids=["s0", "s1"])
+    for request in [long, *short]:
+        scheduler.add_request(request)
+    admission_rounds = 0
+    for _ in range(32):
+        output = scheduler.schedule()
+        assert not output.preempted_req_ids
+        for intent in output.reclaim_requests:
+            assert intent.request_id == "incumbent"
+            assert 5 * (intent.source_effective_kv_len - intent.target_keep_tokens) <= (
+                intent.source_effective_kv_len
+            )
+            assert 2 * intent.target_keep_tokens >= incumbent.num_computed_tokens
+        if not long.num_computed_tokens:
+            admission_rounds += bool(output.reclaim_requests)
+        complete_pressure_step(scheduler, output)
+        if all(request.num_output_tokens for request in short):
+            break
+    assert all(request.num_output_tokens for request in short)
+    assert admission_rounds == 2
+    assert (long.num_computed_tokens < long.num_prompt_tokens) == bool(threshold)
+    assert all(request.num_preemptions == 0 for request in [incumbent, long, *short])
+
+
+@pytest.mark.parametrize("max_tokens", [1, 3])
+def test_pressure_protected_admission_reserves_first_decode_page(
+    pressure_scheduler, max_tokens
+):
+    """A page-aligned prompt must not be admitted into an immediate decode miss."""
+    scheduler = pressure_scheduler(4, budget_mode="protected", decode_reclaim_rounds=2)
+    incumbent = create_requests(1, num_tokens=16, max_tokens=3, req_ids=["A"])[0]
+    waiter = create_requests(1, num_tokens=16, max_tokens=max_tokens, req_ids=["B"])[0]
+    scheduler.add_request(incumbent)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    scheduler.add_request(waiter)
+    output = scheduler.schedule()
+    assert ("B" in output.num_scheduled_tokens) == (max_tokens == 1)
+    assert not output.reclaim_requests
+    complete_pressure_step(scheduler, output)
+    for _ in range(5):
+        output = scheduler.schedule()
+        assert not output.preempted_req_ids
+        complete_pressure_step(scheduler, output)
+        if waiter.is_finished():
+            break
+    assert waiter.is_finished() and waiter.num_preemptions == 0
+
+
 def test_pressure_protected_two_rounds_infeasible_preserves_backfill(
     pressure_scheduler,
 ):
@@ -6031,7 +6114,7 @@ def test_pressure_protected_two_rounds_infeasible_preserves_backfill(
 
 def test_pressure_protected_two_round_window_clears_on_waiter_abort(pressure_scheduler):
     """An aborted beneficiary must not keep blocking later admissions."""
-    scheduler = pressure_scheduler(28, budget_mode="protected", decode_reclaim_rounds=2)
+    scheduler = pressure_scheduler(29, budget_mode="protected", decode_reclaim_rounds=2)
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -6319,7 +6402,7 @@ def test_pressure_protected_pair_commits_only_after_all_results_validate(
     output = scheduler.schedule()
     intents = output.reclaim_requests
     assert len(intents) == 2
-    assert scheduler.kv_cache_manager.last_allocation_shortfall == 3
+    assert scheduler.kv_cache_manager.last_allocation_shortfall == 4
     assert (
         sum(
             len(i.source_block_ids) - (i.target_keep_tokens + 15) // 16 for i in intents

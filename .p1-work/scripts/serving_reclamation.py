@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 def tuning_arguments(parser):
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument("--long-prefill-token-threshold", type=int, default=0)
     parser.add_argument(
         "--worker-cpus",
         type=int,
@@ -45,7 +46,9 @@ def configure_worker_cpus(args, command, env, run):
 async def completion(client, origin, ids, rid, output_tokens, arrival, epoch):
     await asyncio.sleep(max(0, epoch + arrival - time.perf_counter()))
     started = time.perf_counter()
+    started_ns = time.monotonic_ns()
     times, tokens, chunks = [], [], []
+    first_token_ns = None
     usage = None
     body = {
         "model": "/data/models/Qwen3-8B",
@@ -58,7 +61,9 @@ async def completion(client, origin, ids, rid, output_tokens, arrival, epoch):
         "stream_options": {"include_usage": True},
         "return_token_ids": True,
     }
-    async with client.stream("POST", origin + "/v1/completions", json=body) as reply:
+    async with client.stream(
+        "POST", origin + "/v1/completions", json=body, headers={"X-Request-Id": rid}
+    ) as reply:
         if reply.status_code != 200:
             raise RuntimeError((reply.status_code, (await reply.aread()).decode()))
         async for line in reply.aiter_lines():
@@ -72,6 +77,8 @@ async def completion(client, origin, ids, rid, output_tokens, arrival, epoch):
             for choice in payload["choices"]:
                 ids_out = choice.get("token_ids") or []
                 if ids_out:
+                    if first_token_ns is None:
+                        first_token_ns = time.monotonic_ns()
                     now = time.perf_counter()
                     times.extend([now] * len(ids_out))
                     tokens.extend(ids_out)
@@ -84,6 +91,8 @@ async def completion(client, origin, ids, rid, output_tokens, arrival, epoch):
         "output_tokens": len(tokens),
         "arrival_s": arrival,
         "start_s": started - epoch,
+        "client_started_ns": started_ns,
+        "client_first_token_ns": first_token_ns,
         "ttft_s": times[0] - started,
         "tpot_s": (times[-1] - times[0]) / (len(tokens) - 1),
         "itl_s": np.diff(times).tolist(),
@@ -273,6 +282,7 @@ def main():
         "vllm/v1/kv_reclamation.py",
         "vllm/v1/core/kv_cache_manager.py",
         "vllm/v1/core/sched/scheduler.py",
+        "vllm/config/scheduler.py",
         "vllm/v1/core/sched/output.py",
         "vllm/v1/outputs.py",
         "vllm/v1/worker/gpu/model_runner.py",
@@ -347,6 +357,8 @@ def main():
         str(args.max_num_batched_tokens),
         "--max-num-seqs",
         str(args.max_num_seqs),
+        "--long-prefill-token-threshold",
+        str(args.long_prefill_token_threshold),
         "--kv-cache-memory-bytes",
         str(int(args.pool_gib * 2**30)),
         "--gpu-memory-utilization",

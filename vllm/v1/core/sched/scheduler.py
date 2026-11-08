@@ -1036,6 +1036,13 @@ class Scheduler(SchedulerInterface):
                         for a in retry.allocations
                         if a.request_id != request_id
                     )
+                    if self._needs_first_decode_reservation(request):
+                        full_physical = (
+                            request.effective_kv_len
+                            + request.num_tokens
+                            - request.num_computed_tokens
+                        )
+                        reserved_blocks += int(full_physical % self.block_size == 0)
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1372,6 +1379,8 @@ class Scheduler(SchedulerInterface):
             cached = num_new_computed_tokens if request is requester else 0
             computed = request.num_computed_tokens + q + cached
             tokens = max(1, request.num_tokens - computed)
+            if full_prefill and self._needs_first_decode_reservation(request):
+                tokens += 1
             if not full_prefill:
                 threshold = self.scheduler_config.long_prefill_token_threshold
                 if threshold > 0:
@@ -1438,6 +1447,12 @@ class Scheduler(SchedulerInterface):
             tuple(allocations),
             tuple(following),
             completion_headroom,
+        )
+
+    def _needs_first_decode_reservation(self, request: Request) -> bool:
+        return request.status != RequestStatus.RUNNING and request.num_tokens < min(
+            request.num_prompt_tokens + request.max_tokens - 1,
+            self.max_model_len - 1,
         )
 
     def _protected_prefill_reserved_blocks(self, request: Request) -> int:

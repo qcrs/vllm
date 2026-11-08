@@ -197,3 +197,19 @@ usage 先诊断，不在没有有效同分错选证据时新增路由行为。
 - 最低层：扩展现有纯预算oracle和真实Pool Scheduler fixture；用公开schedule→
   completion→commit行为检查连续decode不再每页回收、无抢占且等待者能完成。
 - GPU只验证受影响计划：既有TP2/Graph/双victim延迟/真实改写复用与DP2独立池。
+
+<!-- ENGINEERING-PREFILL-TEST-DESIGN-BEGIN -->
+
+## 2026-11-08 长 prefill 计算预算与短请求进展
+
+- 模块：Scheduler 的 token 预算、完整 prefill 容量预留和两轮回收组合。
+- I/O：真实队列及 BlockPool、已完成 forward → 实际调度及短请求首 token。
+- 失败：长 prefill 耗尽预算；只检查短请求却未入场；测试把中间 chunk 错当产 token。
+- 边界回归：protected 满页 prompt 需在入场检查及 retry 中计入第一步 decode 页；
+  单 token 输出不需额外页。用真实有限池验证先等待自然释放、后完成且零抢占。
+- 最便宜层级：现有 pressure fixture，固定初态对比0/512，完整 completion 语义；
+  GPU0原负载验证真实8B输出及首 token阶段，TP2/DP2本轮资源不足不模拟。
+
+设计与停止门槛见[本轮计划](../plans/engineering-prefill-plan.md)。
+
+<!-- ENGINEERING-PREFILL-TEST-DESIGN-END -->

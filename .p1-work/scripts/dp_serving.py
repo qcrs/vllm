@@ -262,6 +262,8 @@ def main():
         str(args.max_num_batched_tokens),
         "--max-num-seqs",
         str(args.max_num_seqs),
+        "--long-prefill-token-threshold",
+        str(args.long_prefill_token_threshold),
         "--kv-cache-memory-bytes",
         str(int(args.pool_gib * 2**30)),
         "--gpu-memory-utilization",
