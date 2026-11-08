@@ -1,5 +1,20 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-BACKFILL-NAV-BEGIN -->
+
+## 2026-11-08 Admission backfill / TP 瓶颈复核
+
+见[收尾](engineering-backfill-closeout.md)与[评估](engineering-backfill-evaluation.md)。
+实现显式、最多两个成功admission的FCFS backfill及DP capacity guard交互修正，
+CPU本地fixture107项、lint/type checks通过。TP2 GPU1/2与等效容量单卡GPU1均
+6/24→18/24 SLO；fixed均24/24且吞吐更高。短请求全部恢复达标，8192-token仍0/6。
+单卡足以复现主要容量/队头阻塞问题，当前无证据归因TP collective；TP2 backfill
+零回收，不能宣称物理回收收益。micro本轮NOT_RUN，DP usage tie-break仍停止。
+backfill默认0，长请求容量及总吞吐目标未解决，prefill中删除KV按用户要求暂缓。
+GPU0未用、六次guard PASS；用户改动/冻结样本/历史FAIL/PARTIAL保留，未push或创建PR。
+
+<!-- ENGINEERING-BACKFILL-NAV-END -->
+
 <!-- ENGINEERING-PROGRESS-NAV-BEGIN -->
 
 ## 2026-11-08 Controller 进展修正与 TP/DP 复核交付

@@ -1,5 +1,21 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-BACKFILL-NAV-BEGIN -->
+
+## 2026-11-08 Admission backfill：TP 根因复核
+
+实现与停止结论见[收尾](../reports/engineering-backfill-closeout.md)，完整数据见
+[评估](../reports/engineering-backfill-evaluation.md)。protected最多让位两个成功FCFS
+admission后，TP1/TP2均6/24→18/24 SLO；fixed均24/24且吞吐更高。改善来自
+短请求进展，8192-token仍0/6。等效容量单卡复现TP2主退化，定位为容量准入和队头
+阻塞；当前无证据将主退化归因TP collective。TP2 backfill零回收，TP1每轮1次。
+CPU本地fixture107项及lint/type checks通过，补齐DP capacity guard交互；本轮micro
+NOT_RUN，usage tie-break仍STOPPED / NOT_RUN。backfill默认0，prefill中删除KV
+按用户要求暂缓；长请求容量与总吞吐目标未解决。六次GPU guard PASS，仅GPU1/2，
+原用户patch、85条质量样本及历史FAIL/PARTIAL保留，未push或创建PR。
+
+<!-- ENGINEERING-BACKFILL-NAV-END -->
+
 <!-- ENGINEERING-PROGRESS-NAV-BEGIN -->
 
 ## 2026-11-08 Controller 进展修正与 TP/DP 复核
