@@ -226,6 +226,7 @@ def main():
     parser.add_argument("--stats")
     parser.add_argument("--reserve", type=int, default=0)
     parser.add_argument("--admission-bypass-limit", type=int, default=0)
+    parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
     parser.add_argument(
         "--budget-mode",
         choices=[
@@ -385,6 +386,7 @@ def main():
                 "budget_mode": args.budget_mode,
                 "stats_path": args.stats,
                 "admission_bypass_limit": args.admission_bypass_limit,
+                "decode_reclaim_rounds": args.decode_reclaim_rounds,
             }
         }
         command.extend(["--additional-config", json.dumps(config)])

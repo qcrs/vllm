@@ -24,6 +24,7 @@ def lines(path):
 
 
 async def exercise(args, run):
+    pool_blocks = 28 if args.decode_reclaim_rounds == 2 else 33
     options = AsyncEngineArgs(
         model="/data/models/Qwen3-8B",
         dtype="bfloat16",
@@ -39,11 +40,11 @@ async def exercise(args, run):
         async_scheduling=False,
         disable_cascade_attn=True,
         scheduler_reserve_full_isl=False,
-        max_model_len=512,
+        max_model_len=448 if args.decode_reclaim_rounds == 2 else 512,
         max_num_seqs=4,
         max_num_batched_tokens=256,
         kv_cache_memory_bytes=256 * 2**20,
-        num_gpu_blocks_override=33,
+        num_gpu_blocks_override=pool_blocks,
         gpu_memory_utilization=0.3,
         seed=0,
         disable_log_stats=True,
@@ -58,6 +59,7 @@ async def exercise(args, run):
                         "pressure": True,
                         "min_keep_tokens": 32,
                         "budget_mode": args.budget_mode,
+                        "decode_reclaim_rounds": args.decode_reclaim_rounds,
                     }
                 }
             ),
@@ -91,7 +93,7 @@ async def exercise(args, run):
         json.dumps(
             {
                 "args": vars(args),
-                "pool_blocks": 33,
+                "pool_blocks": pool_blocks,
                 "prompt_sha256": hashlib.sha256(json.dumps(text).encode()).hexdigest(),
                 "support": "DP2 TP1 eager; independent pools and abort affinity",
             },
@@ -142,9 +144,11 @@ async def exercise(args, run):
         assert len({i["pid"] for i in scheduler_identities}) == 2
         assert [i["engine"] for i in scheduler_identities] == [0, 1]
         assert all(
-            i["total_blocks"] == 33 and i["free"] == 32 for i in scheduler_identities
+            i["total_blocks"] == pool_blocks and i["free"] == pool_blocks - 1
+            for i in scheduler_identities
         )
-        tasks.append(asyncio.create_task(generate("A", 256, 256, 0)))
+        a_maximum = 192 if args.decode_reclaim_rounds == 2 else 256
+        tasks.append(asyncio.create_task(generate("A", 256, a_maximum, 0)))
         await until(first["A"].is_set)
         tasks.append(asyncio.create_task(generate("C", 256, 64, 0)))
         trace0 = run / "replica-0" / "kv-trace.jsonl"
@@ -155,7 +159,7 @@ async def exercise(args, run):
         idle = lines(run / "replica-1" / "kv-trace.jsonl")
         assert not idle, "Idle replica allocated or freed foreign blocks"
         idle_free = lines(run / "replica-1" / "scheduler.jsonl")[-1]["free"]
-        assert idle_free == 32
+        assert idle_free == pool_blocks - 1
         if args.policy != "full":
             await until(
                 lambda: any(e["event"] == "reclaim_commit" for e in lines(trace0))
@@ -183,7 +187,8 @@ async def exercise(args, run):
         )
         await until(
             lambda: all(
-                lines(run / f"replica-{i}" / "scheduler.jsonl")[-1].get("free") == 32
+                lines(run / f"replica-{i}" / "scheduler.jsonl")[-1].get("free")
+                == pool_blocks - 1
                 for i in range(2)
             )
         )
@@ -203,6 +208,17 @@ async def exercise(args, run):
             }
             assert c_started_before_abort
             assert reused_by_c and all(reused_by_c.values())
+            if args.decode_reclaim_rounds == 2:
+                commits = [e for e in lines(trace0) if e["event"] == "reclaim_commit"]
+                assert len(commits) >= 2, commits
+                windows = [
+                    e["decode_window"]
+                    for e in lines(trace0)
+                    if e["event"] == "protected_plan" and e.get("decode_window")
+                ]
+                assert {w["rounds"] for w in windows} == {1, 2}
+                assert len(windows) == 2, windows
+                assert not any(e["event"] == "preempt" for e in lines(trace0))
         assert not payload[1]["released"]
         assert payload[1]["counts"]["peer_retained_forward"] > 1
         peer_after_abort = [
@@ -228,7 +244,7 @@ async def exercise(args, run):
                     "outputs": outputs,
                     "payload": payload,
                     "peer_idle_before_first_miss": True,
-                    "free_final": [32, 32],
+                    "free_final": [pool_blocks - 1, pool_blocks - 1],
                     "abort_time_ns": abort_time,
                     "peer_tokens_at_abort": peer_tokens_at_abort,
                     "c_started_before_abort": c_started_before_abort,
@@ -260,6 +276,7 @@ def main():
         "--routing", choices=["requests", "known_work"], default="requests"
     )
     parser.add_argument("--worker-cpus", nargs=2, type=int)
+    parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"

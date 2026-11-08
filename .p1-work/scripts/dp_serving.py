@@ -181,6 +181,8 @@ def main():
         "--routing", choices=["requests", "known_work"], default="requests"
     )
     parser.add_argument("--work-counters", action="store_true")
+    parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--admission-bypass-limit", type=int, default=0)
     parser.add_argument(
         "--budget-mode", choices=["fixed", "protected"], default="fixed"
     )
@@ -289,6 +291,8 @@ def main():
             "reserve_cap": 0,
             "stats_path": args.stats,
             "budget_mode": args.budget_mode,
+            "decode_reclaim_rounds": args.decode_reclaim_rounds,
+            "admission_bypass_limit": args.admission_bypass_limit,
         }
     command.extend(["--additional-config", json.dumps(additional)])
     if args.trace:

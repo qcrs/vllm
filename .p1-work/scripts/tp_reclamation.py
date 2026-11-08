@@ -50,7 +50,12 @@ def main():
     parser.add_argument("--retry-tail", action="store_true")
     parser.add_argument("--protected", action="store_true")
     parser.add_argument("--victims", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
+    two_round = args.decode_reclaim_rounds == 2
+    if two_round and (not args.protected or args.prefix or args.policy_updates):
+        parser.error("two rounds require protected mode without prefix/policy updates")
+    pool_blocks = (28 if args.victims == 1 else 43) if two_round else 33
     if args.retry_tail and args.demand_pages is None:
         parser.error("--retry-tail requires --demand-pages")
     if args.worker_cpus:
@@ -87,11 +92,11 @@ def main():
         async_scheduling=False,
         disable_cascade_attn=True,
         scheduler_reserve_full_isl=False,
-        max_model_len=512,
+        max_model_len=448 if two_round else 512,
         max_num_seqs=4,
         max_num_batched_tokens=256,
         kv_cache_memory_bytes=128 * 2**20,
-        num_gpu_blocks_override=33,
+        num_gpu_blocks_override=pool_blocks,
         gpu_memory_utilization=0.3,
         seed=0,
         disable_log_stats=True,
@@ -103,8 +108,9 @@ def main():
         additional_config={
             "kv_reclamation": {
                 "min_keep_tokens": 32,
-                "pressure": args.victims == 2,
+                "pressure": args.victims == 2 or two_round,
                 "budget_mode": "protected" if args.protected else "fixed",
+                "decode_reclaim_rounds": args.decode_reclaim_rounds,
                 "policy": args.policy,
                 "stats_path": os.environ.get("P1_STATS"),
             }
@@ -155,6 +161,11 @@ def main():
     if args.victims == 2:
         assert args.protected and not args.prefix and not args.policy_updates
         prompts["C"] = prompts["C"][:160]
+    if two_round:
+        prompts["C"] = prompts["A"].copy()
+        prompts["D"] = prompts["D"][:16]
+        if args.victims == 2:
+            prompts["B"] = prompts["A"].copy()
     ids, outputs, events = {}, {}, []
     original_schedule, original_update = (
         scheduler.schedule,
@@ -163,13 +174,13 @@ def main():
     step = 0
     inflight, early_errors = {}, []
     stop = threading.Event()
-    policy_events, cold_steps = [], []
+    policy_events, cold_steps, schedule_records = [], [], []
     updating = {}
     reclaim_steps = (
         {16: "A", 24: "B", 32: "C"} if args.policy_updates else {16: "A", 32: "A"}
     )
 
-    if args.victims == 2:
+    if args.victims == 2 or two_round:
         reclaim_steps = {}
 
     def watch():
@@ -316,6 +327,23 @@ def main():
                 64 if args.prefix else 0
             )
         if output.reclaim_requests:
+            if two_round:
+                for intent in output.reclaim_requests:
+                    request = scheduler.requests[intent.request_id]
+                    assert (
+                        5 * (intent.source_effective_kv_len - intent.target_keep_tokens)
+                        <= intent.source_effective_kv_len
+                    )
+                    assert 2 * intent.target_keep_tokens >= request.num_computed_tokens
+                window = scheduler._decode_reclaim_window
+                if window is not None and window.rounds == 2:
+                    first_window = next(e for e in events if e["window"])
+                    assert all(
+                        scheduler.requests[i.request_id].num_computed_tokens
+                        - output.num_scheduled_tokens.get(i.request_id, 0)
+                        > first_window["logical_tokens"][i.request_id]
+                        for i in output.reclaim_requests
+                    )
             inflight.clear()
             inflight.update(
                 free=pool.get_num_free_blocks(),
@@ -325,6 +353,16 @@ def main():
                 },
                 observed=False,
             )
+        schedule_records.append(
+            dict(
+                step=step,
+                scheduled=dict(output.num_scheduled_tokens),
+                window=asdict(scheduler._decode_reclaim_window)
+                if scheduler._decode_reclaim_window
+                else None,
+                preempted=list(output.preempted_req_ids or ()),
+            )
+        )
         if step % 2:
             output.num_scheduled_tokens = dict(
                 reversed(list(output.num_scheduled_tokens.items()))
@@ -371,11 +409,20 @@ def main():
                     ],
                     "batch_tokens": output.total_num_scheduled_tokens,
                     "intents": [asdict(i) for i in intents],
+                    "logical_tokens": {
+                        i.request_id: scheduler.requests[
+                            i.request_id
+                        ].num_computed_tokens
+                        for i in intents
+                    },
                     "rows": rows,
                     "released": released,
                     "local_done_ns": [int(p.read_text()) for p in markers],
                     "ack_ns": time.monotonic_ns(),
                     "canonical_unchanged_while_waiting": inflight["observed"],
+                    "window": asdict(scheduler._decode_reclaim_window)
+                    if scheduler._decode_reclaim_window
+                    else None,
                 }
             )
         return answer
@@ -391,6 +438,12 @@ def main():
                 if args.policy_updates
                 else {0: "A", 2: "B", (16 if args.victims == 2 else 17): "C"}
             ).get(step)
+            if two_round:
+                external = (
+                    {0: "A", 1: "C", 2: "D"}
+                    if args.victims == 1
+                    else {0: "A", 1: "B", 3: "C", 4: "D"}
+                ).get(step)
             if args.policy_updates and external in ("B", "C", "D"):
                 policy = {"B": "random", "C": "triattention", "D": "full"}[external]
                 updating.update(
@@ -500,7 +553,11 @@ def main():
                         left_rank[k] == right_rank[k]
                         for k in ("keep", "row", "E", "path")
                     )
-                    if args.demand_pages is None and args.victims == 1:
+                    if (
+                        args.demand_pages is None
+                        and args.victims == 1
+                        and not two_round
+                    ):
                         assert left_rank["path"] == args.path
                 if args.demand_pages is not None:
                     assert len(events[-1]["released"]) == args.demand_pages
@@ -509,12 +566,28 @@ def main():
             if step >= 17 and not engine.has_unfinished_requests():
                 break
         assert not args.fail
+        if two_round:
+            window_events = [e for e in events if e["window"]]
+            assert len(window_events) == 2, events
+            assert [e["window"]["rounds"] for e in window_events] == [1, 2]
+            assert all(len(e["intents"]) <= 2 for e in events)
+            assert scheduler._decode_reclaim_window is None
+            assert not any(e["preempted"] for e in schedule_records)
+            c_step = next(
+                e["step"] for e in schedule_records if ids["C"] in e["scheduled"]
+            )
+            assert c_step < 63 and window_events[1]["step"] < c_step
+            assert not any(
+                ids["D"] in e["scheduled"]
+                for e in schedule_records
+                if e["step"] < c_step
+            )
         if args.victims == 2:
             assert any(len(e["intents"]) == 2 for e in events)
-        else:
+        elif not two_round:
             assert len(events) == (3 if args.policy_updates else 2)
         assert all(item["finished"] for item in outputs.values())
-        assert pool.get_num_free_blocks() == 32
+        assert pool.get_num_free_blocks() == pool_blocks - 1
         assert all(c["rewritten"] for c in last_checks)
         if args.policy_updates:
             assert sorted(core.reclamation_policies) == [3]
@@ -544,6 +617,7 @@ def main():
                     "free_final": pool.get_num_free_blocks(),
                     "policy_events": policy_events,
                     "cold_steps": cold_steps,
+                    "schedule": schedule_records,
                 },
                 indent=2,
             )

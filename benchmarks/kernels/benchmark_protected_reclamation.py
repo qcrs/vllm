@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine.core_client import DPLBAsyncMPClient
@@ -41,12 +42,16 @@ from vllm.v1.worker.gpu.kv_retention_policy import POLICY_FACTORIES
 MEMBER_BYTES = 36 * 4 * 256 * 2
 
 
-def controller(shape, mode, count, demand):
+def controller(shape, mode, count, demand, rounds=1):
     """Run the actual Scheduler scan/selection on explicit canonical CPU state."""
-    config = ReclamationConfig(budget_mode=mode)
+    config = ReclamationConfig(
+        budget_mode=mode, pressure=rounds == 2, decode_reclaim_rounds=rounds
+    )
     binding = PolicyBinding(0, config)
     scheduler = object.__new__(Scheduler)
     scheduler.reclamation_config = config
+    scheduler._decode_reclaim_window = None
+    scheduler.policy = SchedulingPolicy.FCFS
     scheduler.block_size = 16
     scheduler.max_num_scheduled_tokens = 1024
     scheduler.max_model_len = 9216
@@ -58,6 +63,7 @@ def controller(shape, mode, count, demand):
             num_computed_tokens=shape["L"],
             num_prompt_tokens=shape["L"],
             max_tokens=128,
+            num_output_tokens=1,
             num_tokens=shape["L"] + 1,
             num_in_flight_tokens=0,
             has_encoder_inputs=False,
@@ -102,6 +108,79 @@ def controller(shape, mode, count, demand):
         ]
     )
     return scheduler
+
+
+def two_round_fixture():
+    """Use the 88-page miss, including the admission retry's decode reservation."""
+    scheduler = controller(dict(E=4097, L=4097, P=0), "protected", 1, 88, 2)
+    scheduler.kv_cache_manager.block_pool.get_num_free_blocks = lambda: 424
+    waiting = SimpleNamespace(
+        request_id="waiting",
+        num_tokens=8192,
+        num_prompt_tokens=8192,
+        max_tokens=128,
+        num_computed_tokens=0,
+        effective_kv_len=0,
+        has_encoder_inputs=False,
+        status=RequestStatus.WAITING,
+    )
+    return scheduler, waiting
+
+
+def two_round_call():
+    scheduler, waiting = two_round_fixture()
+
+    def call():
+        scheduler._decode_reclaim_window = None
+        return scheduler._select_reclaim_plan({}, waiting)
+
+    return call
+
+
+def gpu_cases(args, shapes):
+    if not args.two_round_case:
+        for shape, mode, label, demand in cases(shapes):
+            yield (
+                shape,
+                mode,
+                label,
+                controller(shape, mode, 2, demand)._select_reclaim_plan({}),
+            )
+        return
+    shape = dict(E=4097, L=4097, P=0)
+    yield (
+        shape,
+        "fixed",
+        "88-page-miss",
+        controller(shape, "fixed", 1, 88)._select_reclaim_plan({}),
+    )
+    yield (
+        shape,
+        "protected",
+        "single-round-infeasible",
+        controller(shape, "protected", 1, 88)._select_reclaim_plan({}),
+    )
+    scheduler, waiting = two_round_fixture()
+    first = scheduler._select_reclaim_plan({}, waiting)
+    assert len(first) == 1
+    yield shape, "protected", "two-round-first", first
+    selected = first[0]
+    after = dict(E=selected.keep_tokens + 2, L=4099, P=0)
+    victim = scheduler.running[0]
+    victim.effective_kv_len = after["E"]
+    victim.num_computed_tokens = after["L"]
+    victim.num_tokens = after["L"] + 1
+    pages = (after["E"] + 15) // 16
+    manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    manager.req_to_blocks["r0"] = [
+        SimpleNamespace(block_id=i + 1, ref_cnt=1, is_null=False) for i in range(pages)
+    ]
+    free = 424 + len(selected.source_block_ids) - pages
+    scheduler.kv_cache_manager.block_pool.get_num_free_blocks = lambda: free
+    scheduler.kv_cache_manager.last_allocation_shortfall = 512 - free
+    second = scheduler._select_reclaim_plan({}, waiting)
+    assert len(second) == 1
+    yield after, "protected", "two-round-second", second
 
 
 def controller_calls(shape, mode, count, demand):
@@ -217,8 +296,7 @@ def gpu_worker(rank, args, shapes, run):
         device_id=device,
     )
     records = []
-    for shape, mode, label, demand in cases(shapes):
-        plan = controller(shape, mode, 2, demand)._select_reclaim_plan({})
+    for shape, mode, label, plan in gpu_cases(args, shapes):
         if not plan:
             records.append(dict(shape=shape, mode=mode, label=label, feasible=False))
             continue
@@ -350,16 +428,21 @@ def gpu_worker(rank, args, shapes, run):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runtime-shapes", required=True)
+    parser.add_argument("--runtime-shapes")
+    parser.add_argument("--two-round-case", action="store_true")
     parser.add_argument("--worker-cpus", nargs=2, type=int, default=[20, 21])
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
-    shapes = [
-        dict(E=s["E"], L=s["L"], P=s["P"])
-        for s in json.loads(Path(args.runtime_shapes).read_text())["shapes"]
-    ]
-    shapes.append(dict(E=272, L=272, P=0))
-    shutil.copyfile(args.runtime_shapes, run / "runtime-shapes.json")
+    if not args.runtime_shapes and not args.two_round_case:
+        parser.error("--runtime-shapes or --two-round-case is required")
+    shapes = [dict(E=4097, L=4097, P=0)]
+    if args.runtime_shapes:
+        shapes = [
+            dict(E=s["E"], L=s["L"], P=s["P"])
+            for s in json.loads(Path(args.runtime_shapes).read_text())["shapes"]
+        ]
+        shapes.append(dict(E=272, L=272, P=0))
+        shutil.copyfile(args.runtime_shapes, run / "runtime-shapes.json")
     manifest = {}
     for path in (
         "vllm/v1/kv_reclamation.py",
@@ -376,7 +459,28 @@ def main():
         shutil.copyfile(path, target)
         manifest[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
     (run / "source-hashes.json").write_text(json.dumps(manifest, indent=2))
-    (run / "cpu-micro.json").write_text(json.dumps(cpu_micro(shapes), indent=2))
+    if args.two_round_case:
+        call = two_round_call()
+        for _ in range(3):
+            call()
+        samples = []
+        for _ in range(30):
+            start = time.perf_counter_ns()
+            plan = call()
+            samples.append((time.perf_counter_ns() - start) / 1e3)
+        assert len(plan) == 1
+        (run / "two-round-decision.json").write_text(
+            json.dumps(
+                dict(
+                    decision_us=samples,
+                    median_us=statistics.median(samples),
+                    first_plan=[asdict(c) for c in plan],
+                ),
+                indent=2,
+            )
+        )
+    else:
+        (run / "cpu-micro.json").write_text(json.dumps(cpu_micro(shapes), indent=2))
     mp.spawn(gpu_worker, args=(args, shapes, run), nprocs=2, join=True)
 
 
