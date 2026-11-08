@@ -321,6 +321,7 @@ def main():
     arrivals = [0, 0.3, 0.6, 0.9, 5, 5.3, 5.6, 5.9]
     if args.scenario in ("w1", "w0"):
         arrivals = [i * 0.05 for i in range(8)]
+    arrivals = [arrival * args.arrival_scale for arrival in arrivals]
     (run / "prompts.json").write_text(json.dumps(prompts))
     (run / "protocol.json").write_text(
         json.dumps(

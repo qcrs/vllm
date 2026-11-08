@@ -19,10 +19,18 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+def positive_arrival_scale(value):
+    scale = float(value)
+    if not 0 < scale < float("inf"):
+        raise argparse.ArgumentTypeError("arrival scale must be finite and positive")
+    return scale
+
+
 def tuning_arguments(parser):
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--long-prefill-token-threshold", type=int, default=0)
+    parser.add_argument("--arrival-scale", type=positive_arrival_scale, default=1.0)
     parser.add_argument(
         "--worker-cpus",
         type=int,
@@ -429,6 +437,7 @@ def main():
             private = marker + (seed * (length // len(seed) + 1))
             prompts.append(shared + private[: length - len(shared)])
         assert len({prompt[256] for prompt in prompts}) == 8
+    arrivals = [arrival * args.arrival_scale for arrival in arrivals]
     (run / "prompts.json").write_text(json.dumps(prompts))
     protocol = {
         "args": vars(args),
