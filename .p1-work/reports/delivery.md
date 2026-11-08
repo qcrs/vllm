@@ -1,5 +1,16 @@
 # P1 v8 工程交付索引
 
+<!-- PROTECTED-STABLE-NAV-BEGIN -->
+
+## Protected-only 稳定版
+
+稳定版主结果与边界见[Protected KV 回收结果](protected-stable-results.md)。运行配置只有
+native（不配置回收）和 protected（配置回收）；保留独立的 KV 保留/压缩策略与正确性测试。
+本页仅整理现有 GPU1 单卡、GPU1/2 TP2 结果，不是新一轮性能测量；历史对照和负结果仍保留
+在对应评估归档中。
+
+<!-- PROTECTED-STABLE-NAV-END -->
+
 <!-- ENGINEERING-RETEST12-NAV-BEGIN -->
 
 ## 2026-11-08 GPU1/2空闲基线与压力复测

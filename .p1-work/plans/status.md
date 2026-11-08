@@ -1,5 +1,16 @@
 # P1 v8 当前状态与未决项
 
+<!-- PROTECTED-STABLE-NAV-BEGIN -->
+
+## Protected-only 稳定版
+
+当前主结果、配置语义和已验证边界见[稳定版结果](../reports/protected-stable-results.md)。
+不配置回收时走 native；配置回收后只走 protected Controller。旧 Controller 分支及候选
+函数已移除，KV 保留/压缩策略和 TP、DP、Graph、页面复用测试继续保留。本页 Serving 数字
+整理自已有正式评估，没有新增 GPU 测量；fixed 等对照只保留在历史评估中。
+
+<!-- PROTECTED-STABLE-NAV-END -->
+
 <!-- ENGINEERING-RETEST12-NAV-BEGIN -->
 
 ## 2026-11-08 GPU1/2空闲基线重测
