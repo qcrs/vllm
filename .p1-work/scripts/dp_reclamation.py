@@ -24,7 +24,8 @@ def lines(path):
 
 
 async def exercise(args, run):
-    pool_blocks = 28 if args.decode_reclaim_rounds == 2 else 33
+    # Include the waiter's first decode page in the two-round feasible fixture.
+    pool_blocks = 29 if args.decode_reclaim_rounds == 2 else 33
     options = AsyncEngineArgs(
         model="/data/models/Qwen3-8B",
         dtype="bfloat16",

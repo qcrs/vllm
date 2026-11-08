@@ -55,7 +55,8 @@ def main():
     two_round = args.decode_reclaim_rounds == 2
     if two_round and (not args.protected or args.prefix or args.policy_updates):
         parser.error("two rounds require protected mode without prefix/policy updates")
-    pool_blocks = (28 if args.victims == 1 else 43) if two_round else 33
+    # Include the waiter's first decode page in the two-round feasible fixture.
+    pool_blocks = (29 if args.victims == 1 else 43) if two_round else 33
     if args.retry_tail and args.demand_pages is None:
         parser.error("--retry-tail requires --demand-pages")
     if args.worker_cpus:
