@@ -1,5 +1,27 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-TWO-ROUND-NAV-BEGIN -->
+
+## 2026-11-08 两轮protected回收与单卡/TP2/DP2验证
+
+见[收尾](engineering-two-round-closeout.md)、[统一评估](engineering-two-round-evaluation.md)
+和[Controller](engineering-two-round-controller.md)。已实现最多两轮可行路径、真实
+decode完成门控、受益等待者容量窗口及近完成自然释放；20%/50%和最多双victim不变。
+默认仍rounds1/fixed/requests，Worker与全TP completion/commit协议复用。
+
+Correctness：CPU118+DP fixture15项、真实单卡/TP2/DP2通过，含双victim、延迟
+completion、Graph、改写复用、abort/continuation。Micro两轮约3.79/3.80ms，
+fixed约3.20ms，不宣称执行提速。单卡相对r1吞吐+16.79%/+26.63%，SLO18/24→
+23/24、24/24；TP2吞吐改善但SLO18/24→14/24、12/24，未超过fixed。DP同路由
+两组均21/24且零回收/miss，不能归因Controller；usage tie-break仍STOPPED / NOT_RUN。
+
+仅物理GPU0/1、23次guard为20 PASS/3 FAIL、合计峰值39.888672GiB，GPU2及他人任务
+保留。独立诊断8/8只证明路径，未复现正式慢路径；正式负结果保留。
+SLO仍TTFT≤2s且TPOT≤80ms；未重跑旧矩阵、未扩大85条质量样本，用户原patch和
+历史正文保留，本地阶段提交完成，未push或创建PR。
+
+<!-- ENGINEERING-TWO-ROUND-NAV-END -->
+
 <!-- ENGINEERING-BACKFILL-NAV-BEGIN -->
 
 ## 2026-11-08 Admission backfill / TP 瓶颈复核

@@ -1,5 +1,29 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-TWO-ROUND-NAV-BEGIN -->
+
+## 2026-11-08 Decode进展驱动的最多两轮回收
+
+实现和停止结论见[收尾](../reports/engineering-two-round-closeout.md)，完整结果见
+[统一评估](../reports/engineering-two-round-evaluation.md)，机制见
+[Controller](../reports/engineering-two-round-controller.md)。一轮不足时只启动预测
+可行的两轮路径，第二轮必须有真实decode完成，回收页留给原等待者；20%/50%、
+最多两victim及TP completion边界保留，rounds1仍默认。
+
+Correctness：CPU118项、DP本地fixture15项，真实单卡、TP2单/双victim、延迟
+completion、FULL Graph、页改写复用与DP2 abort/continuation通过。Micro量化两轮
+成本，未证明快于fixed。单卡r1→r2正反向吞吐+16.79%/+26.63%，SLO18/24→23/24、
+24/24；TP2吞吐+7.64%/+18.94%但SLO18/24→14/24、12/24。对fixed无总体胜出。
+DP两组均21/24且零回收/miss，性能差不能归因Controller；usage tie-break仍停止。
+
+独立TP2 trace证明缺88页可经52+41页及真实decode后入场，也确认长prefill占用
+后方短请求的调度时间；诊断8/8没有复现正式慢路径，不覆盖正式负结果。
+只用物理GPU0/1，GPU2未使用；23次guard为20 PASS/3 FAIL，峰值39.888672GiB。
+SLO仍TTFT≤2s且TPOT≤80ms，冻结85条质量样本与历史/本轮FAIL/PARTIAL保留。
+本轮已停止扩实验；分阶段本地提交，用户改动保留，未push或创建PR。
+
+<!-- ENGINEERING-TWO-ROUND-NAV-END -->
+
 <!-- ENGINEERING-BACKFILL-NAV-BEGIN -->
 
 ## 2026-11-08 Admission backfill：TP 根因复核
