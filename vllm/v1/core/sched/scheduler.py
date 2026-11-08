@@ -56,17 +56,14 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_reclamation import (
+    ProtectedReclaimForecast,
     ReclaimAllocation,
     ReclaimCandidate,
     ReclaimRequest,
-    ReclaimRetry,
     ReclamationConfig,
-    choose_reclaim_candidate,
-    demand_reclaim_candidates,
     protected_reclaim_floor,
     protected_reclaim_plan,
     protected_two_round_plan,
-    retry_reclaim_candidates,
     sink_recent_ranges,
     whole_block_row,
 )
@@ -466,23 +463,13 @@ class Scheduler(SchedulerInterface):
             self._admission_blocked_head_id = None
             self._admission_bypass_count = 0
         allow_reclamation = (
-            self.reclamation_config is not None
-            and self.reclamation_config.pressure
-            and not self.reclaim_retry_pending
+            self.reclamation_config is not None and not self.reclaim_retry_pending
         )
+        protected_admission = self.reclamation_config is not None
         self.reclaim_retry_pending = False
         reclaim_plan: tuple[ReclaimCandidate, ...] = ()
-        protected_admission = (
-            self.reclamation_config is not None
-            and self.reclamation_config.pressure
-            and self.reclamation_config.budget_mode == "protected"
-        )
         admission_bypass_limit = 0
-        if (
-            self.reclamation_config is not None
-            and protected_admission
-            and self.policy == SchedulingPolicy.FCFS
-        ):
+        if self.reclamation_config is not None and self.policy == SchedulingPolicy.FCFS:
             admission_bypass_limit = self.reclamation_config.admission_bypass_limit
         admission_backfill = admission_bypass_limit > 0
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1023,17 +1010,17 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
                 elif protected_admission:
-                    retry = self._reclaim_retry(
+                    forecast = self._protected_reclaim_forecast(
                         num_scheduled_tokens,
                         request,
                         new_computed_blocks,
                         num_new_local_computed_tokens,
                         full_prefill=True,
                     )
-                    assert retry is not None
+                    assert forecast is not None
                     reserved_blocks = sum(
                         a.required_blocks
-                        for a in retry.allocations
+                        for a in forecast.allocations
                         if a.request_id != request_id
                     )
                     if self._needs_first_decode_reservation(request):
@@ -1348,7 +1335,7 @@ class Scheduler(SchedulerInterface):
             self.reclaim_retry_pending = True
         return scheduler_output
 
-    def _reclaim_retry(
+    def _protected_reclaim_forecast(
         self,
         scheduled: dict[str, int],
         requester: Request,
@@ -1357,7 +1344,7 @@ class Scheduler(SchedulerInterface):
         *,
         full_prefill: bool = False,
         admission_retry: bool = False,
-    ) -> ReclaimRetry | None:
+    ) -> ProtectedReclaimForecast | None:
         """Project continuing requests through one synchronous retry pass.
 
         This is not a capacity reservation: EOS, abort, or new admissions can
@@ -1442,7 +1429,7 @@ class Scheduler(SchedulerInterface):
                     break
         if not reached_requester:
             return None
-        return ReclaimRetry(
+        return ProtectedReclaimForecast(
             self.kv_cache_manager.block_pool.get_num_free_blocks(),
             tuple(allocations),
             tuple(following),
@@ -1500,7 +1487,6 @@ class Scheduler(SchedulerInterface):
         member_bytes = group.kv_cache_spec.page_size_bytes // self.block_size
         member_bytes *= len(group.layer_names)
         candidates = []
-        live_decode_count = 0
         for request in self.running:
             if window is not None and request.request_id not in window.victim_tokens:
                 continue
@@ -1509,7 +1495,6 @@ class Scheduler(SchedulerInterface):
                 or request.num_in_flight_tokens
             ):
                 continue
-            live_decode_count += 1
             if config.decode_reclaim_rounds == 2 and (
                 min(
                     request.max_tokens - request.num_output_tokens,
@@ -1534,19 +1519,12 @@ class Scheduler(SchedulerInterface):
                 default=0,
             )
             source_len = request.effective_kv_len + q
-            keep = protected_prefix + max(
-                request_config.min_keep_tokens,
-                request_config.recent_tokens
-                + max(0, request_config.sink_tokens - protected_prefix),
-                int(request_config.retention * (source_len - protected_prefix)),
+            keep = protected_reclaim_floor(
+                source_len,
+                request.num_computed_tokens + q,
+                protected_prefix,
+                request_config,
             )
-            if config.budget_mode == "protected":
-                keep = protected_reclaim_floor(
-                    source_len,
-                    request.num_computed_tokens + q,
-                    protected_prefix,
-                    request_config,
-                )
             released = len(blocks) - (keep + self.block_size - 1) // self.block_size
             if not 0 < keep < source_len or released <= 0:
                 continue
@@ -1580,193 +1558,113 @@ class Scheduler(SchedulerInterface):
                     binding,
                 )
             )
-        goal = self.kv_cache_manager.last_allocation_shortfall + min(
-            config.reserve_cap, live_decode_count
-        )
         shortfall = self.kv_cache_manager.last_allocation_shortfall
-        if config.budget_mode == "protected":
-            retry = (
-                self._reclaim_retry(
-                    scheduled,
-                    requester,
-                    new_computed_blocks,
-                    num_new_computed_tokens,
-                    full_prefill=True,
-                    admission_retry=(
-                        config.decode_reclaim_rounds == 2
-                        and requester.status != RequestStatus.RUNNING
-                    ),
-                )
-                if requester is not None
-                else None
-            )
-            if retry is not None:
-                shortfall = max(
-                    shortfall,
-                    sum(
-                        a.required_blocks
-                        for a in (*retry.allocations, *retry.following_allocations)
-                    )
-                    - retry.free_blocks,
-                )
-            plan = protected_reclaim_plan(
-                candidates, shortfall, config, self.block_size, member_bytes, retry
-            )
-            if window is not None:
-                window.rounds = 2
-            elif (
-                not plan
-                and config.decode_reclaim_rounds == 2
-                and retry is not None
-                and requester is not None
-                and requester.status != RequestStatus.RUNNING
-                and self.policy == SchedulingPolicy.FCFS
-                and all(
-                    r.num_computed_tokens >= r.num_prompt_tokens for r in self.running
-                )
-            ):
-                growth = {}
-                for allocation in (*retry.allocations, *retry.following_allocations):
-                    if allocation.request_id == requester.request_id:
-                        continue
-                    other = self.requests[allocation.request_id]
-                    end = (
-                        other.effective_kv_len
-                        + scheduled.get(other.request_id, 0)
-                        + allocation.num_tokens
-                    )
-                    growth[other.request_id] = (
-                        end + 2 + self.block_size - 1
-                    ) // self.block_size - (
-                        end + self.block_size - 1
-                    ) // self.block_size
-                plan = protected_two_round_plan(
-                    candidates,
-                    shortfall,
-                    config,
-                    self.block_size,
-                    member_bytes,
-                    retry,
-                    growth,
-                )
-                if plan:
-                    self._decode_reclaim_window = DecodeReclaimWindow(
-                        requester.request_id,
-                        {c.request_id: c.logical_tokens for c in plan},
-                    )
-            if self.kv_cache_manager.trace is not None:
-                from dataclasses import asdict
-
-                self.kv_cache_manager.trace.record(
-                    "protected_plan",
-                    requester=requester.request_id if requester else None,
-                    shortfall=shortfall,
-                    retry_forecast=asdict(retry) if retry is not None else None,
-                    candidates=[asdict(c) for c in candidates],
-                    plan=[asdict(c) for c in plan],
-                    decode_window=(
-                        asdict(self._decode_reclaim_window)
-                        if self._decode_reclaim_window is not None
-                        else None
-                    ),
-                )
-            return plan
-        demand = (
-            demand_reclaim_candidates(
-                candidates, shortfall, goal, config, self.block_size, member_bytes
-            )
-            if config.budget_mode == "demand" or self.kv_cache_manager.trace is not None
-            else candidates
-        )
-        fixed_selected = choose_reclaim_candidate(candidates, goal)
-        demand_selected = choose_reclaim_candidate(demand, goal)
-        mode = config.budget_mode
-        if mode == "prefill_fixed":
-            # A one-pass forecast cannot amortize a known multi-step prefill.
-            # Include waiting and recomputed output history, after this forward.
-            pending_prefill = any(
-                not r.is_finished()
-                and r.num_tokens
-                - r.num_computed_tokens
-                - scheduled.get(r.request_id, 0)
-                - (num_new_computed_tokens if r is requester else 0)
-                > 1
-                for r in self.requests.values()
-            )
-            mode = "fixed" if pending_prefill else "retry_pass"
-        retry = (
-            self._reclaim_retry(
-                scheduled, requester, new_computed_blocks, num_new_computed_tokens
+        forecast = (
+            self._protected_reclaim_forecast(
+                scheduled,
+                requester,
+                new_computed_blocks,
+                num_new_computed_tokens,
+                full_prefill=True,
+                admission_retry=(
+                    config.decode_reclaim_rounds == 2
+                    and requester.status != RequestStatus.RUNNING
+                ),
             )
             if requester is not None
-            and (
-                mode in ("retry", "retry_pass")
-                or self.kv_cache_manager.trace is not None
-            )
             else None
         )
-        retry_candidates = (
-            retry_reclaim_candidates(
+        if forecast is not None:
+            shortfall = max(
+                shortfall,
+                sum(
+                    a.required_blocks
+                    for a in (
+                        *forecast.allocations,
+                        *forecast.following_allocations,
+                    )
+                )
+                - forecast.free_blocks,
+            )
+        plan = protected_reclaim_plan(
+            candidates, shortfall, config, self.block_size, member_bytes, forecast
+        )
+        if window is not None:
+            window.rounds = 2
+        elif (
+            not plan
+            and config.decode_reclaim_rounds == 2
+            and forecast is not None
+            and requester is not None
+            and requester.status != RequestStatus.RUNNING
+            and self.policy == SchedulingPolicy.FCFS
+            and all(r.num_computed_tokens >= r.num_prompt_tokens for r in self.running)
+        ):
+            growth = {}
+            for allocation in (
+                *forecast.allocations,
+                *forecast.following_allocations,
+            ):
+                if allocation.request_id == requester.request_id:
+                    continue
+                other = self.requests[allocation.request_id]
+                end = (
+                    other.effective_kv_len
+                    + scheduled.get(other.request_id, 0)
+                    + allocation.num_tokens
+                )
+                growth[other.request_id] = (
+                    end + 2 + self.block_size - 1
+                ) // self.block_size - (end + self.block_size - 1) // self.block_size
+            plan = protected_two_round_plan(
                 candidates,
-                retry,
-                goal - shortfall,
+                shortfall,
                 config,
                 self.block_size,
                 member_bytes,
+                forecast,
+                growth,
             )
-            if retry is not None
-            else candidates
-        )
-        retry_selected = choose_reclaim_candidate(retry_candidates, goal)
-        selected = {
-            "fixed": fixed_selected,
-            "demand": demand_selected,
-            "retry": retry_selected,
-            "retry_pass": retry_selected,
-        }[mode]
+            if plan:
+                self._decode_reclaim_window = DecodeReclaimWindow(
+                    requester.request_id,
+                    {c.request_id: c.logical_tokens for c in plan},
+                )
         if self.kv_cache_manager.trace is not None:
             from dataclasses import asdict
 
-            required, available = self.kv_cache_manager.last_allocation_capacity
             self.kv_cache_manager.trace.record(
-                "reclaim_candidates",
+                "protected_plan",
                 requester=requester.request_id if requester else None,
-                miss_status=requester.status.name if requester else None,
-                required=required,
-                available=available,
-                shortfall=self.kv_cache_manager.last_allocation_shortfall,
-                goal_blocks=goal,
-                budget=asdict(config),
-                effective_budget_mode=mode,
+                shortfall=shortfall,
+                allocation_forecast=(
+                    asdict(forecast) if forecast is not None else None
+                ),
                 candidates=[asdict(c) for c in candidates],
-                demand_candidates=[asdict(c) for c in demand],
-                retry_forecast=asdict(retry) if retry is not None else None,
-                retry_candidates=[asdict(c) for c in retry_candidates],
-                fixed_selected=asdict(fixed_selected) if fixed_selected else None,
-                demand_selected=asdict(demand_selected) if demand_selected else None,
-                selection_rule="coverage/zero-copy/bytes-per-page/release/arrival/id",
-                shadow_skip_insufficient=bool(candidates)
-                and max(c.released_blocks for c in candidates) < shortfall,
-                selected=selected.request_id if selected else None,
+                plan=[asdict(c) for c in plan],
+                decode_window=(
+                    asdict(self._decode_reclaim_window)
+                    if self._decode_reclaim_window is not None
+                    else None
+                ),
             )
-        if selected is None:
+        if not plan:
             return ()
-        request = self.requests[selected.request_id]
         if self.kv_cache_manager.trace is not None:
-            self.kv_cache_manager.trace_request(
-                "reclaim_select",
-                request,
-                goal_blocks=goal,
-                shortfall=self.kv_cache_manager.last_allocation_shortfall,
-                candidates=len(candidates),
-                released_blocks=selected.released_blocks,
-                keep_tokens=selected.keep_tokens,
-                estimated_copy_bytes=selected.copy_bytes,
-                zero_copy=selected.zero_copy,
-                protected_prefix_tokens=selected.protected_prefix_tokens,
-                q=scheduled.get(selected.request_id, 0),
-            )
-        return (selected,)
+            for selected in plan:
+                self.kv_cache_manager.trace_request(
+                    "reclaim_select",
+                    self.requests[selected.request_id],
+                    shortfall=shortfall,
+                    candidates=len(candidates),
+                    released_blocks=selected.released_blocks,
+                    keep_tokens=selected.keep_tokens,
+                    estimated_copy_bytes=selected.copy_bytes,
+                    zero_copy=selected.zero_copy,
+                    protected_prefix_tokens=selected.protected_prefix_tokens,
+                    q=scheduled.get(selected.request_id, 0),
+                )
+        return plan
 
     def _prepare_reclaim_request(
         self,

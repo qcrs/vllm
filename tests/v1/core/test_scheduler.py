@@ -56,7 +56,6 @@ def pressure_scheduler(tmp_path, monkeypatch):
 
     def create(
         num_blocks,
-        reserve=0,
         enable_prefix_caching=False,
         enable_reclamation=True,
         max_num_batched_tokens=256,
@@ -75,11 +74,9 @@ def pressure_scheduler(tmp_path, monkeypatch):
             enable_prefix_caching=enable_prefix_caching,
             reclamation_config=(
                 {
-                    "pressure": True,
                     "min_keep_tokens": 16,
                     "sink_tokens": 0,
                     "recent_tokens": 0,
-                    "reserve_cap": reserve,
                     **kwargs,
                 }
                 if enable_reclamation
@@ -262,11 +259,10 @@ def test_pressure_running_miss_preserves_partial_batch_and_bounds_retry(
     assert scheduler.kv_cache_manager.get_block_ids("A")[0] == before
 
 
-@pytest.mark.parametrize("reserve", [0, 3])
 def test_pressure_waiting_miss_retries_admission_with_released_pages(
-    pressure_scheduler, reserve
+    pressure_scheduler,
 ):
-    scheduler = pressure_scheduler(5, reserve=reserve)
+    scheduler = pressure_scheduler(5)
     a = create_requests(1, num_tokens=48, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -300,170 +296,14 @@ def test_pressure_running_miss_can_use_maintenance_without_fake_forward(
     assert a.num_preemptions == 0
 
 
-@pytest.mark.parametrize("q", [0, 1])
-def test_pressure_demand_uses_same_post_forward_snapshot(pressure_scheduler, q):
-    scheduler = pressure_scheduler(12, budget_mode="demand")
-    request = create_requests(1, num_tokens=63, req_ids=["A"])[0]
-    scheduler.add_request(request)
-    complete_pressure_step(scheduler, scheduler.schedule())
-    scheduler.kv_cache_manager.last_allocation_shortfall = 1
-    (candidate,) = scheduler._select_reclaim_plan({"A": q})
-    assert candidate.source_effective_kv_len == 63 + q
-    assert candidate.keep_tokens == 48 and candidate.released_blocks == 1
-    assert candidate.q == q
-
-
-@pytest.mark.parametrize(
-    "budget_mode,keep,preemptions", [("demand", 32, 1), ("retry", 31, 0)]
-)
-def test_pressure_retry_accounts_for_earlier_victim_tail(
-    pressure_scheduler, budget_mode, keep, preemptions
-):
-    """Same release count, but one tail slot prevents the first retry miss."""
-    scheduler = pressure_scheduler(7, budget_mode=budget_mode, retention=0.25)
-    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
-    scheduler.add_request(a)
-    complete_pressure_step(scheduler, scheduler.schedule())
-    b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
-    scheduler.add_request(b)
-    output = scheduler.schedule()
-    assert output.reclaim_requests[0].request_id == "A"
-    assert output.reclaim_requests[0].target_keep_tokens == keep
-    complete_pressure_step(scheduler, output)
-    free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
-    retry = scheduler.schedule()
-    assert not retry.reclaim_requests
-    # B is waiting: lack of space must never become an eager preemption.
-    assert a.num_preemptions == b.num_preemptions == 0
-    assert (b.status == RequestStatus.WAITING) == bool(preemptions)
-    if not preemptions:
-        assert retry.num_scheduled_tokens == {"A": 1, "B": 64}
-        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free - 4
-
-
-def test_pressure_retry_requester_can_be_the_victim(pressure_scheduler):
-    scheduler = pressure_scheduler(3, budget_mode="retry")
-    a = create_requests(1, num_tokens=32, req_ids=["A"])[0]
-    scheduler.add_request(a)
-    complete_pressure_step(scheduler, scheduler.schedule())
-    output = scheduler.schedule()
-    assert output.reclaim_requests[0].target_keep_tokens == 16
-    assert output.total_num_scheduled_tokens == 0
-    complete_pressure_step(scheduler, output)
-    retry = scheduler.schedule()
-    assert retry.num_scheduled_tokens == {"A": 1}
-    assert a.num_preemptions == 0
-
-
-@pytest.mark.parametrize("mode", ["retry", "prefill_fixed"])
-def test_pressure_retry_preserves_running_requester_without_preemption(
-    pressure_scheduler, mode
-):
-    scheduler = pressure_scheduler(7, budget_mode=mode, retention=0.25)
-    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
-    b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
-    for request in (a, b):
-        scheduler.add_request(request)
-    complete_pressure_step(scheduler, scheduler.schedule())
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"A": 1}
-    assert output.reclaim_requests[0].request_id == "A"
-    assert output.reclaim_requests[0].target_keep_tokens == 47
-    complete_pressure_step(scheduler, output)
-    retry = scheduler.schedule()
-    assert retry.num_scheduled_tokens == {"A": 1, "B": 1}
-    assert a.num_preemptions == b.num_preemptions == 0
-
-
-@pytest.mark.parametrize(
-    "mode,keep,preemptions",
-    [("retry", 48, 1), ("retry_pass", 31, 0), ("prefill_fixed", 16, 0)],
-)
-def test_pressure_retry_pass_covers_following_prefill(
-    pressure_scheduler, mode, keep, preemptions
-):
-    """A's retry must leave capacity for B later in the same bounded pass."""
-    scheduler = pressure_scheduler(7, budget_mode=mode, retention=0.25)
-    scheduler.max_num_scheduled_tokens = 96
-    a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
-    b = create_requests(1, num_tokens=128, req_ids=["B"])[0]
-    for request in (a, b):
-        scheduler.add_request(request)
-    initial = scheduler.schedule()
-    assert initial.num_scheduled_tokens == {"A": 64, "B": 32}
-    complete_pressure_step(scheduler, initial)
-    scheduler.max_num_scheduled_tokens = 33
-    output = scheduler.schedule()
-    assert output.total_num_scheduled_tokens == 0
-    assert output.reclaim_requests[0].target_keep_tokens == keep
-    complete_pressure_step(scheduler, output)
-    retry = scheduler.schedule()
-    assert not retry.reclaim_requests
-    assert b.num_preemptions == preemptions
-    assert retry.num_scheduled_tokens == (
-        {"A": 1} if preemptions else {"A": 1, "B": 32}
-    )
-
-
-def test_pressure_prefill_fixed_batches_release_for_waiting_prefill(pressure_scheduler):
-    """An unadmitted prompt must not look like decode via is_prefill_chunk."""
-    scheduler = pressure_scheduler(7, budget_mode="prefill_fixed", retention=0.25)
-    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
-    scheduler.add_request(a)
-    complete_pressure_step(scheduler, scheduler.schedule())
-    b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
-    scheduler.add_request(b)
-    assert not b.is_prefill_chunk
-    output = scheduler.schedule()
-    assert output.reclaim_requests[0].target_keep_tokens == 16
-    complete_pressure_step(scheduler, output)
-    retry = scheduler.schedule()
-    assert retry.num_scheduled_tokens == {"A": 1, "B": 64}
-    assert a.num_preemptions == b.num_preemptions == 0
-
-
-@pytest.mark.parametrize("state", ["last_chunk", "aborted", "recompute"])
-def test_pressure_prefill_fixed_follows_live_post_forward_work(
-    pressure_scheduler, state
-):
-    """Use live logical work, including output replay, without a phase flag."""
-    scheduler = pressure_scheduler(16, budget_mode="prefill_fixed", retention=0.25)
-    a = create_requests(1, num_tokens=63, req_ids=["A"])[0]
-    scheduler.add_request(a)
-    complete_pressure_step(scheduler, scheduler.schedule())
-    b = create_requests(1, num_tokens=32, req_ids=["B"])[0]
-    scheduler.add_request(b)
-    output = scheduler.schedule()
-    if state == "aborted":
-        complete_pressure_step(scheduler, output)
-        scheduler.finish_requests(["B"], RequestStatus.FINISHED_ABORTED)
-        scheduled = {}
-    elif state == "recompute":
-        complete_pressure_step(scheduler, output)
-        b.append_output_token_ids([42] * 32)
-        scheduler.running.remove(b)
-        scheduler._preempt_request(b, 0)
-        scheduler.waiting.prepend_request(b)
-        # Replay has reached the prompt boundary, but known output history remains.
-        scheduled = {"B": b.num_prompt_tokens}
-    else:
-        # Selection occurs before _update_after_schedule advances these tokens.
-        for request in scheduler.running:
-            request.num_computed_tokens -= request.num_in_flight_tokens
-            request.num_in_flight_tokens = 0
-        scheduled = output.num_scheduled_tokens
-    (candidate,) = scheduler._select_reclaim_plan(scheduled, a)
-    assert candidate.keep_tokens == (16 if state == "recompute" else 48)
-
-
-def test_pressure_policy_binding_controls_budget_and_survives_preemption(
+def test_pressure_policy_binding_survives_preemption(
     pressure_scheduler,
 ):
     from dataclasses import replace
 
     from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-    scheduler = pressure_scheduler(12, budget_mode="demand")
+    scheduler = pressure_scheduler(12)
     request = create_requests(num_requests=1, num_tokens=64)[0]
     config = replace(scheduler.reclamation_config, policy="full")
     request.policy_binding = PolicyBinding(1, config)
@@ -5913,7 +5753,7 @@ def test_async_load_reservation_prevents_wedge_e2e():
 
 def test_pressure_protected_repeated_reclaim_stops_at_logical_floor(pressure_scheduler):
     """Repeated real Pool commits keep L while bounding each deletion and total loss."""
-    scheduler = pressure_scheduler(40, budget_mode="protected")
+    scheduler = pressure_scheduler(40)
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -5951,7 +5791,7 @@ def test_pressure_protected_waiter_uses_reclaimed_capacity_before_abort(
     pressure_scheduler,
 ):
     """A decode tail must not repeatedly consume the waiting request's page."""
-    scheduler = pressure_scheduler(33, budget_mode="protected")
+    scheduler = pressure_scheduler(33)
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -5977,7 +5817,7 @@ def test_pressure_protected_waiter_uses_reclaimed_capacity_before_abort(
 def test_pressure_protected_two_rounds_require_completed_decode(pressure_scheduler):
     """Partial releases admit the original waiter only after a real decode gap."""
     scheduler = pressure_scheduler(
-        29, budget_mode="protected", admission_bypass_limit=2, decode_reclaim_rounds=2
+        29, admission_bypass_limit=2, decode_reclaim_rounds=2
     )
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
@@ -6028,7 +5868,6 @@ def test_pressure_protected_prefill_budget_allows_short_request_progress(
     """KV admission and compute fairness must both allow short requests to run."""
     scheduler = pressure_scheduler(
         682,
-        budget_mode="protected",
         admission_bypass_limit=2,
         decode_reclaim_rounds=2,
         max_num_batched_tokens=1024,
@@ -6073,7 +5912,7 @@ def test_pressure_protected_admission_reserves_first_decode_page(
     pressure_scheduler, max_tokens
 ):
     """A page-aligned prompt must not be admitted into an immediate decode miss."""
-    scheduler = pressure_scheduler(4, budget_mode="protected", decode_reclaim_rounds=2)
+    scheduler = pressure_scheduler(4, decode_reclaim_rounds=2)
     incumbent = create_requests(1, num_tokens=16, max_tokens=3, req_ids=["A"])[0]
     waiter = create_requests(1, num_tokens=16, max_tokens=max_tokens, req_ids=["B"])[0]
     scheduler.add_request(incumbent)
@@ -6097,7 +5936,7 @@ def test_pressure_protected_two_rounds_infeasible_preserves_backfill(
 ):
     """Do not mutate a victim when even two rounds cannot admit the waiter."""
     scheduler = pressure_scheduler(
-        25, budget_mode="protected", admission_bypass_limit=2, decode_reclaim_rounds=2
+        25, admission_bypass_limit=2, decode_reclaim_rounds=2
     )
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
@@ -6114,7 +5953,7 @@ def test_pressure_protected_two_rounds_infeasible_preserves_backfill(
 
 def test_pressure_protected_two_round_window_clears_on_waiter_abort(pressure_scheduler):
     """An aborted beneficiary must not keep blocking later admissions."""
-    scheduler = pressure_scheduler(29, budget_mode="protected", decode_reclaim_rounds=2)
+    scheduler = pressure_scheduler(29, decode_reclaim_rounds=2)
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -6132,7 +5971,7 @@ def test_pressure_protected_two_round_window_clears_on_waiter_abort(pressure_sch
 
 def test_pressure_protected_two_rounds_wait_for_imminent_finish(pressure_scheduler):
     """A deterministic one-token finish should free its KV without compaction."""
-    scheduler = pressure_scheduler(33, budget_mode="protected", decode_reclaim_rounds=2)
+    scheduler = pressure_scheduler(33, decode_reclaim_rounds=2)
     a = create_requests(1, num_tokens=256, max_tokens=2, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -6149,7 +5988,7 @@ def test_pressure_protected_rejects_partial_admission_without_full_capacity(
     pressure_scheduler,
 ):
     """A first chunk fitting must not admit an unfinishable long prefill."""
-    scheduler = pressure_scheduler(25, budget_mode="protected")
+    scheduler = pressure_scheduler(25)
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -6168,13 +6007,17 @@ def test_pressure_protected_rejects_partial_admission_without_full_capacity(
 @pytest.mark.parametrize(
     "options",
     [
-        {"admission_bypass_limit": 1},
-        {"pressure": True, "admission_bypass_limit": 1},
-        {"budget_mode": "protected", "admission_bypass_limit": 1},
+        {"budget_mode": "fixed"},
+        {"budget_mode": "demand"},
+        {"budget_mode": "retry"},
+        {"budget_mode": "retry_pass"},
+        {"budget_mode": "prefill_fixed"},
+        {"pressure": True},
+        {"reserve_cap": 1},
     ],
 )
-def test_admission_bypass_requires_pressure_protected_mode(options):
-    with pytest.raises(ValueError, match="Admission bypass requires pressure"):
+def test_reclamation_rejects_legacy_controller_options(options):
+    with pytest.raises(TypeError):
         ReclamationConfig(**options)
 
 
@@ -6185,7 +6028,6 @@ def test_pressure_protected_backfill_bounds_successful_admissions(
     """Only successful FCFS admissions behind a KV-blocked head spend quota."""
     scheduler = pressure_scheduler(
         50,
-        budget_mode="protected",
         admission_bypass_limit=bypass_limit,
     )
     incumbent = create_requests(
@@ -6249,9 +6091,7 @@ def test_pressure_protected_backfill_preserves_prefill_capacity_guard(
     pressure_scheduler,
 ):
     """Moving the KV-blocked head must not re-arm DP prefill throttling."""
-    scheduler = pressure_scheduler(
-        50, budget_mode="protected", admission_bypass_limit=2
-    )
+    scheduler = pressure_scheduler(50, admission_bypass_limit=2)
     incumbent = create_requests(
         1, num_tokens=256, max_tokens=128, req_ids=["incumbent"]
     )[0]
@@ -6281,7 +6121,6 @@ def test_pressure_protected_backfill_resets_when_blocked_head_aborts(
     """A removed blocked head must not carry its bypass quota to the next head."""
     scheduler = pressure_scheduler(
         50,
-        budget_mode="protected",
         admission_bypass_limit=2,
     )
     incumbent = create_requests(
@@ -6323,7 +6162,7 @@ def test_pressure_protected_backfill_resets_when_blocked_head_aborts(
 
 def test_pressure_protected_reserves_already_admitted_prefill(pressure_scheduler):
     """New admissions cannot consume capacity owed to an earlier chunked prefill."""
-    scheduler = pressure_scheduler(34, budget_mode="protected")
+    scheduler = pressure_scheduler(34)
     a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
     scheduler.add_request(a)
     complete_pressure_step(scheduler, scheduler.schedule())
@@ -6346,7 +6185,7 @@ def test_pressure_protected_reserves_already_admitted_prefill(pressure_scheduler
 
 def test_pressure_protected_amortizes_decode_pages_until_completion(pressure_scheduler):
     """One maintenance covers both bounded decodes without subsequent page misses."""
-    scheduler = pressure_scheduler(257, budget_mode="protected")
+    scheduler = pressure_scheduler(257)
     scheduler.max_num_scheduled_tokens = 2048
     a = create_requests(1, num_tokens=2048, max_tokens=64, req_ids=["A"])[0]
     scheduler.add_request(a)
@@ -6377,13 +6216,15 @@ def test_pressure_protected_headroom_uses_bounded_uncomputed_output(
     pressure_scheduler, max_tokens
 ):
     """Future output sizes capacity only; it never changes the logical KV floor."""
-    scheduler = pressure_scheduler(65, budget_mode="protected")
+    scheduler = pressure_scheduler(65)
     request = create_requests(1, num_tokens=256, max_tokens=max_tokens)[0]
     scheduler.add_request(request)
-    retry = scheduler._reclaim_retry({}, request, None, 0, full_prefill=True)
-    assert retry is not None
+    forecast = scheduler._protected_reclaim_forecast(
+        {}, request, None, 0, full_prefill=True
+    )
+    assert forecast is not None
     limit = min(256 + max_tokens - 1, scheduler.max_model_len - 1)
-    assert retry.completion_headroom_blocks == (max(0, limit - 256) + 15) // 16
+    assert forecast.completion_headroom_blocks == (max(0, limit - 256) + 15) // 16
     assert request.num_computed_tokens == request.effective_kv_len == 0
 
 
@@ -6392,7 +6233,7 @@ def test_pressure_protected_pair_commits_only_after_all_results_validate(
     pressure_scheduler, invalid_second
 ):
     """A real waiting miss needs two victims; a bad second ACK frees neither."""
-    scheduler = pressure_scheduler(21, budget_mode="protected")
+    scheduler = pressure_scheduler(21)
     a, b = create_requests(2, num_tokens=128, max_tokens=128, req_ids=["A", "B"])
     scheduler.add_request(a)
     scheduler.add_request(b)
@@ -6447,9 +6288,7 @@ def test_pressure_protected_invalid_plan_does_not_deindex_first_victim(
     pressure_scheduler,
 ):
     """Planning/validation finishes before any shared hash index is changed."""
-    scheduler = pressure_scheduler(
-        40, budget_mode="protected", enable_prefix_caching=True
-    )
+    scheduler = pressure_scheduler(40, enable_prefix_caching=True)
     a, b = create_requests(2, num_tokens=128, max_tokens=128, req_ids=["A", "B"])
     for request in (a, b):
         scheduler.add_request(request)
@@ -6475,7 +6314,7 @@ def test_pressure_protected_ended_victim_frees_once_and_live_peer_commits(
     pressure_scheduler, victims, end
 ):
     """Native abort/finish frees once; late ACK skips an aborted victim."""
-    scheduler = pressure_scheduler(11 if victims == 1 else 21, budget_mode="protected")
+    scheduler = pressure_scheduler(11 if victims == 1 else 21)
     requests = create_requests(
         victims, num_tokens=128, max_tokens=128, req_ids=["A", "B"][:victims]
     )

@@ -17,12 +17,9 @@ from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import CompilationConfig, CompilationMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_reclamation import (
-    ReclaimAllocation,
     ReclaimCandidate,
-    ReclaimRetry,
     protected_reclaim_floor,
     protected_reclaim_plan,
-    retry_reclaim_candidates,
     sink_recent_ranges,
 )
 
@@ -46,19 +43,15 @@ def main():
     parser.add_argument("--tp", type=int, choices=[1, 2], default=2)
     parser.add_argument("--policy-updates", action="store_true")
     parser.add_argument("--worker-cpus", nargs="+", type=int)
-    parser.add_argument("--demand-pages", type=int)
-    parser.add_argument("--retry-tail", action="store_true")
-    parser.add_argument("--protected", action="store_true")
+    parser.add_argument("--shortfall-pages", type=int)
     parser.add_argument("--victims", type=int, choices=[1, 2], default=1)
     parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
     two_round = args.decode_reclaim_rounds == 2
-    if two_round and (not args.protected or args.prefix or args.policy_updates):
-        parser.error("two rounds require protected mode without prefix/policy updates")
+    if two_round and (args.prefix or args.policy_updates):
+        parser.error("two rounds do not support prefix caching or policy updates")
     # Include the waiter's first decode page in the two-round feasible fixture.
     pool_blocks = (29 if args.victims == 1 else 43) if two_round else 33
-    if args.retry_tail and args.demand_pages is None:
-        parser.error("--retry-tail requires --demand-pages")
     if args.worker_cpus:
         assert len(args.worker_cpus) == args.tp
     run = Path(os.environ["P1_RUN_DIR"])
@@ -109,8 +102,6 @@ def main():
         additional_config={
             "kv_reclamation": {
                 "min_keep_tokens": 32,
-                "pressure": args.victims == 2 or two_round,
-                "budget_mode": "protected" if args.protected else "fixed",
                 "decode_reclaim_rounds": args.decode_reclaim_rounds,
                 "policy": args.policy,
                 "stats_path": os.environ.get("P1_STATS"),
@@ -160,7 +151,7 @@ def main():
         "D": common + tokenizer.encode("David stayed at home. " * 40)[:64],
     }
     if args.victims == 2:
-        assert args.protected and not args.prefix and not args.policy_updates
+        assert not args.prefix and not args.policy_updates
         prompts["C"] = prompts["C"][:160]
     if two_round:
         prompts["C"] = prompts["A"].copy()
@@ -234,50 +225,7 @@ def main():
                 keep -= 1 if step == 16 else 2
             if args.policy_updates:
                 keep = {"A": 127, "B": 63, "C": 95}[victim]
-            if args.demand_pages is not None:
-                source = request.effective_kv_len + output.num_scheduled_tokens.get(
-                    request.request_id, 0
-                )
-                keep = min(
-                    source - 1,
-                    16
-                    * (
-                        len(manager.get_block_ids(request.request_id)[0])
-                        - args.demand_pages
-                    ),
-                )
-                if args.retry_tail:
-                    row = tuple(manager.get_block_ids(request.request_id)[0])
-                    candidate = ReclaimCandidate(
-                        request.request_id,
-                        32,
-                        len(row) - 2,
-                        0,
-                        False,
-                        0,
-                        source_effective_kv_len=source,
-                        source_block_ids=row,
-                        policy_binding=request.policy_binding,
-                    )
-                    retry = ReclaimRetry(
-                        0,
-                        (
-                            ReclaimAllocation(request.request_id, 1, 0),
-                            ReclaimAllocation(
-                                "requester", 16 * args.demand_pages, args.demand_pages
-                            ),
-                        ),
-                    )
-                    keep = retry_reclaim_candidates(
-                        [candidate],
-                        retry,
-                        0,
-                        scheduler.reclamation_config,
-                        16,
-                        1,
-                    )[0].keep_tokens
-            if args.protected:
-                assert args.demand_pages is not None
+            if args.shortfall_pages is not None:
                 source = request.effective_kv_len + output.num_scheduled_tokens.get(
                     request.request_id, 0
                 )
@@ -299,7 +247,7 @@ def main():
                     policy_binding=request.policy_binding,
                 )
                 plan = protected_reclaim_plan(
-                    [candidate], args.demand_pages, config, 16, 1
+                    [candidate], args.shortfall_pages, config, 16, 1
                 )
                 assert len(plan) == 1
                 keep = plan[0].keep_tokens
@@ -308,7 +256,7 @@ def main():
             )
             intent = output.reclaim_requests[0] if output.reclaim_requests else None
             if (
-                args.demand_pages is None
+                args.shortfall_pages is None
                 and args.path == "token"
                 and args.policy == "sink_recent"
             ):
@@ -555,13 +503,13 @@ def main():
                         for k in ("keep", "row", "E", "path")
                     )
                     if (
-                        args.demand_pages is None
+                        args.shortfall_pages is None
                         and args.victims == 1
                         and not two_round
                     ):
                         assert left_rank["path"] == args.path
-                if args.demand_pages is not None:
-                    assert len(events[-1]["released"]) == args.demand_pages
+                if args.shortfall_pages is not None:
+                    assert len(events[-1]["released"]) == args.shortfall_pages
                 events[-1]["rank_results"] = [left, right]
                 executor.collective_rpc("p1_poison", args=(events[-1]["released"],))
             if step >= 17 and not engine.has_unfinished_requests():

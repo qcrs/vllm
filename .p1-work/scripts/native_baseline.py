@@ -46,8 +46,6 @@ def main():
                 "policy": os.environ.get("P1_POLICY", "sink_recent"),
                 "stats_path": os.environ.get("P1_STATS"),
                 "retention": float(os.environ.get("P1_RETENTION", "1")),
-                "pressure": os.environ.get("P1_CONTROLLER") == "1",
-                "reserve_cap": int(os.environ.get("P1_RESERVE", "0")),
                 "min_keep_tokens": int(os.environ.get("P1_MIN_KEEP", "128")),
                 "sink_tokens": int(os.environ.get("P1_SINK", "16")),
                 "recent_tokens": int(os.environ.get("P1_RECENT", "16")),

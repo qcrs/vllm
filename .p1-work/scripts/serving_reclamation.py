@@ -241,21 +241,8 @@ def main():
     )
     parser.add_argument("--pool-gib", type=float, required=True)
     parser.add_argument("--stats")
-    parser.add_argument("--reserve", type=int, default=0)
     parser.add_argument("--admission-bypass-limit", type=int, default=0)
     parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
-    parser.add_argument(
-        "--budget-mode",
-        choices=[
-            "fixed",
-            "demand",
-            "retry",
-            "retry_pass",
-            "prefill_fixed",
-            "protected",
-        ],
-        default="fixed",
-    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--reclamation-counts", action="store_true")
@@ -275,12 +262,8 @@ def main():
         parser.error("short and mixed workloads do not define shared prefix identities")
     if args.admission_bypass_limit < 0:
         parser.error("admission bypass limit must be nonnegative")
-    if args.admission_bypass_limit and (
-        args.policy == "full" or args.budget_mode != "protected"
-    ):
-        parser.error(
-            "admission bypass limit requires a reclamation policy in protected mode"
-        )
+    if args.admission_bypass_limit and args.policy == "full":
+        parser.error("admission bypass limit requires an enabled reclamation policy")
     run = Path(os.environ["P1_RUN_DIR"])
     source_root = Path(__file__).resolve().parents[2]
     sources = [
@@ -401,9 +384,6 @@ def main():
             "kv_reclamation": {
                 "policy": "sink_recent" if args.policy == "noop" else args.policy,
                 "retention": 1.0 if args.policy == "noop" else 0.5,
-                "pressure": True,
-                "reserve_cap": args.reserve,
-                "budget_mode": args.budget_mode,
                 "stats_path": args.stats,
                 "admission_bypass_limit": args.admission_bypass_limit,
                 "decode_reclaim_rounds": args.decode_reclaim_rounds,

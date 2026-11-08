@@ -4,7 +4,6 @@
 
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from functools import cmp_to_key
 from itertools import combinations
 from typing import TYPE_CHECKING
 
@@ -20,26 +19,14 @@ if TYPE_CHECKING:
 class ReclamationConfig:
     policy: str = "sink_recent"
     stats_path: str | None = None
-    pressure: bool = False
     retention: float = 0.5
     sink_tokens: int = 16
     recent_tokens: int = 16
     min_keep_tokens: int = 128
-    reserve_cap: int = 0
-    budget_mode: str = "fixed"
     admission_bypass_limit: int = 0
     decode_reclaim_rounds: int = 1
 
     def __post_init__(self) -> None:
-        if self.budget_mode not in (
-            "fixed",
-            "demand",
-            "retry",
-            "retry_pass",
-            "prefill_fixed",
-            "protected",
-        ):
-            raise ValueError("Unknown KV reclamation budget mode")
         if self.policy not in ("full", "sink_recent", "random", "triattention"):
             raise ValueError("Unknown KV reclamation policy")
         if self.policy == "triattention" and self.stats_path is None:
@@ -50,7 +37,6 @@ class ReclamationConfig:
             min(
                 self.sink_tokens,
                 self.recent_tokens,
-                self.reserve_cap,
                 self.admission_bypass_limit,
             )
             < 0
@@ -58,16 +44,8 @@ class ReclamationConfig:
             raise ValueError("KV reclamation protection/reserve must be nonnegative")
         if self.min_keep_tokens < self.sink_tokens + self.recent_tokens:
             raise ValueError("min_keep_tokens must cover sink and recent protection")
-        if self.admission_bypass_limit and (
-            not self.pressure or self.budget_mode != "protected"
-        ):
-            raise ValueError("Admission bypass requires pressure protected mode")
         if self.decode_reclaim_rounds not in (1, 2):
             raise ValueError("Decode reclamation supports at most two rounds")
-        if self.decode_reclaim_rounds == 2 and (
-            not self.pressure or self.budget_mode != "protected"
-        ):
-            raise ValueError("Two-round reclamation requires pressure protected mode")
 
     @classmethod
     def from_vllm_config(cls, config: "VllmConfig") -> "ReclamationConfig | None":
@@ -191,7 +169,7 @@ class ReclaimAllocation:
 
 
 @dataclass(frozen=True)
-class ReclaimRetry:
+class ProtectedReclaimForecast:
     free_blocks: int
     allocations: tuple[ReclaimAllocation, ...]
     following_allocations: tuple[ReclaimAllocation, ...] = ()
@@ -221,18 +199,19 @@ def protected_reclaim_plan(
     config: ReclamationConfig,
     block_size: int,
     member_bytes: int,
-    retry: ReclaimRetry | None = None,
+    forecast: ProtectedReclaimForecast | None = None,
 ) -> tuple[ReclaimCandidate, ...]:
     """Cover hard demand, then amortize within the same protected victims."""
     plan = _protected_reclaim_plan(
-        candidates, shortfall, config, block_size, member_bytes, retry
+        candidates, shortfall, config, block_size, member_bytes, forecast
     )
-    if not plan or retry is None or retry.completion_headroom_blocks == 0:
+    if not plan or forecast is None or forecast.completion_headroom_blocks == 0:
         return plan
     chosen = {c.request_id for c in plan}
     selected = [c for c in candidates if c.request_id in chosen]
     allocations = {
-        a.request_id: a for a in (*retry.allocations, *retry.following_allocations)
+        a.request_id: a
+        for a in (*forecast.allocations, *forecast.following_allocations)
     }
     capacity = 0
     for candidate in selected:
@@ -245,9 +224,9 @@ def protected_reclaim_plan(
             // block_size
             + allocation.required_blocks
         )
-    goal = min(shortfall + retry.completion_headroom_blocks, capacity)
+    goal = min(shortfall + forecast.completion_headroom_blocks, capacity)
     return _protected_reclaim_plan(
-        selected, goal, config, block_size, member_bytes, retry
+        selected, goal, config, block_size, member_bytes, forecast
     )
 
 
@@ -257,7 +236,7 @@ def protected_two_round_plan(
     config: ReclamationConfig,
     block_size: int,
     member_bytes: int,
-    retry: ReclaimRetry,
+    forecast: ProtectedReclaimForecast,
     inter_round_growth: dict[str, int],
 ) -> tuple[ReclaimCandidate, ...]:
     """Start only a feasible two-round path; execution replans after real decode.
@@ -266,7 +245,8 @@ def protected_two_round_plan(
     admission retry. The projected rows are used only for capacity arithmetic.
     """
     allocations = {
-        a.request_id: a for a in (*retry.allocations, *retry.following_allocations)
+        a.request_id: a
+        for a in (*forecast.allocations, *forecast.following_allocations)
     }
     ordered = sorted(candidates, key=lambda c: (c.arrival_time, c.request_id))
     for count in (1, 2):
@@ -297,7 +277,7 @@ def protected_two_round_plan(
                     + allocation.required_blocks
                 )
                 plan = _protected_reclaim_plan(
-                    [candidate], capacity, config, block_size, member_bytes, retry
+                    [candidate], capacity, config, block_size, member_bytes, forecast
                 )
                 if not plan:
                     break
@@ -325,7 +305,7 @@ def protected_two_round_plan(
             if (
                 len(first) == count
                 and final_capacity >= shortfall + growth
-                and retry.free_blocks + sum(c.released_blocks for c in first)
+                and forecast.free_blocks + sum(c.released_blocks for c in first)
                 >= interim_demand
             ):
                 feasible.append(tuple(first))
@@ -347,14 +327,17 @@ def _protected_reclaim_plan(
     config: ReclamationConfig,
     block_size: int,
     member_bytes: int,
-    retry: ReclaimRetry | None,
+    forecast: ProtectedReclaimForecast | None,
 ) -> tuple[ReclaimCandidate, ...]:
     """Cover net demand, including victims' own post-reclaim allocations."""
     if shortfall <= 0:
         return ()
     allocations = (
-        {a.request_id: a for a in (*retry.allocations, *retry.following_allocations)}
-        if retry is not None
+        {
+            a.request_id: a
+            for a in (*forecast.allocations, *forecast.following_allocations)
+        }
+        if forecast is not None
         else {}
     )
 
@@ -401,7 +384,7 @@ def _protected_reclaim_plan(
                 == (keep + allocation.num_tokens + block_size - 1) // block_size
             ):
                 keep = aligned
-        return retarget_reclaim_candidate(
+        return _retarget_protected_candidate(
             candidate, keep, policy, block_size, member_bytes
         )
 
@@ -466,65 +449,7 @@ def _protected_reclaim_plan(
     return best
 
 
-def retry_reclaim_candidates(
-    candidates: list[ReclaimCandidate],
-    retry: ReclaimRetry,
-    reserve: int,
-    config: ReclamationConfig,
-    block_size: int,
-    member_bytes: int,
-) -> list[ReclaimCandidate]:
-    """Maximize K for the retry, optionally covering its known remaining pass.
-
-    For a victim visited before (or at) the requester, release minus its next
-    allocation is N - ceil((K + q_next) / B). A victim visited later has q_next=0.
-    The full pass is a soft target, subordinate to the retention floor. This
-    includes tail slack without reserving an unconditional extra page.
-    """
-    targets = [retry.allocations]
-    if (
-        config.budget_mode in ("retry_pass", "prefill_fixed")
-        and retry.following_allocations
-    ):
-        targets.insert(0, retry.allocations + retry.following_allocations)
-    for allocations in targets:
-        total = sum(a.required_blocks for a in allocations)
-        by_id = {a.request_id: a for a in allocations}
-        for headroom in dict.fromkeys((reserve, 0)):
-            covering = []
-            for candidate in candidates:
-                allocation = by_id.get(candidate.request_id)
-                other = total - (allocation.required_blocks if allocation else 0)
-                keep = min(
-                    candidate.source_effective_kv_len - 1,
-                    block_size * (len(candidate.source_block_ids) - 1),
-                    block_size
-                    * (
-                        retry.free_blocks
-                        + len(candidate.source_block_ids)
-                        - other
-                        - headroom
-                    )
-                    - (allocation.num_tokens if allocation else 0),
-                )
-                if keep >= candidate.keep_tokens:
-                    covering.append(
-                        retarget_reclaim_candidate(
-                            candidate,
-                            keep,
-                            candidate.policy_binding.config
-                            if candidate.policy_binding is not None
-                            else config,
-                            block_size,
-                            member_bytes,
-                        )
-                    )
-            if covering:
-                return covering
-    return candidates
-
-
-def retarget_reclaim_candidate(
+def _retarget_protected_candidate(
     candidate: ReclaimCandidate,
     keep: int,
     config: ReclamationConfig,
@@ -557,64 +482,6 @@ def retarget_reclaim_candidate(
         copy_bytes=0 if zero_copy else 2 * (keep - prefix) * member_bytes,
         zero_copy=zero_copy,
     )
-
-
-def demand_reclaim_candidates(
-    candidates: list[ReclaimCandidate],
-    shortfall: int,
-    goal: int,
-    config: ReclamationConfig,
-    block_size: int,
-    member_bytes: int,
-) -> list[ReclaimCandidate]:
-    """Maximize K at G, then D; retain fixed floors if neither is feasible."""
-    for target in dict.fromkeys((goal, shortfall)):
-        if target <= 0:
-            continue
-        covering = []
-        for candidate in candidates:
-            keep = min(
-                candidate.source_effective_kv_len - 1,
-                block_size * (len(candidate.source_block_ids) - target),
-            )
-            if keep >= candidate.keep_tokens:
-                covering.append(
-                    retarget_reclaim_candidate(
-                        candidate,
-                        keep,
-                        candidate.policy_binding.config
-                        if candidate.policy_binding is not None
-                        else config,
-                        block_size,
-                        member_bytes,
-                    )
-                )
-        if covering:
-            return covering
-    return candidates
-
-
-def choose_reclaim_candidate(
-    candidates: list[ReclaimCandidate], goal_blocks: int
-) -> ReclaimCandidate | None:
-    """Prefer coverage, then zero copy and exact cost-per-released-page order."""
-    if not candidates:
-        return None
-    covering = [c for c in candidates if c.released_blocks >= goal_blocks]
-
-    def compare(a: ReclaimCandidate, b: ReclaimCandidate) -> int:
-        if not covering and a.released_blocks != b.released_blocks:
-            return -1 if a.released_blocks > b.released_blocks else 1
-        if a.zero_copy != b.zero_copy:
-            return -1 if a.zero_copy else 1
-        ratio = a.copy_bytes * b.released_blocks - b.copy_bytes * a.released_blocks
-        if ratio:
-            return -1 if ratio < 0 else 1
-        a_key = (-a.released_blocks, a.arrival_time, a.request_id)
-        b_key = (-b.released_blocks, b.arrival_time, b.request_id)
-        return (a_key > b_key) - (a_key < b_key)
-
-    return min(covering or candidates, key=cmp_to_key(compare))
 
 
 def sink_recent_ranges(

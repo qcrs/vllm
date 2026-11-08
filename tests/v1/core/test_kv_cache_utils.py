@@ -61,18 +61,15 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.kv_reclamation import (
+    ProtectedReclaimForecast,
     ReclaimAllocation,
     ReclaimCandidate,
     ReclaimRequest,
     ReclaimResult,
-    ReclaimRetry,
     ReclamationConfig,
-    choose_reclaim_candidate,
-    demand_reclaim_candidates,
     protected_reclaim_floor,
     protected_reclaim_plan,
     protected_two_round_plan,
-    retry_reclaim_candidates,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -1607,123 +1604,6 @@ def reclamation_owner():
     return manager, request, intent
 
 
-@pytest.mark.parametrize("goal,expected", [(2, "zero"), (5, "cheap"), (20, "large")])
-def test_reclamation_candidate_coverage_cost_and_stable_tie(goal, expected):
-    candidates = [
-        ReclaimCandidate("large", 128, 10, 100, False, 3),
-        ReclaimCandidate("cheap", 128, 6, 30, False, 2),
-        ReclaimCandidate("zero", 128, 4, 0, True, 1),
-        ReclaimCandidate("tie", 128, 6, 30, False, 2),
-    ]
-    assert choose_reclaim_candidate(candidates, goal).request_id == expected
-
-
-@pytest.mark.parametrize(
-    "source,prefix,floor,shortfall,goal,expected",
-    [
-        (1024, 0, 512, 4, 4, 960),
-        (1025, 0, 512, 1, 1, 1024),
-        (1009, 64, 576, 4, 4, 960),
-        (1024, 64, 576, 28, 30, 576),  # Only D is feasible.
-        (1024, 0, 512, 40, 40, 512),  # Neither target: original floor.
-    ],
-)
-def test_reclamation_demand_maximizes_keep_within_floor(
-    source, prefix, floor, shortfall, goal, expected
-):
-    """Partial tails and soft reserve must not force K below the quality floor."""
-    row = tuple(range((source + 15) // 16))
-    candidate = ReclaimCandidate(
-        "A",
-        floor,
-        len(row) - (floor + 15) // 16,
-        100,
-        False,
-        1,
-        prefix,
-        source,
-        row,
-    )
-    result = demand_reclaim_candidates(
-        [candidate], shortfall, goal, ReclamationConfig(), 16, 256
-    )[0]
-    assert result.keep_tokens == expected
-    assert result.released_blocks == len(row) - (expected + 15) // 16
-    assert result.protected_prefix_tokens == prefix
-    assert result.keep_tokens >= floor
-
-
-@pytest.mark.parametrize("victim_tokens", [0, 1, 17])
-@pytest.mark.parametrize(
-    "free,required,floor,reserve", [(40, 64, 2051, 0), (0, 129, 2051, 3)]
-)
-def test_reclamation_retry_maximal_keep_matches_capacity_oracle(
-    victim_tokens, free, required, floor, reserve
-):
-    """Enumerate all legal K, including floor and soft-reserve failure."""
-    candidate = ReclaimCandidate(
-        "A", floor, 128, 100, False, 0, 16, 4103, tuple(range(257))
-    )
-    allocations = [ReclaimAllocation("B", 1024, required)]
-    if victim_tokens:
-        allocations.insert(0, ReclaimAllocation("A", victim_tokens, 1))
-    result = retry_reclaim_candidates(
-        [candidate],
-        ReclaimRetry(free, tuple(allocations)),
-        reserve,
-        ReclamationConfig(),
-        16,
-        256,
-    )[0]
-    expected = floor
-    for headroom in dict.fromkeys((reserve, 0)):
-        feasible = []
-        for keep in range(floor, 4103):
-            retained_pages = (keep + 15) // 16
-            victim_growth = (keep + victim_tokens + 15) // 16 - retained_pages
-            if free + 257 - retained_pages >= required + victim_growth + headroom:
-                feasible.append(keep)
-        if feasible:
-            expected = max(feasible)
-            break
-    assert result.keep_tokens == expected
-
-
-@pytest.mark.parametrize("following_required", [2, 4])
-def test_reclamation_retry_pass_soft_target_preserves_floor(following_required):
-    candidate = ReclaimCandidate("A", 16, 3, 0, False, 0, 0, 64, (1, 2, 3, 4))
-    result = retry_reclaim_candidates(
-        [candidate],
-        ReclaimRetry(
-            0,
-            (ReclaimAllocation("A", 1, 1),),
-            (ReclaimAllocation("B", 32, following_required),),
-        ),
-        0,
-        ReclamationConfig(budget_mode="retry_pass"),
-        16,
-        256,
-    )[0]
-    # Four following pages cannot fit at K_floor; preserve requester feasibility.
-    assert result.keep_tokens == (31 if following_required == 2 else 48)
-
-
-def test_reclamation_demand_real_pool_releases_only_required_page(reclamation_owner):
-    manager, request, intent = reclamation_owner
-    row = tuple(intent.source_block_ids)
-    candidate = ReclaimCandidate("A", 32, 2, 100, False, 1, 0, 64, row)
-    selected = demand_reclaim_candidates(
-        [candidate], 1, 1, ReclamationConfig(), 16, 256
-    )[0]
-    intent = dataclasses.replace(intent, target_keep_tokens=selected.keep_tokens)
-    before = manager.block_pool.get_num_free_blocks()
-    manager.commit_reclamations(
-        [(request, intent, ReclaimResult("A", 48, list(row[:3])))]
-    )
-    assert manager.block_pool.get_num_free_blocks() == before + selected.released_blocks
-    assert request.effective_kv_len == 48
-
-
 def test_reclamation_reuses_released_pages_and_grows_from_effective_length(
     reclamation_owner,
 ):
@@ -2965,7 +2845,7 @@ def test_resolve_block_hashes_rejects_mismatched_view():
 )
 def test_reclamation_protected_floor_and_exact_page_target(source, logical, prefix):
     """Both caps survive rounding; infeasible floors never produce an action."""
-    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    config = ReclamationConfig(min_keep_tokens=32)
     floor = protected_reclaim_floor(source, logical, prefix, config)
     assert 5 * (source - floor) <= source - prefix
     assert 2 * (floor - prefix) >= logical - prefix
@@ -3007,8 +2887,6 @@ def test_reclamation_two_round_capacity_includes_retry_and_peer_growth(
 ):
     """Only start paths that cover the whole waiter, with at most two victims."""
     config = ReclamationConfig(
-        pressure=True,
-        budget_mode="protected",
         decode_reclaim_rounds=2,
         min_keep_tokens=16,
         sink_tokens=0,
@@ -3031,7 +2909,7 @@ def test_reclamation_two_round_capacity_includes_retry_and_peer_growth(
         )
         for i in range(count)
     ]
-    retry = ReclaimRetry(
+    forecast = ProtectedReclaimForecast(
         512 - shortfall,
         (
             *[ReclaimAllocation(c.request_id, 2, 0) for c in candidates],
@@ -3039,31 +2917,23 @@ def test_reclamation_two_round_capacity_includes_retry_and_peer_growth(
         ),
     )
     plan = protected_two_round_plan(
-        candidates, shortfall, config, 16, 2, retry, {"peer": growth}
+        candidates, shortfall, config, 16, 2, forecast, {"peer": growth}
     )
     assert len(plan) == expected
     assert plan == protected_two_round_plan(
-        candidates[::-1], shortfall, config, 16, 2, retry, {"peer": growth}
+        candidates[::-1], shortfall, config, 16, 2, forecast, {"peer": growth}
     )
     assert all(5 * (source - c.keep_tokens) <= source for c in plan)
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"decode_reclaim_rounds": 3},
-        {"decode_reclaim_rounds": 2},
-        {"decode_reclaim_rounds": 2, "pressure": True},
-    ],
-)
-def test_reclamation_two_rounds_require_opt_in_protected_pressure(options):
+def test_reclamation_decode_round_count_is_bounded():
     with pytest.raises(ValueError):
-        ReclamationConfig(**options)
+        ReclamationConfig(decode_reclaim_rounds=3)
 
 
 def test_reclamation_protected_prefers_private_logical_retention():
     """Equal physical capacity favors the less cumulatively compressed request."""
-    config = ReclamationConfig(budget_mode="protected")
+    config = ReclamationConfig()
     candidates = [
         ReclaimCandidate(
             rid, 800, 14, 0, False, arrival, 0, 1024, tuple(range(64)), logical
@@ -3079,7 +2949,7 @@ def test_reclamation_protected_prefers_private_logical_retention():
 def test_reclamation_protected_pair_is_bounded_balanced_and_deterministic(
     shortfall, keeps
 ):
-    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    config = ReclamationConfig(min_keep_tokens=32)
     candidates = [
         ReclaimCandidate(
             rid,
@@ -3107,7 +2977,7 @@ def test_reclamation_protected_pair_is_bounded_balanced_and_deterministic(
 @pytest.mark.parametrize("headroom", [0, 1, 1000])
 def test_reclamation_protected_headroom_stays_with_hard_victims(shortfall, headroom):
     """Soft capacity cannot add victims, bypass infeasibility or break either cap."""
-    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    config = ReclamationConfig(min_keep_tokens=32)
     candidates = []
     for i in range(3):
         source, logical, prefix = 257, 400, 16
@@ -3128,7 +2998,7 @@ def test_reclamation_protected_headroom_stays_with_hard_victims(shortfall, headr
         )
     allocations = tuple(ReclaimAllocation(c.request_id, 1, 0) for c in candidates)
     hard = protected_reclaim_plan(
-        candidates, shortfall, config, 16, 2, ReclaimRetry(0, allocations)
+        candidates, shortfall, config, 16, 2, ProtectedReclaimForecast(0, allocations)
     )
     plan = protected_reclaim_plan(
         candidates,
@@ -3136,7 +3006,7 @@ def test_reclamation_protected_headroom_stays_with_hard_victims(shortfall, headr
         config,
         16,
         2,
-        ReclaimRetry(0, allocations, completion_headroom_blocks=headroom),
+        ProtectedReclaimForecast(0, allocations, completion_headroom_blocks=headroom),
     )
     assert {c.request_id for c in plan} == {c.request_id for c in hard}
     assert len(plan) <= 2
@@ -3167,7 +3037,7 @@ def test_reclamation_protected_headroom_stays_with_hard_victims(shortfall, headr
 @pytest.mark.parametrize("next_tokens", [0, 1])
 def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes, next_tokens):
     """Independent token enumeration checks net capacity, remapping and fairness."""
-    config = ReclamationConfig(budget_mode="protected", min_keep_tokens=32)
+    config = ReclamationConfig(min_keep_tokens=32)
     candidates = []
     for i, (source, logical, prefix) in enumerate(shapes):
         floor = protected_reclaim_floor(source, logical, prefix, config)
@@ -3199,7 +3069,7 @@ def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes, next_tok
         )
         for c in candidates
     }
-    retry = ReclaimRetry(0, tuple(allocations.values()))
+    forecast = ProtectedReclaimForecast(0, tuple(allocations.values()))
 
     def retained(candidate, credit):
         allocation = allocations[candidate.request_id]
@@ -3252,7 +3122,7 @@ def test_reclamation_protected_pair_matches_exhaustive_fairness(shapes, next_tok
                     for c, k in zip((first, second), keeps)
                 ]
                 legal.append(fairness(ratios))
-        plan = protected_reclaim_plan(candidates, shortfall, config, 16, 2, retry)
+        plan = protected_reclaim_plan(candidates, shortfall, config, 16, 2, forecast)
         assert bool(plan) == bool(legal)
         if plan:
             assert len(plan) == 2

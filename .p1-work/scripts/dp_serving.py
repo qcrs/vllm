@@ -183,9 +183,6 @@ def main():
     parser.add_argument("--work-counters", action="store_true")
     parser.add_argument("--decode-reclaim-rounds", type=int, choices=[1, 2], default=1)
     parser.add_argument("--admission-bypass-limit", type=int, default=0)
-    parser.add_argument(
-        "--budget-mode", choices=["fixed", "protected"], default="fixed"
-    )
     tuning_arguments(parser)
     args = parser.parse_args()
     run = Path(os.environ["P1_RUN_DIR"])
@@ -289,10 +286,7 @@ def main():
         additional["kv_reclamation"] = {
             "policy": "sink_recent" if args.policy == "noop" else args.policy,
             "retention": 1.0 if args.policy == "noop" else 0.5,
-            "pressure": True,
-            "reserve_cap": 0,
             "stats_path": args.stats,
-            "budget_mode": args.budget_mode,
             "decode_reclaim_rounds": args.decode_reclaim_rounds,
             "admission_bypass_limit": args.admission_bypass_limit,
         }

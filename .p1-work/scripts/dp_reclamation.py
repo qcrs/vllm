@@ -57,9 +57,7 @@ async def exercise(args, run):
                 else {
                     "kv_reclamation": {
                         "policy": args.policy,
-                        "pressure": True,
                         "min_keep_tokens": 32,
-                        "budget_mode": args.budget_mode,
                         "decode_reclaim_rounds": args.decode_reclaim_rounds,
                     }
                 }
@@ -235,7 +233,6 @@ async def exercise(args, run):
                 {
                     "status": "PASS",
                     "policy": args.policy,
-                    "budget_mode": args.budget_mode,
                     "routing": args.routing,
                     "identities": identities,
                     "scheduler_identities": scheduler_identities,
@@ -269,9 +266,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--policy", choices=["full", "sink_recent"], default="sink_recent"
-    )
-    parser.add_argument(
-        "--budget-mode", choices=["fixed", "protected"], default="fixed"
     )
     parser.add_argument(
         "--routing", choices=["requests", "known_work"], default="requests"
