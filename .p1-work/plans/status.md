@@ -1,5 +1,26 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-RETEST12-NAV-BEGIN -->
+
+## 2026-11-08 GPU1/2空闲基线重测
+
+见[收尾](../reports/engineering-retest-closeout.md)、[统一评估](../reports/engineering-retest-evaluation.md)
+与[复测计划](engineering-retest-plan.md)。仅重测与记录，没有修改Runtime源码。
+GPU1单卡和GPU1/2 TP2、DP2均完成当前版本基线与burst/混长短对照。
+
+Correctness：CPU92项、DP本地fixture13项、lint/type checks通过；GPU1/2真实TP2
+双victim/延迟completion、Graph/页面改写复用及DP2 abort/continuation通过。Micro：
+protected第二轮41页zero-copy，Worker0.342ms，未证明完整策略提速。Serving：TP1/TP2
+baseline档两策略均24/24；burst TP1 protected吞吐低42.59%、SLO21→9/24，TP2吞吐低约
+28%但SLO9→15/24且反向复现。DP known_work在W1正反向改善路由结果；protected相对fixed
+在1.5GiB池持续较慢。W0反向因TCPStore EADDRINUSE没有正式样本，记PARTIAL。
+
+SLO仍TTFT≤2s且TPOT≤80ms。29次guard为28 PASS/1 FAIL，项目峰值39.888672GiB；
+运行窗口没有发现外部GPU计算。测试结束后GPU2被其他进程占用，未触碰、未续跑。旧矩阵
+未重跑、85条质量样本未扩大，历史FAIL/PARTIAL保留，未push或创建PR。
+
+<!-- ENGINEERING-RETEST12-NAV-END -->
+
 <!-- ENGINEERING-PREFILL-NAV-BEGIN -->
 
 ## 2026-11-08 Prefill预算公平性与GPU0新基线

@@ -1,5 +1,22 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-RETEST12-NAV-BEGIN -->
+
+## 2026-11-08 GPU1/2空闲基线与压力复测
+
+见[收尾](engineering-retest-closeout.md)和[完整评估](engineering-retest-evaluation.md)。
+GPU1单卡及GPU1/2 TP2、DP2对照已完成，未改Runtime源码。CPU/DP fixture、TP2 Graph与
+真实页复用、DP2生命周期正确性通过；protected第二轮zero-copy micro为0.342ms，不能
+代表端到端加速。TP1 burst protected吞吐低42.59%、SLO21/24降至9/24；TP2 burst吞吐
+低约28%，但SLO9/24升至15/24，正反向一致。W1 known_work路由收益在DP正反向复现，
+protected相对fixed在小池更慢。W0反向请求启动失败，保留PARTIAL。
+
+SLO为TTFT≤2s且TPOT≤80ms。GPU1/2空闲批次29次guard为28 PASS/1 FAIL、峰值
+39.888672GiB；正式窗口无外部GPU计算。测试后GPU2出现其他用户占用，未触碰。旧矩阵
+和85条质量样本未扩大，历史FAIL/PARTIAL保留；本地分阶段提交，未push或创建PR。
+
+<!-- ENGINEERING-RETEST12-NAV-END -->
+
 <!-- ENGINEERING-PREFILL-NAV-BEGIN -->
 
 ## 2026-11-08 Prefill公平性：GPU0同卡基线
