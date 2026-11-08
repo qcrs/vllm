@@ -5982,6 +5982,162 @@ def test_pressure_protected_rejects_partial_admission_without_full_capacity(
     assert a.num_preemptions == 0
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"admission_bypass_limit": 1},
+        {"pressure": True, "admission_bypass_limit": 1},
+        {"budget_mode": "protected", "admission_bypass_limit": 1},
+    ],
+)
+def test_admission_bypass_requires_pressure_protected_mode(options):
+    with pytest.raises(ValueError, match="Admission bypass requires pressure"):
+        ReclamationConfig(**options)
+
+
+@pytest.mark.parametrize("bypass_limit, expected_bypasses", [(0, 0), (2, 2)])
+def test_pressure_protected_backfill_bounds_successful_admissions(
+    pressure_scheduler, bypass_limit, expected_bypasses
+):
+    """Only successful FCFS admissions behind a KV-blocked head spend quota."""
+    scheduler = pressure_scheduler(
+        50,
+        budget_mode="protected",
+        admission_bypass_limit=bypass_limit,
+    )
+    incumbent = create_requests(
+        1, num_tokens=256, max_tokens=128, req_ids=["incumbent"]
+    )[0]
+    scheduler.add_request(incumbent)
+    complete_pressure_step(scheduler, scheduler.schedule())
+
+    head = create_requests(1, num_tokens=640, max_tokens=128, req_ids=["head"])[0]
+    too_large = create_requests(
+        1, num_tokens=640, max_tokens=128, req_ids=["too-large"]
+    )[0]
+    followers = create_requests(
+        3,
+        num_tokens=32,
+        max_tokens=4,
+        req_ids=["follower-1", "follower-2", "follower-3"],
+    )
+    for request in (head, too_large, *followers):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduled = set(output.num_scheduled_tokens)
+    assert scheduled & {request.request_id for request in followers} == (
+        {"follower-1", "follower-2"} if bypass_limit else set()
+    )
+    assert "head" not in scheduled and "too-large" not in scheduled
+    assert not output.reclaim_requests and not output.preempted_req_ids
+    assert scheduler._admission_bypass_count == expected_bypasses
+    assert head.num_computed_tokens == head.effective_kv_len == 0
+    assert too_large.num_computed_tokens == too_large.effective_kv_len == 0
+    assert incumbent.num_preemptions == 0
+
+    if bypass_limit:
+        complete_pressure_step(scheduler, output)
+        for _ in range(3):
+            retry = scheduler.schedule()
+            assert "follower-3" not in retry.num_scheduled_tokens
+            assert "head" not in retry.num_scheduled_tokens
+            assert scheduler._admission_bypass_count == expected_bypasses
+            assert [r.request_id for r in scheduler.skipped_waiting] == [
+                "head",
+                "too-large",
+            ]
+            complete_pressure_step(scheduler, retry)
+        assert all(r.is_finished() for r in followers[:2])
+        assert followers[2].status == RequestStatus.WAITING
+        scheduler.finish_requests(
+            "incumbent",
+            RequestStatus.FINISHED_ABORTED,
+        )
+        retry = scheduler.schedule()
+        assert "head" in retry.num_scheduled_tokens
+        assert "too-large" not in retry.num_scheduled_tokens
+        assert "follower-3" not in retry.num_scheduled_tokens
+        assert scheduler._admission_blocked_head_id is None
+        assert scheduler._admission_bypass_count == 0
+
+
+def test_pressure_protected_backfill_preserves_prefill_capacity_guard(
+    pressure_scheduler,
+):
+    """Moving the KV-blocked head must not re-arm DP prefill throttling."""
+    scheduler = pressure_scheduler(
+        50, budget_mode="protected", admission_bypass_limit=2
+    )
+    incumbent = create_requests(
+        1, num_tokens=256, max_tokens=128, req_ids=["incumbent"]
+    )[0]
+    scheduler.add_request(incumbent)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    head = create_requests(1, num_tokens=640, req_ids=["head"])[0]
+    follower = create_requests(1, num_tokens=32, req_ids=["follower"])[0]
+    scheduler.add_request(head)
+    scheduler.add_request(follower)
+
+    output = scheduler.schedule()
+    assert "follower" in output.num_scheduled_tokens
+    assert not scheduler.waiting
+    assert [r.request_id for r in scheduler.skipped_waiting] == ["head"]
+    assert scheduler.prefill_capacity_bound
+    complete_pressure_step(scheduler, output)
+    scheduler.finish_requests("incumbent", RequestStatus.FINISHED_ABORTED)
+
+    retry = scheduler.schedule(throttle_prefills=True)
+    assert "head" in retry.num_scheduled_tokens
+    assert not retry.preempted_req_ids
+
+
+def test_pressure_protected_backfill_resets_when_blocked_head_aborts(
+    pressure_scheduler,
+):
+    """A removed blocked head must not carry its bypass quota to the next head."""
+    scheduler = pressure_scheduler(
+        50,
+        budget_mode="protected",
+        admission_bypass_limit=2,
+    )
+    incumbent = create_requests(
+        1, num_tokens=256, max_tokens=128, req_ids=["incumbent"]
+    )[0]
+    scheduler.add_request(incumbent)
+    complete_pressure_step(scheduler, scheduler.schedule())
+
+    head, next_head = create_requests(
+        2, num_tokens=640, max_tokens=128, req_ids=["head", "next-head"]
+    )
+    followers = create_requests(
+        3,
+        num_tokens=32,
+        max_tokens=4,
+        req_ids=["follower-1", "follower-2", "follower-3"],
+    )
+    for request in (head, next_head, *followers):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) & {
+        "follower-1",
+        "follower-2",
+        "follower-3",
+    } == {"follower-1", "follower-2"}
+    assert scheduler._admission_bypass_count == 2
+    complete_pressure_step(scheduler, output)
+    scheduler.finish_requests(
+        ["incumbent", "head", "follower-1", "follower-2"],
+        RequestStatus.FINISHED_ABORTED,
+    )
+
+    retry = scheduler.schedule()
+    assert "next-head" in retry.num_scheduled_tokens
+    assert scheduler._admission_blocked_head_id is None
+    assert scheduler._admission_bypass_count == 0
+
+
 def test_pressure_protected_reserves_already_admitted_prefill(pressure_scheduler):
     """New admissions cannot consume capacity owed to an earlier chunked prefill."""
     scheduler = pressure_scheduler(34, budget_mode="protected")

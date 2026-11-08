@@ -225,6 +225,7 @@ def main():
     parser.add_argument("--pool-gib", type=float, required=True)
     parser.add_argument("--stats")
     parser.add_argument("--reserve", type=int, default=0)
+    parser.add_argument("--admission-bypass-limit", type=int, default=0)
     parser.add_argument(
         "--budget-mode",
         choices=[
@@ -246,12 +247,22 @@ def main():
         "--graph-mode", choices=["eager", "full", "piecewise"], default="eager"
     )
     parser.add_argument("--full-warmup", action="store_true")
-    parser.add_argument("--workload", choices=["long", "short"], default="long")
+    parser.add_argument(
+        "--workload", choices=["long", "short", "mixed"], default="long"
+    )
     parser.add_argument("--tp", type=int, choices=[1, 2], default=1)
     tuning_arguments(parser)
     args = parser.parse_args()
-    if args.workload == "short" and args.prefix_caching:
-        parser.error("short workload does not define shared prefix identities")
+    if args.workload != "long" and args.prefix_caching:
+        parser.error("short and mixed workloads do not define shared prefix identities")
+    if args.admission_bypass_limit < 0:
+        parser.error("admission bypass limit must be nonnegative")
+    if args.admission_bypass_limit and (
+        args.policy == "full" or args.budget_mode != "protected"
+    ):
+        parser.error(
+            "admission bypass limit requires a reclamation policy in protected mode"
+        )
     run = Path(os.environ["P1_RUN_DIR"])
     source_root = Path(__file__).resolve().parents[2]
     sources = [
@@ -373,6 +384,7 @@ def main():
                 "reserve_cap": args.reserve,
                 "budget_mode": args.budget_mode,
                 "stats_path": args.stats,
+                "admission_bypass_limit": args.admission_bypass_limit,
             }
         }
         command.extend(["--additional-config", json.dumps(config)])
@@ -388,6 +400,12 @@ def main():
     if args.workload == "short":
         prompts = [(seed * (length // len(seed) + 1))[:length] for length in (128, 256)]
         arrivals = [0, 0.3]
+    elif args.workload == "mixed":
+        prompts = [
+            (seed * (length // len(seed) + 1))[:length]
+            for length in (4096, 8192, 128, 128, 4096, 8192, 128, 128)
+        ]
+        arrivals = [0, 0.3, 0.6, 0.9, 5, 5.3, 5.6, 5.9]
     if args.prefix_caching:
         shared = (seed * (256 // len(seed) + 1))[:256]
         prompts = []

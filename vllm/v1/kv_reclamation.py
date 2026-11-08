@@ -26,6 +26,7 @@ class ReclamationConfig:
     min_keep_tokens: int = 128
     reserve_cap: int = 0
     budget_mode: str = "fixed"
+    admission_bypass_limit: int = 0
 
     def __post_init__(self) -> None:
         if self.budget_mode not in (
@@ -43,10 +44,22 @@ class ReclamationConfig:
             raise ValueError("TriAttention requires calibrated frequency stats")
         if not 0 < self.retention <= 1:
             raise ValueError("KV reclamation retention must be in (0, 1]")
-        if min(self.sink_tokens, self.recent_tokens, self.reserve_cap) < 0:
+        if (
+            min(
+                self.sink_tokens,
+                self.recent_tokens,
+                self.reserve_cap,
+                self.admission_bypass_limit,
+            )
+            < 0
+        ):
             raise ValueError("KV reclamation protection/reserve must be nonnegative")
         if self.min_keep_tokens < self.sink_tokens + self.recent_tokens:
             raise ValueError("min_keep_tokens must cover sink and recent protection")
+        if self.admission_bypass_limit and (
+            not self.pressure or self.budget_mode != "protected"
+        ):
+            raise ValueError("Admission bypass requires pressure protected mode")
 
     @classmethod
     def from_vllm_config(cls, config: "VllmConfig") -> "ReclamationConfig | None":

@@ -202,6 +202,8 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._admission_blocked_head_id: str | None = None
+        self._admission_bypass_count = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -443,6 +445,12 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if (
+            self._admission_blocked_head_id is not None
+            and self._admission_blocked_head_id not in self.requests
+        ):
+            self._admission_blocked_head_id = None
+            self._admission_bypass_count = 0
         allow_reclamation = (
             self.reclamation_config is not None
             and self.reclamation_config.pressure
@@ -455,6 +463,14 @@ class Scheduler(SchedulerInterface):
             and self.reclamation_config.pressure
             and self.reclamation_config.budget_mode == "protected"
         )
+        admission_bypass_limit = 0
+        if (
+            self.reclamation_config is not None
+            and protected_admission
+            and self.policy == SchedulingPolicy.FCFS
+        ):
+            admission_bypass_limit = self.reclamation_config.admission_bypass_limit
+        admission_backfill = admission_bypass_limit > 0
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -712,6 +728,7 @@ class Scheduler(SchedulerInterface):
             and self._pause_state == PauseState.UNPAUSED
         ):
             step_skipped_waiting = create_request_queue(self.policy)
+            blocked_head_skipped = False
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -725,6 +742,13 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    admission_backfill
+                    and blocked_head_skipped
+                    and self._admission_bypass_count >= admission_bypass_limit
+                ):
+                    break
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1020,10 +1044,20 @@ class Scheduler(SchedulerInterface):
                             num_new_computed_tokens=num_new_local_computed_tokens,
                         )
 
+                    if admission_backfill and not reclaim_plan:
+                        if self._admission_blocked_head_id is None:
+                            self._admission_blocked_head_id = request_id
+                        if request_id == self._admission_blocked_head_id:
+                            blocked_head_skipped = True
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if admission_backfill and not reclaim_plan:
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1047,6 +1081,12 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                if admission_backfill:
+                    if request_id == self._admission_blocked_head_id:
+                        self._admission_blocked_head_id = None
+                        self._admission_bypass_count = 0
+                    elif blocked_head_skipped:
+                        self._admission_bypass_count += 1
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1130,9 +1170,11 @@ class Scheduler(SchedulerInterface):
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
             # DP prefill balancing: on a step that admitted prefills (release),
-            # record whether it was capacity-bound.
+            # include KV-blocked heads moved to skipped_waiting by backfill.
             if not defer_prefills:
-                self.prefill_capacity_bound = bool(self.waiting)
+                self.prefill_capacity_bound = (
+                    bool(self.waiting) or self._admission_blocked_head_id is not None
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
