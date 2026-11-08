@@ -5,6 +5,7 @@
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import cmp_to_key
+from itertools import combinations
 from typing import TYPE_CHECKING
 
 from vllm import envs
@@ -27,6 +28,7 @@ class ReclamationConfig:
     reserve_cap: int = 0
     budget_mode: str = "fixed"
     admission_bypass_limit: int = 0
+    decode_reclaim_rounds: int = 1
 
     def __post_init__(self) -> None:
         if self.budget_mode not in (
@@ -60,6 +62,12 @@ class ReclamationConfig:
             not self.pressure or self.budget_mode != "protected"
         ):
             raise ValueError("Admission bypass requires pressure protected mode")
+        if self.decode_reclaim_rounds not in (1, 2):
+            raise ValueError("Decode reclamation supports at most two rounds")
+        if self.decode_reclaim_rounds == 2 and (
+            not self.pressure or self.budget_mode != "protected"
+        ):
+            raise ValueError("Two-round reclamation requires pressure protected mode")
 
     @classmethod
     def from_vllm_config(cls, config: "VllmConfig") -> "ReclamationConfig | None":
@@ -241,6 +249,96 @@ def protected_reclaim_plan(
     return _protected_reclaim_plan(
         selected, goal, config, block_size, member_bytes, retry
     )
+
+
+def protected_two_round_plan(
+    candidates: list[ReclaimCandidate],
+    shortfall: int,
+    config: ReclamationConfig,
+    block_size: int,
+    member_bytes: int,
+    retry: ReclaimRetry,
+    inter_round_growth: dict[str, int],
+) -> tuple[ReclaimCandidate, ...]:
+    """Start only a feasible two-round path; execution replans after real decode.
+
+    Account for a retry decode, the second round's forward, and the final
+    admission retry. The projected rows are used only for capacity arithmetic.
+    """
+    allocations = {
+        a.request_id: a for a in (*retry.allocations, *retry.following_allocations)
+    }
+    ordered = sorted(candidates, key=lambda c: (c.arrival_time, c.request_id))
+    for count in (1, 2):
+        feasible = []
+        for group in combinations(ordered, count):
+            first = []
+            final_capacity = 0
+            growth = sum(
+                pages
+                for rid, pages in inter_round_growth.items()
+                if rid not in {c.request_id for c in group}
+            )
+            interim_demand = (
+                sum(
+                    a.required_blocks
+                    for a in allocations.values()
+                    if a.request_id in inter_round_growth
+                    and a.request_id not in {c.request_id for c in group}
+                )
+                + growth
+            )
+            for candidate in group:
+                allocation = allocations[candidate.request_id]
+                capacity = (
+                    len(candidate.source_block_ids)
+                    - (candidate.keep_tokens + allocation.num_tokens + block_size - 1)
+                    // block_size
+                    + allocation.required_blocks
+                )
+                plan = _protected_reclaim_plan(
+                    [candidate], capacity, config, block_size, member_bytes, retry
+                )
+                if not plan:
+                    break
+                (selected,) = plan
+                first.append(selected)
+                source = selected.keep_tokens + 2
+                logical = candidate.logical_tokens + 2
+                pages = (source + block_size - 1) // block_size
+                interim_demand += (
+                    pages - (selected.keep_tokens + block_size - 1) // block_size
+                )
+                policy = (
+                    candidate.policy_binding.config
+                    if candidate.policy_binding
+                    else config
+                )
+                floor = protected_reclaim_floor(
+                    source, logical, candidate.protected_prefix_tokens, policy
+                )
+                final_capacity += (
+                    len(candidate.source_block_ids)
+                    - (floor + allocation.num_tokens + block_size - 1) // block_size
+                    + allocation.required_blocks
+                )
+            if (
+                len(first) == count
+                and final_capacity >= shortfall + growth
+                and retry.free_blocks + sum(c.released_blocks for c in first)
+                >= interim_demand
+            ):
+                feasible.append(tuple(first))
+        if feasible:
+            return min(
+                feasible,
+                key=lambda plan: (
+                    sum(not c.zero_copy for c in plan),
+                    sum(c.copy_bytes for c in plan),
+                    tuple((c.arrival_time, c.request_id) for c in plan),
+                ),
+            )
+    return ()
 
 
 def _protected_reclaim_plan(

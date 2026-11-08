@@ -5962,6 +5962,106 @@ def test_pressure_protected_waiter_uses_reclaimed_capacity_before_abort(
     assert a.num_preemptions == c.num_preemptions == 0
 
 
+def test_pressure_protected_two_rounds_require_completed_decode(pressure_scheduler):
+    """Partial releases admit the original waiter only after a real decode gap."""
+    scheduler = pressure_scheduler(
+        28, budget_mode="protected", admission_bypass_limit=2, decode_reclaim_rounds=2
+    )
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    c = create_requests(1, num_tokens=256, max_tokens=3, req_ids=["C"])[0]
+    d = create_requests(1, num_tokens=16, max_tokens=3, req_ids=["D"])[0]
+    scheduler.add_request(c)
+    scheduler.add_request(d)
+    first = scheduler.schedule()
+    assert len(first.reclaim_requests) == 1
+    assert "D" not in first.num_scheduled_tokens
+    complete_pressure_step(scheduler, first)
+    assert not scheduler._select_reclaim_plan({}, c)
+    retry = scheduler.schedule()
+    assert retry.num_scheduled_tokens == {"A": 1}
+    assert not retry.reclaim_requests
+    # schedule() has advanced optimistic L, but the GPU has not completed it.
+    assert not scheduler._select_reclaim_plan({}, c)
+    complete_pressure_step(scheduler, retry)
+    second = scheduler.schedule()
+    assert len(second.reclaim_requests) == 1
+    for output in (first, second):
+        (intent,) = output.reclaim_requests
+        assert intent.request_id == "A"
+        assert 5 * (intent.source_effective_kv_len - intent.target_keep_tokens) <= (
+            intent.source_effective_kv_len
+        )
+    assert 2 * second.reclaim_requests[0].target_keep_tokens >= a.num_computed_tokens
+    complete_pressure_step(scheduler, second)
+    assert not scheduler._select_reclaim_plan({}, c)
+    admitted = scheduler.schedule()
+    assert "C" in admitted.num_scheduled_tokens
+    assert scheduler._decode_reclaim_window is None
+    complete_pressure_step(scheduler, admitted)
+    for _ in range(8):
+        output = scheduler.schedule()
+        assert not output.preempted_req_ids
+        complete_pressure_step(scheduler, output)
+        if c.is_finished():
+            break
+    assert c.is_finished() and a.num_preemptions == c.num_preemptions == 0
+
+
+def test_pressure_protected_two_rounds_infeasible_preserves_backfill(
+    pressure_scheduler,
+):
+    """Do not mutate a victim when even two rounds cannot admit the waiter."""
+    scheduler = pressure_scheduler(
+        25, budget_mode="protected", admission_bypass_limit=2, decode_reclaim_rounds=2
+    )
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    for rid, length in (("C", 256), ("D", 16)):
+        scheduler.add_request(
+            create_requests(1, num_tokens=length, max_tokens=3, req_ids=[rid])[0]
+        )
+    output = scheduler.schedule()
+    assert not output.reclaim_requests
+    assert "D" in output.num_scheduled_tokens and "C" not in output.num_scheduled_tokens
+    assert scheduler._decode_reclaim_window is None
+
+
+def test_pressure_protected_two_round_window_clears_on_waiter_abort(pressure_scheduler):
+    """An aborted beneficiary must not keep blocking later admissions."""
+    scheduler = pressure_scheduler(28, budget_mode="protected", decode_reclaim_rounds=2)
+    a = create_requests(1, num_tokens=256, max_tokens=128, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    c = create_requests(1, num_tokens=256, max_tokens=3, req_ids=["C"])[0]
+    scheduler.add_request(c)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    assert scheduler._decode_reclaim_window is not None
+    scheduler.finish_requests(["C"], RequestStatus.FINISHED_ABORTED)
+    d = create_requests(1, num_tokens=16, max_tokens=3, req_ids=["D"])[0]
+    scheduler.add_request(d)
+    output = scheduler.schedule()
+    assert "D" in output.num_scheduled_tokens
+    assert scheduler._decode_reclaim_window is None
+
+
+def test_pressure_protected_two_rounds_wait_for_imminent_finish(pressure_scheduler):
+    """A deterministic one-token finish should free its KV without compaction."""
+    scheduler = pressure_scheduler(33, budget_mode="protected", decode_reclaim_rounds=2)
+    a = create_requests(1, num_tokens=256, max_tokens=2, req_ids=["A"])[0]
+    scheduler.add_request(a)
+    complete_pressure_step(scheduler, scheduler.schedule())
+    c = create_requests(1, num_tokens=256, max_tokens=3, req_ids=["C"])[0]
+    scheduler.add_request(c)
+    output = scheduler.schedule()
+    assert not output.reclaim_requests and "C" not in output.num_scheduled_tokens
+    complete_pressure_step(scheduler, output)
+    assert a.is_finished()
+    assert "C" in scheduler.schedule().num_scheduled_tokens
+
+
 def test_pressure_protected_rejects_partial_admission_without_full_capacity(
     pressure_scheduler,
 ):

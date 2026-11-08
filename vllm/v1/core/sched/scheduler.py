@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -65,6 +65,7 @@ from vllm.v1.kv_reclamation import (
     demand_reclaim_candidates,
     protected_reclaim_floor,
     protected_reclaim_plan,
+    protected_two_round_plan,
     retry_reclaim_candidates,
     sink_recent_ranges,
     whole_block_row,
@@ -79,6 +80,13 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class DecodeReclaimWindow:
+    requester_id: str
+    victim_tokens: dict[str, int]
+    rounds: int = 1
 
 
 class Scheduler(SchedulerInterface):
@@ -98,6 +106,7 @@ class Scheduler(SchedulerInterface):
         self.cache_config = vllm_config.cache_config
         self.reclamation_config = ReclamationConfig.from_vllm_config(vllm_config)
         self.reclaim_retry_pending = False
+        self._decode_reclaim_window: DecodeReclaimWindow | None = None
         if self.reclamation_config is not None:
             self.reclamation_config.validate_cache(kv_cache_config)
         self.lora_config = vllm_config.lora_config
@@ -446,6 +455,11 @@ class Scheduler(SchedulerInterface):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         if (
+            self._decode_reclaim_window is not None
+            and self._decode_reclaim_window.requester_id not in self.requests
+        ):
+            self._decode_reclaim_window = None
+        if (
             self._admission_blocked_head_id is not None
             and self._admission_blocked_head_id not in self.requests
         ):
@@ -742,6 +756,12 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    self._decode_reclaim_window is not None
+                    and request_id != self._decode_reclaim_window.requester_id
+                ):
+                    break
 
                 if (
                     admission_backfill
@@ -1044,7 +1064,12 @@ class Scheduler(SchedulerInterface):
                             num_new_computed_tokens=num_new_local_computed_tokens,
                         )
 
-                    if admission_backfill and not reclaim_plan:
+                    can_backfill = (
+                        admission_backfill
+                        and not reclaim_plan
+                        and self._decode_reclaim_window is None
+                    )
+                    if can_backfill:
                         if self._admission_blocked_head_id is None:
                             self._admission_blocked_head_id = request_id
                         if request_id == self._admission_blocked_head_id:
@@ -1056,9 +1081,15 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    if admission_backfill and not reclaim_plan:
+                    if can_backfill:
                         continue
                     break
+
+                if (
+                    self._decode_reclaim_window is not None
+                    and request_id == self._decode_reclaim_window.requester_id
+                ):
+                    self._decode_reclaim_window = None
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1318,6 +1349,7 @@ class Scheduler(SchedulerInterface):
         num_new_computed_tokens: int,
         *,
         full_prefill: bool = False,
+        admission_retry: bool = False,
     ) -> ReclaimRetry | None:
         """Project continuing requests through one synchronous retry pass.
 
@@ -1354,6 +1386,13 @@ class Scheduler(SchedulerInterface):
                 if request is requester:
                     return None
                 continue
+            if (
+                admission_retry
+                and request.status == RequestStatus.RUNNING
+                and computed >= request.num_prompt_tokens
+            ):
+                # The retry forwards one decode before reserving its next token.
+                tokens += 1
             physical = request.effective_kv_len + q + cached
             blocks = (
                 new_computed_blocks.blocks[0]
@@ -1427,6 +1466,20 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[ReclaimCandidate, ...]:
         config = self.reclamation_config
         assert config is not None
+        window = self._decode_reclaim_window
+        if window is not None:
+            if (
+                requester is None
+                or requester.request_id != window.requester_id
+                or window.rounds == 2
+            ):
+                return ()
+            for rid, tokens in window.victim_tokens.items():
+                victim = self.requests.get(rid)
+                if victim is not None and (
+                    victim.num_in_flight_tokens or victim.num_computed_tokens <= tokens
+                ):
+                    return ()
         manager = self.kv_cache_manager.coordinator.single_type_managers[0]
         group = self.kv_cache_config.kv_cache_groups[0]
         member_bytes = group.kv_cache_spec.page_size_bytes // self.block_size
@@ -1434,12 +1487,22 @@ class Scheduler(SchedulerInterface):
         candidates = []
         live_decode_count = 0
         for request in self.running:
+            if window is not None and request.request_id not in window.victim_tokens:
+                continue
             if (
                 request.num_computed_tokens < request.num_prompt_tokens
                 or request.num_in_flight_tokens
             ):
                 continue
             live_decode_count += 1
+            if config.decode_reclaim_rounds == 2 and (
+                min(
+                    request.max_tokens - request.num_output_tokens,
+                    self.max_model_len - request.num_tokens,
+                )
+                <= 2
+            ):
+                continue
             q = scheduled.get(request.request_id, 0)
             if q not in (0, 1):
                 continue
@@ -1514,6 +1577,10 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks,
                     num_new_computed_tokens,
                     full_prefill=True,
+                    admission_retry=(
+                        config.decode_reclaim_rounds == 2
+                        and requester.status != RequestStatus.RUNNING
+                    ),
                 )
                 if requester is not None
                 else None
@@ -1530,6 +1597,48 @@ class Scheduler(SchedulerInterface):
             plan = protected_reclaim_plan(
                 candidates, shortfall, config, self.block_size, member_bytes, retry
             )
+            if window is not None:
+                window.rounds = 2
+            elif (
+                not plan
+                and config.decode_reclaim_rounds == 2
+                and retry is not None
+                and requester is not None
+                and requester.status != RequestStatus.RUNNING
+                and self.policy == SchedulingPolicy.FCFS
+                and all(
+                    r.num_computed_tokens >= r.num_prompt_tokens for r in self.running
+                )
+            ):
+                growth = {}
+                for allocation in (*retry.allocations, *retry.following_allocations):
+                    if allocation.request_id == requester.request_id:
+                        continue
+                    other = self.requests[allocation.request_id]
+                    end = (
+                        other.effective_kv_len
+                        + scheduled.get(other.request_id, 0)
+                        + allocation.num_tokens
+                    )
+                    growth[other.request_id] = (
+                        end + 2 + self.block_size - 1
+                    ) // self.block_size - (
+                        end + self.block_size - 1
+                    ) // self.block_size
+                plan = protected_two_round_plan(
+                    candidates,
+                    shortfall,
+                    config,
+                    self.block_size,
+                    member_bytes,
+                    retry,
+                    growth,
+                )
+                if plan:
+                    self._decode_reclaim_window = DecodeReclaimWindow(
+                        requester.request_id,
+                        {c.request_id: c.logical_tokens for c in plan},
+                    )
             if self.kv_cache_manager.trace is not None:
                 from dataclasses import asdict
 
@@ -1540,6 +1649,11 @@ class Scheduler(SchedulerInterface):
                     retry_forecast=asdict(retry) if retry is not None else None,
                     candidates=[asdict(c) for c in candidates],
                     plan=[asdict(c) for c in plan],
+                    decode_window=(
+                        asdict(self._decode_reclaim_window)
+                        if self._decode_reclaim_window is not None
+                        else None
+                    ),
                 )
             return plan
         demand = (

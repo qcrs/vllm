@@ -71,6 +71,7 @@ from vllm.v1.kv_reclamation import (
     demand_reclaim_candidates,
     protected_reclaim_floor,
     protected_reclaim_plan,
+    protected_two_round_plan,
     retry_reclaim_candidates,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -2995,6 +2996,69 @@ def test_reclamation_protected_floor_and_exact_page_target(source, logical, pref
             ]
             assert plan[0].keep_tokens == max(aligned or [largest])
             assert plan[0].released_blocks == target
+
+
+@pytest.mark.parametrize(
+    "source,count,shortfall,growth,expected",
+    [(4097, 1, 88, 0, 1), (257, 2, 9, 0, 2), (257, 2, 13, 0, 0), (257, 2, 12, 1, 0)],
+)
+def test_reclamation_two_round_capacity_includes_retry_and_peer_growth(
+    source, count, shortfall, growth, expected
+):
+    """Only start paths that cover the whole waiter, with at most two victims."""
+    config = ReclamationConfig(
+        pressure=True,
+        budget_mode="protected",
+        decode_reclaim_rounds=2,
+        min_keep_tokens=16,
+        sink_tokens=0,
+        recent_tokens=0,
+    )
+    floor = protected_reclaim_floor(source, source, 0, config)
+    pages = (source + 15) // 16
+    candidates = [
+        ReclaimCandidate(
+            str(i),
+            floor,
+            pages - (floor + 15) // 16,
+            0,
+            False,
+            float(i),
+            0,
+            source,
+            tuple(range(pages * i, pages * (i + 1))),
+            source,
+        )
+        for i in range(count)
+    ]
+    retry = ReclaimRetry(
+        512 - shortfall,
+        (
+            *[ReclaimAllocation(c.request_id, 2, 0) for c in candidates],
+            ReclaimAllocation("waiter", 8192, 512),
+        ),
+    )
+    plan = protected_two_round_plan(
+        candidates, shortfall, config, 16, 2, retry, {"peer": growth}
+    )
+    assert len(plan) == expected
+    assert plan == protected_two_round_plan(
+        candidates[::-1], shortfall, config, 16, 2, retry, {"peer": growth}
+    )
+    assert all(5 * (source - c.keep_tokens) <= source for c in plan)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"decode_reclaim_rounds": 3},
+        {"decode_reclaim_rounds": 2},
+        {"decode_reclaim_rounds": 2, "pressure": True},
+    ],
+)
+def test_reclamation_two_rounds_require_opt_in_protected_pressure(options):
+    with pytest.raises(ValueError):
+        ReclamationConfig(**options)
 
 
 def test_reclamation_protected_prefers_private_logical_retention():
