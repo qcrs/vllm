@@ -1,5 +1,30 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-PROGRESS-NAV-BEGIN -->
+
+## 2026-11-08 Controller 进展修正与 TP/DP 复核
+
+已完成完整 prefill admission、净回收预算、合法整页重映射优先和有界回收合并。
+详情见[收尾](../reports/engineering-progress-closeout.md)、
+[统一评估](../reports/engineering-progress-evaluation.md)、
+[Controller](../reports/engineering-progress-controller.md)与
+[DP](../reports/engineering-progress-dp.md)。
+
+| 范围 | 当前结论与边界 |
+| --- | --- |
+| Correctness | CPU99项、DP本地fixture15项、真实TP2单/双victim、延迟completion、Graph及页改写复用PASS；DP等待者在abort前进展并复用本地释放页 |
+| Micro | 小额回收可合法zero-copy；E4100单victim释放1页、copy0、Worker0.373ms。不同释放量不作等动作提速结论 |
+| TP2 Serving | 同源码fixed101.548tok/s、18/24，protected73.359tok/s、6/24，仍低27.76%；均零抢占/重算。剩余容量不足有直接证据，停止调参 |
+| DP2 Serving | 已有known_work在W1正反向吞吐+16.09%/+21.52%，均21/24→24/24；W0变化符号反转，无稳定收益。本轮没有新增DP Runtime |
+| 条件与组合 | usage tie-break缺重复有效同分错选→本地压力证据，STOPPED / NOT_RUN；组合24/24但零回收，不能归因Controller |
+
+只用用户指定物理GPU1/2，GPU0未用；29次guard为27 PASS/2 FAIL，失败原样保留。
+SLO仍TTFT≤2s且TPOT≤80ms，20%/50%与最多两victim不变；fixed/requests仍默认。
+历史FAIL/PARTIAL、85条质量样本及用户改动保留，旧矩阵未重跑，未push或创建PR。
+以下为历史导航与正文，按对应日期及配置理解。
+
+<!-- ENGINEERING-PROGRESS-NAV-END -->
+
 <!-- ENGINEERING-PROTECTED-NAV-BEGIN -->
 
 ## 2026-11-07 protected Controller / DP：本轮完成

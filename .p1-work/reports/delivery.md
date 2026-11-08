@@ -1,5 +1,29 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-PROGRESS-NAV-BEGIN -->
+
+## 2026-11-08 Controller 进展修正与 TP/DP 复核交付
+
+机制与完整结果见[收尾](engineering-progress-closeout.md)、
+[统一评估](engineering-progress-evaluation.md)、
+[Controller](engineering-progress-controller.md)与[DP](engineering-progress-dp.md)。
+已实现完整prefill admission/净页预算、合法整页重映射优先与同victim内有界回收合并。
+
+Correctness：CPU99项、DP本地fixture15项，真实TP2单/双victim、延迟completion、
+Graph、页改写复用与DP abort前等待者进展通过。Micro：小额复制缺口修复，但不同
+释放量不能作为等动作加速。TP同源码三轮零抢占/重算，protected73.359tok/s、6/24，
+仍较fixed101.548tok/s、18/24低27.76%；容量不足有直接证据，按计划停止调参。
+
+DP已有known_work在固定W1正反向吞吐+16.09%/+21.52%，均24/24；W0无稳定收益。
+本轮没有新增DP Runtime，收益不归因Controller。usage tie-break缺进入证据而停止；
+组合24/24但压力动作全0。SLO仍TTFT≤2s且TPOT≤80ms，fixed/requests继续默认。
+
+本轮只用物理GPU1/2，GPU0未用；29次guard为27 PASS/2 FAIL、合计峰值39.888672GiB。
+用户改动、历史与开发FAIL/PARTIAL、85条质量样本保留；未重跑旧矩阵，未push或创建PR。
+最终hash、命令索引、资源与Git保护审计见收尾的最终B0。下方历史正文原样保留。
+
+<!-- ENGINEERING-PROGRESS-NAV-END -->
+
 <!-- ENGINEERING-PROTECTED-NAV-BEGIN -->
 
 ## 2026-11-07 protected Controller / DP 交付

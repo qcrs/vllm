@@ -54,3 +54,67 @@ q0 极短窗口不要求 observer 采样成功；延迟批次必须实际观测�
 correctness PASS 不能解释为速度、SLO 或模型质量 PASS。
 
 micro 与 Serving 见后续统一评估；不能用 correctness 代替性能结论。
+
+## 有界合并与最终实现
+
+`533fa38ed5` 在上述修正后补充有限 completion headroom。只在原硬缺口已经存在合法
+单/双 victim 计划后，才在同一 victim 集合中合并近期小额回收；不增加 victim，不对
+不可行缺口先做部分删除。每个请求的容量上界为
+`min(prompt_tokens + max_tokens - 1, max_model_len - 1)`，减去 post-forward 已计算量
+及硬预算已覆盖量，再向上取页。最终目标不超过选中 victim 的合法净容量。
+
+该上界仅用于容量预算，EOS 可能提前终止；它不进入已计算逻辑 L，也不改变 DP
+known_work 中的已知工作量 U。没有新增权重、搜索参数或页所有权状态。20% 单次
+cap、50% 逻辑 floor、prefix/min_keep/sink/recent 和全 TP completion 后才 commit/free
+继续成立。最终源码入口为 `Scheduler._reclaim_retry`、
+`Scheduler._protected_prefill_reserved_blocks`、`Scheduler._select_reclaim_plan`、
+`KVCacheManager.allocate_slots` 和 `protected_reclaim_plan`。
+
+## 最终正确性
+
+最终 Runtime 的 B0 为 `Engineering-Amortized-B0/20261108-014007-initial`：相关 CPU
+suite **99 passed / 289 deselected**，DP 本地 fixture 为 **13+2=15 passed**；后者不是
+完整上游 DP suite。适用 pre-commit 和 manual mypy-3.12 通过。最终测量入口的静态
+检查另见 `Engineering-Progress-Final-B0/20261108-021957-resume`。
+
+最终真实 GPU 验证位于 `Engineering-Amortized-Correctness/`：
+
+- `20261108-015330-single-q0-tp2-graph-reuse`：两 rank 计划一致、continuation、
+  FP32 attention/Graph-eager reference、释放页改写复用 PASS，最终 free32。
+- `20261108-015400-pair-tp2-graph-delay-reuse`：单批两个 victim，rank1 第二 victim
+  延迟至少2.5s时 canonical 不变，全部完成后 ACK/commit/free；Graph 和真实复用
+  PASS。最终5批、6个 victim，最终 free32。
+- `20261108-015435-dp2-progress-abort-reuse`：C 在 abort A 前已输出并改写本地
+  释放页 `[14,15,16,17]`；peer 无回收，abort 后还有112次 payload 验证 forward；
+  两个池最终均 free32。严格的等待者进展要求通过，没有再靠 abort 放行来验收。
+
+独立审计为上述 B0 的 `audit-correctness.py` / `correctness-analysis.json`。开发阶段
+失败和旧报告中的失败保留，见[收尾报告](engineering-progress-closeout.md)。
+
+## 最终性能与剩余容量瓶颈
+
+同源码、同仪表、同 GPU1/2 的三轮正式 TP2 对照：fixed 为101.548tok/s、18/24 SLO，
+protected 为73.359tok/s、6/24，吞吐仍 **−27.76%**。两边均零抢占、零重算；protected
+回收18次、fixed56次，但 protected 有1551次 allocation miss。miss 统计包含同一等待
+请求反复重试，不能解释成1551个请求失败。正式最大 victim 都为1。
+
+独立 trace 位于
+`Engineering-Progress-Final-Diagnostic/20261108-022023-tp2-protected-capacity-gpu12`，
+复算在最终 B0 `capacity-analysis.json`。514次 protected 计划中508次为空，独立按
+候选净容量复算后，**508次全部是合法容量不足**。首例池681页，8192-token 入站请求
+需512页、当前 free424页，缺88页；唯一4097-token victim 的 floor3278，只能净释放
+52页，仍缺36页。其他 running 的下一步需求为0，排除了该例前方 decode 抢页或预算
+重复计算。四个长请求各被拒绝127–128次；首次失败检查至实际分配约1.40–1.60s，
+这不是请求总排队时间。
+
+trace 的三次大回收均 source8193、floor6555、K6559、释放103页；邻近 zero-copy
+K6545 低于 floor，不能合法选用。三次小回收各释放3页，已全部 zero-copy。因此既
+不能继续把剩余退化归因于每次都复制，也不能把它归因于双 victim 扫描。
+
+中间版本 trace 曾有48次 timed commit、45次只释放1页；合并后最终正式仅18次回收。
+这说明小额维护频率已被修正，但没有解决保护约束下长请求的入场容量和排队问题。
+已触发[有界合并计划](../plans/engineering-amortized-plan.md)的停止条件：停止继续
+调参，保留 fixed 默认及本轮 TP 负结果。继续研究应先明确容量/排队或质量与删除比例
+的取舍；反复空回收、放宽 SLO、换 workload 或增大 pool 均不能作为本轮收益。
+
+完整 micro、Serving 配置和归因见[统一评估](engineering-progress-evaluation.md)。
