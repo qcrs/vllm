@@ -43,3 +43,12 @@ micro 矩阵；调度 micro 单列，不能当 Serving 提速。真实 TP2/DP2 �
 本轮 NOT_RUN，CPU 契约回归与历史多卡证据分别列出，不冒充本轮多卡测试。
 
 按实现/验证/收尾做本地精确提交；保留原 staged/unstaged 内容，不 push/PR。
+
+## 执行结论
+
+已完成实现、CPU92项/DP本地13项及适用静态检查、同GPU0/CPU20正反向八组对照。
+protected短TTFT改善74.80%/73.73%，完成速率下降1.84%/1.07%；相同512配置下
+距fixed完成速率0.28%/0.02%。八组均24/24 SLO、零抢占/重算。保留显式512推荐，
+停止阈值扫描和追加独占豁免；micro及本轮真实TP2/DP2为NOT_RUN。
+详细取舍、历史负结果和归档见[评估](../reports/engineering-prefill-evaluation.md)与
+[收尾](../reports/engineering-prefill-closeout.md)。

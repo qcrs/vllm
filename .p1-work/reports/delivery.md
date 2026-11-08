@@ -1,5 +1,23 @@
 # P1 v8 工程交付索引
 
+<!-- ENGINEERING-PREFILL-NAV-BEGIN -->
+
+## 2026-11-08 Prefill公平性：GPU0同卡基线
+
+见[收尾](engineering-prefill-closeout.md)与[统一评估](engineering-prefill-evaluation.md)。
+protected admission/retry为页对齐prompt预留首decode必要空间；wrapper透传已有
+512-token限额并关联首token阶段。保留两轮门控、20%/50%、完整prefill预留及backfill。
+
+CPU92+DP本地13项及静态检查PASS。GPU0/CPU20正反向8组各24/24 SLO、零抢占/重算。
+protected短TTFT下降74.80%/73.73%，长8192 TTFT增加约23%、仍<2s，吞吐下降
+1.84%/1.07%；同512下距fixed吞吐0.28%/0.02%。定位到计算预算公平性，未宣称
+新Controller算法、kernel或TP通信加速。限额显式推荐，默认保留，停止扩大调参。
+
+本轮micro、真实TP2/DP2 NOT_RUN，GPU1其他任务保留；项目峰值17.564453GiB。
+历史FAIL/PARTIAL、冻结85条样本与用户patch保留，未push或创建PR。
+
+<!-- ENGINEERING-PREFILL-NAV-END -->
+
 <!-- ENGINEERING-TWO-ROUND-NAV-BEGIN -->
 
 ## 2026-11-08 两轮protected回收与单卡/TP2/DP2验证

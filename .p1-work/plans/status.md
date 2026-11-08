@@ -1,5 +1,26 @@
 # P1 v8 当前状态与未决项
 
+<!-- ENGINEERING-PREFILL-NAV-BEGIN -->
+
+## 2026-11-08 Prefill预算公平性与GPU0新基线
+
+见[收尾](../reports/engineering-prefill-closeout.md)、
+[统一评估](../reports/engineering-prefill-evaluation.md)和
+[计划](engineering-prefill-plan.md)。修复protected页对齐prompt的首decode容量边界，
+Serving/DP wrapper透传已有prefill限额，增加逐请求首token分段与独立复算。
+
+CPU92项、DP本地fixture13项及lint/type checks通过；仅GPU0/CPU20，正反向八组
+各24/24 SLO、零抢占/重算。protected开启512后短TTFT约530→133–140ms，改善约74%；
+8192 TTFT约0.95→1.17s，完成速率下降约1–2%。相同512下距fixed吞吐不足0.3%，
+未证明整体加速。短请求实际在长prefill完成前开始计算，确认计算预算公平性问题。
+
+GPU1占用，本轮真实TP2/DP2 NOT_RUN；micro未重跑。8次guard全PASS，项目峰值
+17.564453GiB。历史TP2 SLO_FAIL/质量未证明等结论保留，85条样本未扩大。
+显式推荐混合负载512，不改默认，停止加机制/扫参数；usage tie-break仍停止，
+prefill中删KV暂缓。本地阶段提交完成，用户原改动保留，未push或创建PR。
+
+<!-- ENGINEERING-PREFILL-NAV-END -->
+
 <!-- ENGINEERING-TWO-ROUND-NAV-BEGIN -->
 
 ## 2026-11-08 Decode进展驱动的最多两轮回收
