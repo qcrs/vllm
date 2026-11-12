@@ -638,6 +638,7 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                        # 因为是优先级 有可能 是本轮 调度过加入 running 队列了
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
@@ -659,7 +660,8 @@ class Scheduler(SchedulerInterface):
                             req_index -= 1
                     else:
                         preempted_req = self.running.pop()
-
+                    # 抢占后重新加入 waiting 队列。
+                    # FCFS 放到队首，Priority 按优先级排序。
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -728,6 +730,7 @@ class Scheduler(SchedulerInterface):
             and not reclaim_plan
             and self._pause_state == PauseState.UNPAUSED
         ):
+            # 解决waiting不能调度的事情
             step_skipped_waiting = create_request_queue(self.policy)
             blocked_head_skipped = False
 

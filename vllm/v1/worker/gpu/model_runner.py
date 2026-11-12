@@ -920,10 +920,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = len(num_tokens_per_req)
 
         # batch_idx -> req_id
+        # 直接使用 scheduler_output.num_scheduled_tokens 去分析 然后排序
         req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
         numtoks_iter = map(num_tokens_per_req.get, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
-
+        # 基于新的req的位置然后 生成idx_mapping 他的 下标就是batch的值
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
@@ -968,6 +969,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
+        # 根据重排后的 req_ids 构建 batch 索引映射。
+        # num_scheduled_tokens 已按相同顺序重排。
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
         # Pad for full CUDA graph mode.
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
@@ -976,6 +979,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+        # cpu 侧
         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
@@ -1024,6 +1028,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        # 这里也是 上一轮的decode 的结果写如到 input_ids的部分
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -1127,6 +1132,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        # 理解为 logits_indices 只取每个请求的最后一个
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:

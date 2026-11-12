@@ -344,6 +344,7 @@ __global__ void reshape_and_cache_flash_kernel(
       value_cache + block_idx * block_stride + block_offset * page_stride;
 
   // this is true for the NHD layout where `head_stride == head_size`
+  // Head 数据连续且使用统一 Scale
   const bool is_contiguous_heads = (head_stride == head_size);
 
   constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;

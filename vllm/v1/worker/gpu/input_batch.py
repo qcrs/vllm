@@ -194,25 +194,32 @@ def _prepare_prefill_inputs_kernel(
     num_computed_tokens_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # 一块处理一个请求
     batch_idx = tl.program_id(0)
+    # 基于当前的batch 找到对应的idx
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+    # 判断当前的 req 是否以及跳过了prefill
     prefill_len = tl.load(prefill_lens_ptr + req_state_idx)
     num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
     if num_computed >= prefill_len:
         # Not prefill.
         return
-
+    # 开始的位置
     query_start = tl.load(query_start_loc_ptr + batch_idx)
+    # 结束的位置
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    # 整体的长度
     query_len = query_end - query_start
-
+    # 历史的Token
+    # all_token_ids.shape = [max_num_reqs, max_model_len]
+    # 找到对应的req
     request_ptr = all_token_ids_ptr + req_state_idx * all_token_ids_stride
     for i in range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         tokens = tl.load(request_ptr + num_computed + block, mask=mask)
         tl.store(input_ids_ptr + query_start + block, tokens, mask=mask)
-
+    # 记录下一次的位置
     next_pos = num_computed + query_len
     if next_pos < prefill_len:
         next_token = tl.load(request_ptr + next_pos)
@@ -228,6 +235,8 @@ def prepare_prefill_inputs(
     prefill_len: torch.Tensor,
     num_computed_tokens: torch.Tensor,
 ) -> None:
+    # idx_mapping 将当前 batch 的位置映射到请求索引。
+    # idx_mapping[i] 表示第 i 个位置对应的 req_idx。
     num_reqs = idx_mapping.shape[0]
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         input_ids,

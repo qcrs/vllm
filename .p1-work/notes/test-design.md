@@ -198,6 +198,18 @@ usage 先诊断，不在没有有效同分错选证据时新增路由行为。
   completion→commit行为检查连续decode不再每页回收、无抢占且等待者能完成。
 - GPU只验证受影响计划：既有TP2/Graph/双victim延迟/真实改写复用与DP2独立池。
 
+## Protected admission backfill
+
+- 模块用途：在 protected FCFS 队首因完整 KV 容量不足且无合法回收计划时，有限地
+  让后方可行请求入场；完整 prefill admission 和已接纳请求容量预留保持不变。
+- I/O：配置绕过上限；Scheduler 依据真实 allocator 失败确定阻塞队首，仅成功入场的
+  后方请求消耗额度，队首成功或离队后清理状态。
+- 主要失败：部分 prefill 被误接纳、额度按尝试错误消耗、上限后仍持续入场、队首
+  abort 后遗留状态阻塞、合法 reclaim plan 被绕过。
+- 最低有效层级：扩展现有 `test_scheduler.py` 的 protected Pool fixture，以有限池
+  验证容量缺口下真实短请求 allocation、成功入场上限、队首恢复；之后在 GPU1 与
+  TP2 相同逻辑页数的单轮混合负载对照 serving 行为。
+
 <!-- ENGINEERING-PREFILL-TEST-DESIGN-BEGIN -->
 
 ## 2026-11-08 长 prefill 计算预算与短请求进展

@@ -218,18 +218,22 @@ def _gather_block_tables_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
+    # 就是 汇聚 batch 对应的这些KV  block 然后输出
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
-
+    # 一个 Triton Program 负责一个 KV Group 下的一行 Batch Block Table。
+    # (num_kv_cache_groups, num_reqs_padded) 最大的
+    # 需要知道 最长多少 以及每个req的实际数量
     stride = tl.load(block_table_strides + group_id)
     max_num_blocks = stride  # stride equals max_num_blocks for this group.
     dst_block_table_ptr = _load_ptr(dst_block_table_ptrs + group_id, tl.int32)
     dst_row_ptr = dst_block_table_ptr + batch_idx * stride
-
+    # 行 大于 我们的 长度的时候
     if batch_idx >= num_reqs:
         # Zero out padded rows.
         for i in tl.range(0, max_num_blocks, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
+            # 最大的blocks的数量
             tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
         return
 
@@ -239,7 +243,7 @@ def _gather_block_tables_kernel(
 
     src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
     src_row_ptr = src_block_table_ptr + req_idx * stride
-
+    # 这里是 num_blocks
     for i in tl.range(0, num_blocks, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
@@ -267,7 +271,7 @@ def _compute_slot_mappings_kernel(
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
     slot_mapping_ptr = slot_mappings_ptr + group_id * slot_mappings_stride
-
+    # 执行到最后一个时 要处理后面的面的位置 slot_mapping
     if batch_idx == tl.num_programs(1) - 1:
         # Pad remaining slots to -1. This is needed for CUDA graphs.
         # Start from actual token count (not padded) to cover the gap
@@ -280,18 +284,23 @@ def _compute_slot_mappings_kernel(
         return
 
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
+    # stride 是 这个 block_table 的一行 一个req的最大值
     block_table_stride = tl.load(block_table_strides + group_id)
+    # block_size 是这一行的所拥有的值因为 一个program对应一行
     block_size = tl.load(block_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
+    # start_idx 到 end_idx 是 该 req的 token 数
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        # 加载他们对应的位置 基于位置确定属于 哪个逻辑块 以及块内的偏移
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
 
         block_indices = positions // (block_size * CP_SIZE)
         block_offsets = positions % (block_size * CP_SIZE)
+        # 先加载物理块
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices
         )
